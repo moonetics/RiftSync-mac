@@ -1,0 +1,12 @@
+{
+  "changes": [
+    {
+      "op": "upsert",
+      "entity": "script",
+      "local_path": "ServerScriptService/Foo.server.luau",
+      "rbx_path": "game.ServerScriptService.Foo",
+      "class_name": "Script",
+      "source": "print(\"foo\")\n"
+    }
+  ]
+}

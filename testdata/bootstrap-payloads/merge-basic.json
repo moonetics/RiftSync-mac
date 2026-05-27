@@ -1,0 +1,9 @@
+{
+  "mode": "merge",
+  "files": [
+    {
+      "local_path": "ServerScriptService/Pulled.server.luau",
+      "source": "print(\"pulled\")\n"
+    }
+  ]
+}

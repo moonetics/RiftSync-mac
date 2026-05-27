@@ -1,0 +1,48 @@
+{
+  "changes": [
+    {
+      "op": "upsert",
+      "entity": "script",
+      "local_path": "StarterGui/Main.ScreenGui/Loader.LocalScript/source.client.luau",
+      "rbx_path": "game.StarterGui.Main.Loader",
+      "class_name": "LocalScript",
+      "source": "print(\"loader\")\n"
+    },
+    {
+      "op": "upsert",
+      "entity": "ui_instance",
+      "local_path": "StarterGui/Main.ScreenGui/properties.init.json",
+      "rbx_path": "game.StarterGui.Main",
+      "class_name": "ScreenGui",
+      "payload": {
+        "id": "main-screen",
+        "className": "ScreenGui",
+        "name": "Main"
+      }
+    },
+    {
+      "op": "upsert",
+      "entity": "ui_instance",
+      "local_path": "StarterGui/Menu/init.meta.json",
+      "rbx_path": "game.StarterGui.Menu",
+      "class_name": "ScreenGui",
+      "payload": {
+        "id": "menu-screen",
+        "className": "ScreenGui",
+        "name": "Menu"
+      }
+    },
+    {
+      "op": "upsert",
+      "entity": "ui_instance",
+      "local_path": "StarterGui/Popup.model.json",
+      "rbx_path": "game.StarterGui.Popup",
+      "class_name": "Frame",
+      "payload": {
+        "id": "path:StarterGui/Popup.model.json",
+        "className": "Frame",
+        "name": "Popup"
+      }
+    }
+  ]
+}

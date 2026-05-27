@@ -1,0 +1,7 @@
+rblxsync-server.exe
+*.exe
+*.exe~
+*.test
+coverage.out
+.DS_Store
+Thumbs.db

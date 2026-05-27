@@ -1,0 +1,1585 @@
+package uiapp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"riftsync/internal/config"
+	"riftsync/internal/serverapp"
+	"riftsync/internal/state"
+
+	webview "github.com/webview/webview_go"
+	"golang.org/x/sys/windows"
+)
+
+var (
+	user32               = windows.NewLazySystemDLL("user32.dll")
+	procGetWindowLongPtr = user32.NewProc("GetWindowLongPtrW")
+	procSetWindowLongPtr = user32.NewProc("SetWindowLongPtrW")
+	procSetWindowPos     = user32.NewProc("SetWindowPos")
+	procShowWindow       = user32.NewProc("ShowWindow")
+	procReleaseCapture   = user32.NewProc("ReleaseCapture")
+	procSendMessage      = user32.NewProc("SendMessageW")
+	procPostMessage      = user32.NewProc("PostMessageW")
+
+	ole32                = windows.NewLazySystemDLL("ole32.dll")
+	procCoCreateInstance = ole32.NewProc("CoCreateInstance")
+	procCoInitializeEx   = ole32.NewProc("CoInitializeEx")
+	procCoUninitialize   = ole32.NewProc("CoUninitialize")
+	procCoTaskMemFree    = ole32.NewProc("CoTaskMemFree")
+)
+
+const (
+	gwlStyle            = ^uintptr(15) // -16
+	wsCaption           = uintptr(0x00C00000)
+	swpNoSize           = uintptr(0x0001)
+	swpNoMove           = uintptr(0x0002)
+	swpNoZOrder         = uintptr(0x0004)
+	swpFrameChanged     = uintptr(0x0020)
+	swMinimize          = uintptr(6)
+	wmClose             = uintptr(0x0010)
+	wmNCLButtonDown     = uintptr(0x00A1)
+	htCaption           = uintptr(2)
+	defaultWindowWidth  = 1120
+	defaultWindowHeight = 760
+	coinitApartment     = uintptr(0x2)
+	rpcEChangedMode     = uintptr(0x80010106)
+	clsctxInprocServer  = uintptr(0x1)
+	sigdnFileSysPath    = uint32(0x80058000)
+	fosPickFolders      = uint32(0x00000020)
+	fosForceFileSystem  = uint32(0x00000040)
+	fosPathMustExist    = uint32(0x00000800)
+	errorCancelled      = uintptr(0x800704C7)
+)
+
+var (
+	clsidFileOpenDialog = windows.GUID{Data1: 0xDC1C5A9C, Data2: 0xE88A, Data3: 0x4DDE, Data4: [8]byte{0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7}}
+	iidIFileOpenDialog  = windows.GUID{Data1: 0xD57C7288, Data2: 0xD4AD, Data3: 0x4768, Data4: [8]byte{0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60}}
+)
+
+type fileOpenDialog struct {
+	vtbl *fileOpenDialogVtbl
+}
+
+type fileOpenDialogVtbl struct {
+	QueryInterface      uintptr
+	AddRef              uintptr
+	Release             uintptr
+	Show                uintptr
+	SetFileTypes        uintptr
+	SetFileTypeIndex    uintptr
+	GetFileTypeIndex    uintptr
+	Advise              uintptr
+	Unadvise            uintptr
+	SetOptions          uintptr
+	GetOptions          uintptr
+	SetDefaultFolder    uintptr
+	SetFolder           uintptr
+	GetFolder           uintptr
+	GetCurrentSelection uintptr
+	SetFileName         uintptr
+	GetFileName         uintptr
+	SetTitle            uintptr
+	SetOkButtonLabel    uintptr
+	SetFileNameLabel    uintptr
+	GetResult           uintptr
+}
+
+type shellItem struct {
+	vtbl *shellItemVtbl
+}
+
+type shellItemVtbl struct {
+	QueryInterface uintptr
+	AddRef         uintptr
+	Release        uintptr
+	BindToHandler  uintptr
+	GetParent      uintptr
+	GetDisplayName uintptr
+}
+
+type appController struct {
+	runner  *serverapp.Runner
+	options serverapp.Options
+	ctx     context.Context
+	window  *windowController
+
+	mu        sync.Mutex
+	starting  bool
+	lastError string
+	quitOnce  sync.Once
+	quit      chan struct{}
+	terminate func()
+	forceExit bool
+}
+
+type windowController struct {
+	hwnd uintptr
+}
+
+type statusPayload struct {
+	Running          bool    `json:"running"`
+	Starting         bool    `json:"starting"`
+	Status           string  `json:"status"`
+	Address          string  `json:"address"`
+	Host             string  `json:"host"`
+	Port             int     `json:"port"`
+	ConfigPath       string  `json:"config_path"`
+	SyncRoot         string  `json:"sync_root"`
+	Mode             string  `json:"mode"`
+	Debug            bool    `json:"debug"`
+	LegacyScan       bool    `json:"legacy_scan"`
+	Revision         int     `json:"revision"`
+	Indexed          int     `json:"indexed"`
+	Scripts          int     `json:"scripts"`
+	UI               int     `json:"ui"`
+	RequestCount     int     `json:"request_count"`
+	Polls            int     `json:"polls"`
+	GitEnabled       bool    `json:"git_enabled"`
+	GitStatus        string  `json:"git_status"`
+	ActivityText     string  `json:"activity_text"`
+	ActivityOp       string  `json:"activity_operation"`
+	ActivityError    bool    `json:"activity_error"`
+	ActivityProgress int     `json:"activity_progress"`
+	ActivityClientID string  `json:"activity_client_id"`
+	ActivityRevision int     `json:"activity_revision"`
+	ActivityAt       float64 `json:"activity_at"`
+	LastError        string  `json:"last_error"`
+	Uptime           string  `json:"uptime"`
+}
+
+type restartRequest struct {
+	ConfigPath string `json:"config_path"`
+	SyncRoot   string `json:"sync_root"`
+	Host       string `json:"host"`
+	Port       string `json:"port"`
+	GitEnabled bool   `json:"git_enabled"`
+	Debug      bool   `json:"debug"`
+	LegacyScan bool   `json:"legacy_scan"`
+}
+
+// Run starts a tiny loopback control UI and displays it in an embedded WebView2 window.
+// The sync server itself remains stopped until the user clicks Start.
+func Run(ctx context.Context, options serverapp.Options) error {
+	controller := &appController{
+		runner:    serverapp.New(options),
+		options:   normalizeUIOptions(options),
+		ctx:       ctx,
+		quit:      make(chan struct{}),
+		forceExit: true,
+	}
+	mux := http.NewServeMux()
+	controller.registerRoutes(mux)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("start app UI listener: %w", err)
+	}
+	defer listener.Close()
+
+	server := &http.Server{Handler: mux}
+	serveErr := make(chan error, 1)
+	go func() {
+		err := server.Serve(listener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		serveErr <- err
+	}()
+
+	url := "http://" + listener.Addr().String() + "/app"
+	w := webview.New(options.Debug)
+	if w == nil {
+		return errors.New("create WebView2 window failed")
+	}
+	defer w.Destroy()
+	w.SetTitle("RiftSync")
+	w.SetSize(defaultWindowWidth, defaultWindowHeight, webview.HintNone)
+	window := &windowController{hwnd: uintptr(w.Window())}
+	controller.window = window
+	controller.terminate = w.Terminate
+	_ = window.makeFrameless()
+	_ = w.Bind("appDragWindow", func() error {
+		return window.drag()
+	})
+	_ = w.Bind("appMinimizeWindow", func() error {
+		return window.minimize()
+	})
+	_ = w.Bind("appCloseWindow", func() error {
+		controller.requestQuit()
+		return nil
+	})
+	w.Navigate(url)
+
+	monitorErr := make(chan error, 1)
+	go func() {
+		var err error
+		select {
+		case <-ctx.Done():
+		case <-controller.quit:
+		case err = <-serveErr:
+		}
+		monitorErr <- err
+		w.Terminate()
+	}()
+
+	w.Run()
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = controller.runner.Stop(stopCtx)
+	_ = server.Shutdown(stopCtx)
+
+	var result error
+	select {
+	case result = <-monitorErr:
+	default:
+	}
+	select {
+	case err := <-serveErr:
+		if result == nil {
+			result = err
+		}
+	case <-stopCtx.Done():
+	}
+	return result
+}
+
+func (a *appController) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/app", a.handleApp)
+	mux.HandleFunc("/app/status", a.handleStatus)
+	mux.HandleFunc("/app/start", a.handleStart)
+	mux.HandleFunc("/app/stop", a.handleStop)
+	mux.HandleFunc("/app/restart", a.handleRestart)
+	mux.HandleFunc("/app/config/apply", a.handleConfigApply)
+	mux.HandleFunc("/app/open-folder", a.handleOpenFolder)
+	mux.HandleFunc("/app/pick-folder", a.handlePickFolder)
+	mux.HandleFunc("/app/history", a.handleHistory)
+	mux.HandleFunc("/app/logs", a.handleLogs)
+	mux.HandleFunc("/app/window/minimize", a.handleWindowMinimize)
+	mux.HandleFunc("/app/window/close", a.handleWindowClose)
+	mux.HandleFunc("/app/quit", a.handleQuit)
+}
+
+func (a *appController) handleApp(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(htmlDocument()))
+}
+
+func (a *appController) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "app": a.status()})
+}
+
+func (a *appController) handleStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	if err := a.start(a.ctx); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "app": a.status()})
+}
+
+func (a *appController) handleStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.runner.Stop(stopCtx); err != nil {
+		a.setLastError(err.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
+		return
+	}
+	a.setLastError("")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "app": a.status()})
+}
+
+func (a *appController) handleRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	if a.configLocked() {
+		writeJSON(w, http.StatusConflict, map[string]any{"status": "error", "error": "stop sync before changing config", "app": a.status()})
+		return
+	}
+	next, err := a.optionsFromRequest(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
+		return
+	}
+	if err := a.saveAndSetOptions(next); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
+		return
+	}
+
+	a.mu.Lock()
+	a.starting = true
+	a.lastError = ""
+	a.mu.Unlock()
+
+	err = a.runner.Restart(a.ctx, next)
+	a.mu.Lock()
+	a.starting = false
+	if err != nil {
+		a.lastError = err.Error()
+	}
+	a.mu.Unlock()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "result": "restarted", "app": a.status()})
+}
+
+func (a *appController) handleConfigApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	if a.configLocked() {
+		writeJSON(w, http.StatusConflict, map[string]any{"status": "error", "error": "stop sync before changing config", "app": a.status()})
+		return
+	}
+	next, err := a.optionsFromRequest(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
+		return
+	}
+	if err := a.saveAndSetOptions(next); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
+		return
+	}
+
+	a.mu.Lock()
+	a.starting = true
+	a.lastError = ""
+	a.mu.Unlock()
+
+	restarted, err := a.runner.ApplyOptions(a.ctx, next)
+	a.mu.Lock()
+	a.starting = false
+	if err != nil {
+		a.lastError = err.Error()
+	}
+	a.mu.Unlock()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
+		return
+	}
+	result := "saved_only"
+	if restarted {
+		result = "restarted"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "result": result, "app": a.status()})
+}
+
+func (a *appController) handleOpenFolder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	payload := a.status()
+	target := strings.TrimSpace(payload.SyncRoot)
+	if target == "" {
+		target = "src/game"
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": payload})
+		return
+	}
+	cmd := exec.Command("explorer", target)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if err := cmd.Start(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": payload})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "app": payload})
+}
+
+func (a *appController) handlePickFolder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	owner := uintptr(0)
+	if a.window != nil {
+		owner = a.window.hwnd
+	}
+	path, selected, err := pickFolder(owner)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
+		return
+	}
+	payload := a.status()
+	if selected && strings.TrimSpace(path) != "" {
+		payload.SyncRoot = path
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "ok",
+		"selected": selected,
+		"path":     path,
+		"app":      payload,
+	})
+}
+
+func (a *appController) handleHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	if revArg := r.URL.Query().Get("rev"); revArg != "" {
+		revision, err := strconv.Atoi(revArg)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "rev must be an integer"})
+			return
+		}
+		serverRev, gitState, summary, changes, found := a.runner.HistoryDetail(revision)
+		payload := map[string]any{
+			"status":     "ok",
+			"found":      found,
+			"rev":        revision,
+			"server_rev": serverRev,
+			"git":        gitState,
+			"changes":    changes,
+		}
+		if found {
+			payload["ts"] = summary.TS
+			payload["change_count"] = summary.ChangeCount
+			payload["op_counts"] = summary.OpCounts
+			payload["entity_counts"] = summary.EntityCounts
+			payload["git_commit"] = summary.GitCommit
+			payload["git_commit_short"] = summary.GitCommitShort
+		}
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+	serverRev, gitState, revisions := a.runner.HistorySummaries(limit)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "ok",
+		"server_rev": serverRev,
+		"git":        gitState,
+		"revisions":  revisions,
+	})
+}
+
+func (a *appController) handleLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	a.mu.Lock()
+	options := a.options
+	a.mu.Unlock()
+	status := a.runner.Status(120)
+	status = hydrateStoppedStatus(status, options)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":        "ok",
+		"running":       status.Running,
+		"revision":      status.Revision,
+		"events":        status.Events,
+		"metrics":       status.Metrics,
+		"git":           status.Git,
+		"activity":      status.Activity,
+		"scan_warnings": status.Warnings,
+	})
+}
+
+func (a *appController) handleWindowMinimize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	if a.window != nil {
+		_ = a.window.minimize()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (a *appController) handleWindowClose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	a.requestQuit()
+}
+
+func (a *appController) handleQuit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	a.requestQuit()
+}
+
+func (a *appController) requestQuit() {
+	a.quitOnce.Do(func() {
+		close(a.quit)
+		if a.window != nil {
+			_ = a.window.close()
+		}
+		if a.terminate != nil {
+			go a.terminate()
+		}
+		if a.forceExit {
+			time.AfterFunc(1500*time.Millisecond, func() {
+				os.Exit(0)
+			})
+		}
+	})
+}
+
+func (a *appController) optionsFromRequest(r *http.Request) (serverapp.Options, error) {
+	var request restartRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		return serverapp.Options{}, fmt.Errorf("invalid JSON: %w", err)
+	}
+	current := a.runner.Options()
+	return optionsFromInput(current, request.ConfigPath, request.SyncRoot, request.Host, request.Port, request.GitEnabled, request.Debug, request.LegacyScan)
+}
+
+func (a *appController) saveAndSetOptions(options serverapp.Options) error {
+	if err := saveConfigFromOptions(options); err != nil {
+		a.setLastError(err.Error())
+		return err
+	}
+	a.mu.Lock()
+	a.options = options
+	a.lastError = ""
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *appController) start(ctx context.Context) error {
+	a.mu.Lock()
+	if a.starting {
+		a.mu.Unlock()
+		return nil
+	}
+	a.starting = true
+	a.lastError = ""
+	a.mu.Unlock()
+
+	err := a.runner.Start(ctx)
+	a.mu.Lock()
+	a.starting = false
+	if err != nil {
+		a.lastError = err.Error()
+	}
+	a.mu.Unlock()
+	return err
+}
+
+func (a *appController) status() statusPayload {
+	a.mu.Lock()
+	starting := a.starting
+	lastError := a.lastError
+	options := a.options
+	a.mu.Unlock()
+
+	status := a.runner.Status(12)
+	status = hydrateStoppedStatus(status, options)
+	return makeStatusPayload(status, starting, lastError)
+}
+
+func (a *appController) setLastError(message string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastError = message
+}
+
+func (a *appController) configLocked() bool {
+	a.mu.Lock()
+	starting := a.starting
+	a.mu.Unlock()
+	return starting || a.runner.Status(1).Running
+}
+
+func hydrateStoppedStatus(status serverapp.Status, options serverapp.Options) serverapp.Status {
+	if status.Port > 0 && status.SyncRoot != "" && status.ConfigPath != "" {
+		return status
+	}
+	cfg, err := config.Load(fallback(options.ConfigPath, "sync_config.json"))
+	if err == nil {
+		if options.HostOverride != "" {
+			cfg.Host = options.HostOverride
+		}
+		if options.PortOverride > 0 {
+			cfg.Port = options.PortOverride
+		}
+		if options.SyncRootOverride != "" {
+			cfg.SyncRoot = options.SyncRootOverride
+			_ = cfg.NormalizeAndValidate()
+		}
+		if options.GitVersioningOverride != nil {
+			cfg.GitVersioningEnabled = *options.GitVersioningOverride
+		}
+		if status.Host == "" {
+			status.Host = cfg.Host
+		}
+		if status.Port == 0 {
+			status.Port = cfg.Port
+		}
+		if status.SyncRoot == "" {
+			status.SyncRoot = cfg.SyncRootAbs
+			if status.SyncRoot == "" {
+				status.SyncRoot = cfg.SyncRoot
+			}
+		}
+		status.Git.Enabled = true
+	} else {
+		defaults := config.Default()
+		if status.Host == "" {
+			status.Host = fallback(options.HostOverride, defaults.Host)
+		}
+		if status.Port == 0 {
+			if options.PortOverride > 0 {
+				status.Port = options.PortOverride
+			} else {
+				status.Port = defaults.Port
+			}
+		}
+		if status.SyncRoot == "" {
+			status.SyncRoot = fallback(options.SyncRootOverride, defaults.SyncRoot)
+		}
+		status.Git.Enabled = true
+	}
+	if status.ConfigPath == "" {
+		status.ConfigPath = fallback(options.ConfigPath, "sync_config.json")
+	}
+	status.Debug = options.Debug
+	status.LegacyScan = false
+	return status
+}
+
+func makeStatusPayload(status serverapp.Status, starting bool, lastError string) statusPayload {
+	host := fallback(status.Host, "127.0.0.1")
+	port := status.Port
+	address := host
+	if port > 0 {
+		address = fmt.Sprintf("%s:%d", host, port)
+	}
+	mode := "Live sync"
+	gitStatus := gitStatusText(status)
+	if lastError == "" {
+		lastError = status.LastError
+	}
+	uptime := ""
+	if status.Running && !status.StartedAt.IsZero() {
+		uptime = time.Since(status.StartedAt).Round(time.Second).String()
+	}
+	payload := statusPayload{
+		Running:          status.Running,
+		Starting:         starting,
+		Address:          address,
+		Host:             host,
+		Port:             port,
+		ConfigPath:       fallback(status.ConfigPath, "sync_config.json"),
+		SyncRoot:         status.SyncRoot,
+		Mode:             mode,
+		Debug:            status.Debug,
+		LegacyScan:       status.LegacyScan,
+		Revision:         status.Revision,
+		Indexed:          status.Counts.Entry,
+		Scripts:          status.Counts.Script,
+		UI:               status.Counts.UI,
+		RequestCount:     status.Metrics.RequestCount,
+		Polls:            status.Metrics.ChangesRequests,
+		GitEnabled:       status.Git.Enabled,
+		GitStatus:        gitStatus,
+		ActivityText:     fallback(status.Activity.Text, "No Studio activity yet."),
+		ActivityOp:       status.Activity.Operation,
+		ActivityError:    status.Activity.Error,
+		ActivityProgress: status.Activity.Progress,
+		ActivityClientID: status.Activity.ClientID,
+		ActivityRevision: status.Activity.Revision,
+		ActivityAt:       status.Activity.At,
+		LastError:        fallback(lastError, "Clear"),
+		Uptime:           uptime,
+	}
+	payload.Status = statusText(payload)
+	return payload
+}
+
+func gitStatusText(status serverapp.Status) string {
+	if !status.Git.Enabled {
+		if !status.Running {
+			return "Pending, will initialize on Start"
+		}
+		return "Checking Git"
+	}
+	if !status.Running {
+		return "Pending, will initialize on Start"
+	}
+	switch status.Git.Status {
+	case state.GitStatusChecking:
+		return "Checking Git"
+	case state.GitStatusInitializing:
+		return "Initializing repo"
+	case state.GitStatusInitialCommit:
+		return "Creating initial commit"
+	case state.GitStatusCommitting:
+		return "Committing"
+	case state.GitStatusReady:
+		return "Ready"
+	case state.GitStatusError:
+		return "Error"
+	case state.GitStatusPending:
+		return "Pending"
+	case state.GitStatusDisabled:
+		return "Disabled"
+	default:
+		if status.Git.LastError != "" {
+			return "Error"
+		}
+		return "Checking Git"
+	}
+}
+
+func statusText(payload statusPayload) string {
+	if payload.Starting {
+		return "Starting"
+	}
+	if payload.Running {
+		return "Running"
+	}
+	return "Stopped"
+}
+
+func optionsFromInput(current serverapp.Options, configPath, syncRoot, host, portRaw string, gitEnabled, debug, legacyScan bool) (serverapp.Options, error) {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return serverapp.Options{}, fmt.Errorf("config path must not be empty")
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if host != "127.0.0.1" && host != "localhost" {
+		return serverapp.Options{}, fmt.Errorf("host must be 127.0.0.1 or localhost")
+	}
+	syncRoot = strings.TrimSpace(syncRoot)
+	if syncRoot == "" {
+		return serverapp.Options{}, fmt.Errorf("sync root must not be empty")
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(portRaw))
+	if err != nil || port < 1 || port > 65535 {
+		return serverapp.Options{}, fmt.Errorf("port must be between 1 and 65535")
+	}
+	options := current
+	options.ConfigPath = configPath
+	options.HostOverride = host
+	options.PortOverride = port
+	options.SyncRootOverride = syncRoot
+	gitAlwaysEnabled := true
+	options.GitVersioningOverride = &gitAlwaysEnabled
+	options.Debug = debug
+	options.LegacyScan = false
+	return options, nil
+}
+
+func saveConfigFromOptions(options serverapp.Options) error {
+	path := fallback(options.ConfigPath, "sync_config.json")
+	cfg, err := config.Load(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		cfg = config.Default()
+	}
+	if options.HostOverride != "" {
+		cfg.Host = options.HostOverride
+	}
+	if options.PortOverride > 0 {
+		cfg.Port = options.PortOverride
+	}
+	if options.SyncRootOverride != "" {
+		cfg.SyncRoot = options.SyncRootOverride
+	}
+	cfg.GitVersioningEnabled = true
+	return config.Save(path, cfg)
+}
+
+func normalizeUIOptions(options serverapp.Options) serverapp.Options {
+	if options.ConfigPath == "" {
+		options.ConfigPath = "sync_config.json"
+	}
+	if options.PortOverride == 0 {
+		options.PortOverride = -1
+	}
+	return options
+}
+
+func (w *windowController) makeFrameless() error {
+	if w == nil || w.hwnd == 0 {
+		return errors.New("window handle is unavailable")
+	}
+	style, _, err := procGetWindowLongPtr.Call(w.hwnd, gwlStyle)
+	if style == 0 && err != windows.ERROR_SUCCESS {
+		return err
+	}
+	style &^= wsCaption
+	if result, _, err := procSetWindowLongPtr.Call(w.hwnd, gwlStyle, style); result == 0 && err != windows.ERROR_SUCCESS {
+		return err
+	}
+	procSetWindowPos.Call(w.hwnd, 0, 0, 0, 0, 0, swpNoMove|swpNoSize|swpNoZOrder|swpFrameChanged)
+	return nil
+}
+
+func (w *windowController) minimize() error {
+	if w == nil || w.hwnd == 0 {
+		return errors.New("window handle is unavailable")
+	}
+	procShowWindow.Call(w.hwnd, swMinimize)
+	return nil
+}
+
+func (w *windowController) drag() error {
+	if w == nil || w.hwnd == 0 {
+		return errors.New("window handle is unavailable")
+	}
+	procReleaseCapture.Call()
+	procSendMessage.Call(w.hwnd, wmNCLButtonDown, htCaption, 0)
+	return nil
+}
+
+func (w *windowController) close() error {
+	if w == nil || w.hwnd == 0 {
+		return errors.New("window handle is unavailable")
+	}
+	procPostMessage.Call(w.hwnd, wmClose, 0, 0)
+	return nil
+}
+
+func pickFolder(owner uintptr) (string, bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	hr, _, _ := procCoInitializeEx.Call(0, coinitApartment)
+	initialized := hr == 0 || hr == 1
+	if initialized {
+		defer procCoUninitialize.Call()
+	} else if hr != rpcEChangedMode {
+		return "", false, fmt.Errorf("initialize folder picker: 0x%x", hr)
+	}
+
+	var dialog *fileOpenDialog
+	hr, _, _ = procCoCreateInstance.Call(
+		uintptr(unsafe.Pointer(&clsidFileOpenDialog)),
+		0,
+		clsctxInprocServer,
+		uintptr(unsafe.Pointer(&iidIFileOpenDialog)),
+		uintptr(unsafe.Pointer(&dialog)),
+	)
+	if failedHRESULT(hr) {
+		return "", false, fmt.Errorf("open folder picker: 0x%x", hr)
+	}
+	if dialog == nil {
+		return "", false, errors.New("open folder picker: dialog unavailable")
+	}
+	defer dialog.release()
+
+	options, err := dialog.getOptions()
+	if err != nil {
+		return "", false, err
+	}
+	if err := dialog.setOptions(options | fosPickFolders | fosForceFileSystem | fosPathMustExist); err != nil {
+		return "", false, err
+	}
+	if err := dialog.setTitle("Choose RiftSync folder"); err != nil {
+		return "", false, err
+	}
+	hr = dialog.show(owner)
+	if hr == errorCancelled {
+		return "", false, nil
+	}
+	if failedHRESULT(hr) {
+		return "", false, fmt.Errorf("show folder picker: 0x%x", hr)
+	}
+
+	item, err := dialog.result()
+	if err != nil {
+		return "", false, err
+	}
+	defer item.release()
+	path, err := item.fileSystemPath()
+	if err != nil {
+		return "", false, err
+	}
+	return path, true, nil
+}
+
+func failedHRESULT(hr uintptr) bool {
+	return hr&0x80000000 != 0
+}
+
+func (d *fileOpenDialog) release() {
+	syscall.SyscallN(d.vtbl.Release, uintptr(unsafe.Pointer(d)))
+}
+
+func (d *fileOpenDialog) show(owner uintptr) uintptr {
+	hr, _, _ := syscall.SyscallN(d.vtbl.Show, uintptr(unsafe.Pointer(d)), owner)
+	return hr
+}
+
+func (d *fileOpenDialog) getOptions() (uint32, error) {
+	var options uint32
+	hr, _, _ := syscall.SyscallN(d.vtbl.GetOptions, uintptr(unsafe.Pointer(d)), uintptr(unsafe.Pointer(&options)))
+	if failedHRESULT(hr) {
+		return 0, fmt.Errorf("read folder picker options: 0x%x", hr)
+	}
+	return options, nil
+}
+
+func (d *fileOpenDialog) setOptions(options uint32) error {
+	hr, _, _ := syscall.SyscallN(d.vtbl.SetOptions, uintptr(unsafe.Pointer(d)), uintptr(options))
+	if failedHRESULT(hr) {
+		return fmt.Errorf("set folder picker options: 0x%x", hr)
+	}
+	return nil
+}
+
+func (d *fileOpenDialog) setTitle(title string) error {
+	ptr, err := windows.UTF16PtrFromString(title)
+	if err != nil {
+		return err
+	}
+	hr, _, _ := syscall.SyscallN(d.vtbl.SetTitle, uintptr(unsafe.Pointer(d)), uintptr(unsafe.Pointer(ptr)))
+	if failedHRESULT(hr) {
+		return fmt.Errorf("set folder picker title: 0x%x", hr)
+	}
+	return nil
+}
+
+func (d *fileOpenDialog) result() (*shellItem, error) {
+	var item *shellItem
+	hr, _, _ := syscall.SyscallN(d.vtbl.GetResult, uintptr(unsafe.Pointer(d)), uintptr(unsafe.Pointer(&item)))
+	if failedHRESULT(hr) {
+		return nil, fmt.Errorf("read selected folder: 0x%x", hr)
+	}
+	if item == nil {
+		return nil, errors.New("folder picker returned no item")
+	}
+	return item, nil
+}
+
+func (i *shellItem) release() {
+	syscall.SyscallN(i.vtbl.Release, uintptr(unsafe.Pointer(i)))
+}
+
+func (i *shellItem) fileSystemPath() (string, error) {
+	var path *uint16
+	hr, _, _ := syscall.SyscallN(i.vtbl.GetDisplayName, uintptr(unsafe.Pointer(i)), uintptr(sigdnFileSysPath), uintptr(unsafe.Pointer(&path)))
+	if failedHRESULT(hr) {
+		return "", fmt.Errorf("read selected folder path: 0x%x", hr)
+	}
+	if path == nil {
+		return "", errors.New("folder picker returned empty path")
+	}
+	defer procCoTaskMemFree.Call(uintptr(unsafe.Pointer(path)))
+	return windows.UTF16PtrToString(path), nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func fallback(value, defaultValue string) string {
+	if strings.TrimSpace(value) == "" {
+		return defaultValue
+	}
+	return value
+}
+
+func portText(port int) string {
+	if port < 1 {
+		return ""
+	}
+	return strconv.Itoa(port)
+}
+
+func formatWarnings(warnings []string) string {
+	if len(warnings) == 0 {
+		return "No warnings."
+	}
+	return strings.Join(warnings, "\n")
+}
+
+func formatEvents(status serverapp.Status) string {
+	if len(status.Events) == 0 {
+		return "No events yet."
+	}
+	lines := make([]string, 0, len(status.Events))
+	for _, event := range status.Events {
+		lines = append(lines, fmt.Sprintf("%s %s", event.Kind, event.Message))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatHistory(history []state.RevisionSummary) string {
+	if len(history) == 0 {
+		return "No revisions yet."
+	}
+	lines := make([]string, 0, len(history))
+	for _, revision := range history {
+		lines = append(lines, fmt.Sprintf("rev %d - %d changes%s%s",
+			revision.Rev,
+			revision.ChangeCount,
+			formatCounts(revision.OpCounts),
+			formatGitShort(revision.GitCommitShort),
+		))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", key, counts[key]))
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+func formatGitShort(short string) string {
+	if short == "" {
+		return ""
+	}
+	return " [" + short + "]"
+}
+
+func htmlDocument() string {
+	return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RiftSync</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #090d18;
+  --ink: #f4f7fb;
+  --muted: #aab3c8;
+  --panel: rgba(22, 27, 45, .68);
+  --panel-strong: rgba(31, 38, 62, .78);
+  --surface: rgba(6, 10, 24, .42);
+  --line: rgba(210, 220, 255, .16);
+  --accent: #9aa8ff;
+  --accent-2: #7ee7d6;
+  --good: #4ade80;
+  --bad: #fb7185;
+  --warn: #fbbf24;
+}
+* { box-sizing: border-box; }
+html, body, .app { width: 100%; height: 100vh; overflow: hidden; }
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 8% 0%, rgba(154,168,255,.20), transparent 22rem),
+    radial-gradient(circle at 92% 10%, rgba(126,231,214,.14), transparent 24rem),
+    radial-gradient(circle at 50% 110%, rgba(251,113,133,.10), transparent 30rem),
+    var(--bg);
+  color: var(--ink);
+  font: 14px/1.35 "Segoe UI", Inter, system-ui, sans-serif;
+}
+button, input { font: inherit; }
+button {
+  border: 1px solid var(--line);
+  color: var(--ink);
+  background: var(--panel-strong);
+  padding: 8px 12px;
+  border-radius: 9px;
+  cursor: pointer;
+  min-width: 72px;
+}
+button.primary { background: linear-gradient(135deg, #7c8cff, #71ded0); color: #08101f; border-color: transparent; font-weight: 760; }
+button.danger { border-color: rgba(251,113,133,.45); color: #ffd7df; }
+button.icon { min-width: 34px; width: 34px; height: 30px; padding: 0; }
+button.ghost { background: rgba(22,27,45,.52); }
+button:hover { border-color: var(--accent-2); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button:focus-visible, input:focus-visible, .toggle-switch input:focus-visible + .switch-track, .custom-select-button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.app { display: grid; grid-template-rows: 64px 44px 1fr; }
+.app-header {
+  display: grid;
+  grid-template-columns: minmax(190px, .9fr) auto minmax(360px, 1fr);
+  align-items: center;
+  gap: 14px;
+  padding: 10px 18px 8px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(11,15,28,.74);
+  backdrop-filter: blur(18px);
+  user-select: none;
+}
+.brand h1 { margin: 0; font-size: 22px; letter-spacing: 0; }
+.brand .sub { color: var(--muted); font-size: 12px; margin-top: 1px; }
+.header-status { display: flex; align-items: center; justify-content: center; gap: 11px; color: var(--muted); white-space: nowrap; }
+.pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--ink); font-weight: 750; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 4px rgba(251,113,133,.13); }
+.running .dot { background: var(--good); box-shadow: 0 0 0 4px rgba(74,222,128,.13); }
+.starting .dot { background: var(--warn); box-shadow: 0 0 0 4px rgba(251,191,36,.13); }
+.header-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.window-actions { display: inline-flex; gap: 7px; margin-left: 2px; }
+.tabbar { display: flex; align-items: end; gap: 8px; padding: 7px 18px 0; background: rgba(11,15,28,.44); backdrop-filter: blur(16px); }
+.tab { min-width: 120px; height: 37px; border-bottom-left-radius: 0; border-bottom-right-radius: 0; background: rgba(22,27,45,.58); color: var(--muted); }
+.tab.active { color: var(--ink); border-color: var(--accent-2); background: var(--panel-strong); }
+.content { min-height: 0; padding: 14px 18px 18px; overflow: hidden; }
+.tab-panel { display: none; height: 100%; min-height: 0; overflow: hidden; }
+.tab-panel.active { display: block; }
+.stack { display: grid; grid-template-rows: auto auto auto auto; gap: 12px; height: 100%; min-height: 0; }
+.metric-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.metric, .mini-stat { min-height: 76px; padding: 13px 14px; background: linear-gradient(145deg, rgba(255,255,255,.075), rgba(255,255,255,.025)); border: 1px solid var(--line); border-radius: 13px; backdrop-filter: blur(14px); }
+.label { color: var(--muted); font-size: 11px; font-weight: 760; text-transform: uppercase; letter-spacing: .05em; }
+.value { margin-top: 7px; font-size: 19px; font-weight: 820; word-break: break-word; }
+.hint { color: var(--muted); font-size: 12px; margin-top: 4px; word-break: break-word; }
+.panel { background: linear-gradient(145deg, rgba(255,255,255,.07), rgba(255,255,255,.025)); border: 1px solid var(--line); border-radius: 14px; padding: 15px; min-height: 0; overflow: hidden; box-shadow: 0 18px 45px rgba(0,0,0,.22); backdrop-filter: blur(18px); }
+.panel h2 { margin: 0 0 12px; font-size: 16px; }
+.overview-middle { display: grid; grid-template-columns: .9fr 1.1fr; gap: 12px; min-height: 0; }
+.project-card { display: grid; grid-template-rows: auto auto auto auto; gap: 6px; }
+.project-name { margin-top: 8px; font-size: 22px; font-weight: 820; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+.health-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.health-row { min-height: 64px; border: 1px solid var(--line); border-radius: 11px; background: rgba(4,8,20,.42); padding: 10px 11px; }
+.status-band { display: grid; grid-template-columns: 120px 1fr; gap: 12px; align-items: center; min-height: 56px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 13px; background: var(--panel); }
+.error { color: #ffd6de; overflow-wrap: anywhere; }
+.error-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 10px; min-width: 0; }
+.error-summary { color: #ffd6de; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.error-summary.clear { color: var(--muted); }
+.details-button { min-width: 72px; padding: 7px 10px; }
+.activity-card { min-width: 0; }
+.activity-bar { height: 7px; margin-top: 8px; border-radius: 999px; background: rgba(4,8,20,.7); border: 1px solid var(--line); overflow: hidden; }
+.activity-fill { width: 0%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .18s ease; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 500; display: none; place-items: center; background: rgba(2,6,18,.72); padding: 22px; }
+.modal-backdrop.open { display: grid; }
+.modal { width: min(860px, 100%); max-height: min(620px, 88vh); display: grid; grid-template-rows: auto 1fr; gap: 12px; border: 1px solid var(--line); border-radius: 14px; background: #10162a; box-shadow: 0 24px 70px rgba(0,0,0,.48); padding: 15px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.modal-actions { display: flex; gap: 8px; }
+.error-detail { min-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 11px; background: rgba(4,8,20,.72); color: var(--ink); padding: 12px; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+.history-shell { display: grid; grid-template-rows: auto 1fr; gap: 12px; height: 100%; min-height: 0; }
+.history-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.field label { display: block; color: var(--muted); font-size: 11px; font-weight: 760; text-transform: uppercase; margin-bottom: 6px; }
+input { width: 100%; border: 1px solid var(--line); border-radius: 10px; background: rgba(4, 8, 20, .62); color: var(--ink); padding: 9px 11px; min-height: 39px; }
+.input-row { display: grid; grid-template-columns: 1fr auto; gap: 9px; align-items: end; }
+.custom-select { position: relative; }
+.custom-select-button { width: 100%; min-height: 39px; text-align: left; display: flex; align-items: center; justify-content: space-between; gap: 10px; background: rgba(4,8,20,.62); }
+.custom-select-button::after { content: "⌄"; color: var(--accent-2); font-size: 15px; }
+.history-toolbar-panel { overflow: visible; position: relative; z-index: 20; }
+.custom-menu { display: none; position: absolute; z-index: 100; left: 0; right: 0; top: calc(100% + 6px); max-height: 220px; overflow: auto; border: 1px solid var(--accent-2); border-radius: 11px; background: #11182b; box-shadow: 0 18px 40px rgba(0,0,0,.34); padding: 6px; }
+.custom-menu.open { display: block; }
+.custom-option { width: 100%; display: block; text-align: left; border: 0; border-radius: 8px; background: transparent; color: var(--ink); padding: 9px 10px; }
+.custom-option:hover, .custom-option.active { background: rgba(126,231,214,.13); }
+.history-layout { display: grid; grid-template-columns: minmax(220px, .38fr) 1fr; gap: 12px; min-height: 0; height: 100%; }
+.history-timeline { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); padding: 8px; }
+.history-item { width: 100%; display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center; text-align: left; border: 0; border-radius: 10px; background: transparent; padding: 10px; margin-bottom: 6px; }
+.history-item.active, .history-item:hover { background: rgba(126,231,214,.12); }
+.history-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 0 4px rgba(126,231,214,.10); }
+.history-item-title { font-weight: 760; }
+.history-item-meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.history-detail-card { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
+.revision-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 12px; }
+.history-detail { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); padding: 11px; }
+.change-row { border-bottom: 1px solid var(--line); padding: 10px 2px; }
+.change-row:last-child { border-bottom: 0; }
+.change-row strong { font-size: 13px; }
+.change-meta { color: var(--muted); font-size: 12px; word-break: break-word; margin-top: 3px; }
+.empty { min-height: 150px; display: grid; place-items: center; color: var(--muted); text-align: center; }
+.config-shell { display: grid; grid-template-rows: 1fr auto; gap: 12px; height: 100%; min-height: 0; }
+.config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; min-height: 0; }
+.form-grid { display: grid; grid-template-columns: 1fr 130px; gap: 12px; }
+.full { grid-column: 1 / -1; }
+.switch-list { display: grid; gap: 10px; margin-top: 12px; }
+.switch-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); padding: 10px 11px; }
+.switch-copy strong { display: block; }
+.switch-copy span { color: var(--muted); font-size: 12px; }
+.toggle-switch { position: relative; display: inline-flex; align-items: center; gap: 8px; }
+.toggle-switch input { position: absolute; opacity: 0; pointer-events: none; }
+.switch-track { width: 48px; height: 26px; border-radius: 999px; border: 1px solid var(--line); background: rgba(4,8,20,.7); position: relative; transition: .16s ease; }
+.switch-track::before { content: ""; position: absolute; width: 20px; height: 20px; left: 2px; top: 2px; border-radius: 50%; background: var(--muted); transition: .16s ease; }
+.toggle-switch input:checked + .switch-track { background: rgba(126,231,214,.22); border-color: var(--accent-2); }
+.toggle-switch input:checked + .switch-track::before { transform: translateX(22px); background: var(--accent-2); }
+.switch-state { min-width: 58px; color: var(--muted); font-size: 12px; font-weight: 760; text-align: right; }
+.action-band { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--line); border-radius: 13px; background: var(--panel); padding: 12px; }
+.terminal-detail { min-height: 320px; max-height: 68vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 11px; background: rgba(2,5,14,.82); color: #d7ffef; padding: 12px; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+@media (max-width: 900px) {
+  .app-header { grid-template-columns: 1fr auto; }
+  .header-status { justify-content: flex-start; }
+  .header-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .metric-strip, .overview-middle, .health-grid, .revision-summary, .config-grid, .form-grid, .history-layout { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<main class="app">
+  <header id="appHeader" class="app-header">
+    <div class="brand"><h1>RiftSync</h1><div class="sub">Live sync for Roblox Studio</div></div>
+    <div class="header-status"><span id="statusPill" class="pill"><span class="dot"></span><span id="statusText">Stopped</span></span><span id="addressText">127.0.0.1:8765</span></div>
+    <div class="header-actions">
+      <button id="logsBtn" class="ghost">Logs</button><button id="startBtn" class="primary">Start</button><button id="stopBtn">Stop</button>
+      <span class="window-actions"><button id="minimizeBtn" class="icon" title="Minimize">_</button><button id="closeBtn" class="icon danger" title="Close">x</button></span>
+    </div>
+  </header>
+  <nav class="tabbar"><button id="overviewTab" class="tab active" data-tab="overviewPanel">Overview</button><button id="historyTab" class="tab" data-tab="historyPanel">History</button><button id="configTab" class="tab" data-tab="configPanel">Config</button></nav>
+  <section class="content">
+    <section id="overviewPanel" class="tab-panel active">
+      <div class="stack">
+        <div id="metricStrip" class="metric-strip">
+          <div class="metric"><div class="label">Sync</div><div id="overviewStatusText" class="value">Stopped</div><div id="uptimeText" class="hint"></div></div>
+          <div class="metric"><div class="label">Revision</div><div id="revisionText" class="value">0</div><div id="modeText" class="hint">Live sync</div></div>
+          <div class="metric"><div class="label">Studio</div><div id="indexedText" class="value">0 items</div><div id="indexedHint" class="hint">Waiting for project</div></div>
+          <div class="metric"><div class="label">Git</div><div id="gitText" class="value">Pending</div><div class="hint">version history</div></div>
+        </div>
+        <div class="overview-middle">
+          <article id="workspacePanel" class="panel project-card">
+            <h2>Project</h2><div class="label">Active folder</div><div id="projectNameText" class="project-name">game</div><div class="hint">Folder path is managed in Config.</div>
+            <div class="row-actions"><button id="openBtn">Open Folder</button><button id="changePathBtn">Edit Path</button></div>
+          </article>
+          <article id="healthPanel" class="panel">
+            <h2>Live status</h2>
+            <div class="health-grid">
+              <div class="health-row"><div class="label">Studio checks</div><div id="pollsText" class="value">0</div><div class="hint">updates watched</div></div>
+              <div class="health-row"><div class="label">App requests</div><div id="requestsText" class="value">0</div><div class="hint">local only</div></div>
+              <div class="health-row"><div class="label">Sync mode</div><div id="healthModeText" class="value">Live sync</div><div class="hint">watch + safety scan</div></div>
+              <div class="health-row"><div class="label">Last scan</div><div id="lastScanText" class="value">Ready</div><div class="hint">background</div></div>
+            </div>
+          </article>
+        </div>
+        <div class="status-band"><div class="label">Last error</div><div class="error-row"><div id="errorText" class="error-summary clear">Clear</div><button id="errorDetailsBtn" class="details-button ghost" type="button" disabled>Details</button></div></div>
+        <div class="status-band"><div class="label">Studio activity</div><div class="activity-card"><div id="activityText" class="error">No Studio activity yet.</div><div id="activityHint" class="hint"></div><div class="activity-bar"><div id="activityFill" class="activity-fill"></div></div></div></div>
+      </div>
+    </section>
+    <section id="historyPanel" class="tab-panel">
+      <div class="history-shell">
+        <div class="panel history-toolbar-panel">
+          <div class="history-toolbar">
+            <div><div class="label">Revision timeline</div><div class="hint">Showing retained project history.</div></div>
+            <button id="historyRefreshBtn">Refresh</button>
+          </div>
+        </div>
+        <div class="history-layout">
+          <div id="historyTimeline" class="history-timeline"><div class="empty">History will appear after file changes publish revisions.</div></div>
+          <article class="panel history-detail-card">
+            <div id="revisionSummary" class="revision-summary"><div class="mini-stat"><div class="label">Revision</div><div class="value">-</div></div><div class="mini-stat"><div class="label">Changes</div><div class="value">0</div></div><div class="mini-stat"><div class="label">Ops</div><div class="hint">-</div></div><div class="mini-stat"><div class="label">Git</div><div class="hint">-</div></div></div>
+            <div id="historyDetail" class="history-detail"><div class="empty">Choose a revision.</div></div>
+          </article>
+        </div>
+      </div>
+    </section>
+    <section id="configPanel" class="tab-panel">
+      <div class="config-shell">
+        <div class="config-grid">
+          <article id="configPathPanel" class="panel">
+            <h2>Path Settings</h2>
+            <div class="field"><label for="syncRootInput">Sync root</label><div class="input-row"><input id="syncRootInput" spellcheck="false"><button id="syncRootPickerBtn" type="button">Choose</button></div></div>
+            <div class="field"><label for="configInput">Config path</label><input id="configInput" spellcheck="false"></div>
+            <div class="hint">This is the only place to change the local folder used by pull/sync.</div>
+          </article>
+          <article id="serverSettingsPanel" class="panel">
+            <h2>Server Settings</h2>
+            <div class="form-grid"><div class="field"><label for="hostInput">Host</label><input id="hostInput" spellcheck="false"></div><div class="field"><label for="portInput">Port</label><input id="portInput" inputmode="numeric"></div></div>
+            <div class="switch-list">
+              <label class="switch-row"><span class="switch-copy"><strong>Debug</strong><span>Extra startup and runtime details.</span></span><span class="toggle-switch"><input id="debugInput" type="checkbox"><span class="switch-track"></span><span id="debugStateText" class="switch-state">Off</span></span></label>
+            </div>
+          </article>
+        </div>
+        <div class="action-band"><div><div class="hint">Host is local-only: 127.0.0.1 or localhost.</div><div id="configApplyStatus" class="hint">Saved</div></div><div class="row-actions" style="margin-top:0"><button id="configOpenBtn">Open Folder</button></div></div>
+      </div>
+    </section>
+  </section>
+</main>
+<div id="errorModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="errorModalTitle">
+  <div class="modal">
+    <div class="modal-head"><div><div class="label">Last error</div><h2 id="errorModalTitle">Error details</h2></div><div class="modal-actions"><button id="copyErrorBtn" type="button">Copy</button><button id="closeErrorBtn" class="danger" type="button">Close</button></div></div>
+    <pre id="errorDetailText" class="error-detail">Clear</pre>
+  </div>
+</div>
+<div id="logsModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="logsModalTitle">
+  <div class="modal">
+    <div class="modal-head"><div><div class="label">Activity log</div><h2 id="logsModalTitle">Local terminal</h2></div><div class="modal-actions"><button id="refreshLogsBtn" type="button">Refresh</button><button id="closeLogsBtn" class="danger" type="button">Close</button></div></div>
+    <pre id="logsText" class="terminal-detail">Logs will appear here.</pre>
+  </div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let latest = null;
+let busy = false;
+let selectedHistoryRev = null;
+let historyRevisions = [];
+let configDirty = false;
+let applyingConfig = false;
+let lastFullError = "";
+let refreshTimer = null;
+let logsOpen = false;
+let logsTimer = null;
+const configControlIds = ["configInput","syncRootInput","hostInput","portInput","syncRootPickerBtn","debugInput"];
+function setBusy(value) { busy = value; ["startBtn","stopBtn","openBtn","configOpenBtn"].forEach(id => $(id).disabled = value); setConfigLocked(value || (latest && (latest.running || latest.starting))); }
+function setConfigLocked(value) { configControlIds.forEach(id => { const node = $(id); if (node) node.disabled = !!value; }); }
+async function api(path, options) { const response = await fetch(path, options || {}); const body = await response.json(); if (!response.ok || body.status === "error") throw new Error(body.error || "request failed"); return body; }
+function setTab(panelId) { document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === panelId)); document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === panelId)); if (panelId === "historyPanel") loadHistoryList(false); }
+function folderName(path) { const clean = String(path || "src/game").replace(/[\\/]+$/, ""); const parts = clean.split(/[\\/]/).filter(Boolean); return parts[parts.length - 1] || clean || "game"; }
+function updateSwitchText() { [["debugInput","debugStateText"]].forEach(([input,text]) => { $(text).textContent = $(input).checked ? "On" : "Off"; }); }
+function errorSummary(value) {
+  const text = String(value || "");
+  if (!text || text === "Clear") return "Clear";
+  const lower = text.toLowerCase();
+  if (lower.includes("filename too long")) return "Git path terlalu panjang. RiftSync akan memakai core.longpaths untuk repo ini.";
+  if (lower.includes("lf will be replaced by crlf")) return "Git line-ending warning. Detail lengkap tersedia.";
+  return text.split(/\r?\n/).find(Boolean) || text;
+}
+function showError(message) {
+  lastFullError = String(message || "");
+  const hasError = lastFullError !== "" && lastFullError !== "Clear";
+  const summary = errorSummary(lastFullError);
+  $("errorText").textContent = summary;
+  $("errorText").title = hasError ? lastFullError : "";
+  $("errorText").classList.toggle("clear", !hasError);
+  $("errorDetailsBtn").disabled = !hasError;
+  $("errorDetailText").textContent = hasError ? lastFullError : "Clear";
+}
+function showErrorModal() { if (lastFullError && lastFullError !== "Clear") $("errorModal").classList.add("open"); }
+function hideErrorModal() { $("errorModal").classList.remove("open"); }
+function setActivityProgress(value, active) {
+  const progress = Math.max(0, Math.min(100, Number(value) || 0));
+  $("activityFill").style.width = active ? progress + "%" : "0%";
+}
+function render(app) {
+  latest = app;
+  $("statusText").textContent = app.status; $("overviewStatusText").textContent = app.status; $("statusPill").className = "pill " + (app.running ? "running" : app.starting ? "starting" : "");
+  $("addressText").textContent = app.address; $("uptimeText").textContent = app.uptime ? "Up " + app.uptime : ""; $("revisionText").textContent = app.revision; $("modeText").textContent = app.mode; $("healthModeText").textContent = app.mode;
+  $("indexedText").textContent = app.indexed + " items"; $("indexedHint").textContent = app.scripts + " scripts · " + app.ui + " UI"; $("projectNameText").textContent = folderName(app.sync_root);
+  if (!configDirty) {
+    $("configInput").value = app.config_path || "sync_config.json"; $("syncRootInput").value = app.sync_root || "src/game"; $("hostInput").value = app.host || "127.0.0.1"; $("portInput").value = app.port || 8765;
+    $("debugInput").checked = !!app.debug; updateSwitchText();
+  }
+  $("requestsText").textContent = app.request_count || 0; $("pollsText").textContent = app.polls || 0; $("gitText").textContent = app.git_status || "Pending"; $("lastScanText").textContent = app.indexed ? app.indexed + " items" : "Ready"; showError(app.last_error || "Clear");
+  $("activityText").textContent = app.activity_text || "No Studio activity yet."; $("activityText").style.color = app.activity_error ? "var(--bad)" : "var(--ink)";
+  const activityBits = []; if (app.activity_operation) activityBits.push(app.activity_operation); if (app.activity_progress) activityBits.push(app.activity_progress + "%"); if (app.activity_revision) activityBits.push("rev " + app.activity_revision);
+  $("activityHint").textContent = activityBits.join(" · ");
+  setActivityProgress(app.activity_progress, !!app.activity_progress && !app.activity_error);
+  $("startBtn").disabled = busy || app.running || app.starting; $("stopBtn").disabled = busy || !app.running;
+  setConfigLocked(busy || app.running || app.starting);
+  if ((app.running || app.starting) && !configDirty && !applyingConfig) setConfigStatus("Stop sync before editing config.", "active");
+  else if (!configDirty && !applyingConfig) setConfigStatus("Saved", "ok");
+}
+function gitSwitchStatus(value) { const text = String(value || "Disabled"); if (text.indexOf("Pending") === 0) return "Pending"; if (text === "Initializing repo") return "Init"; if (text === "Creating initial commit") return "Commit"; if (text === "Checking Git") return "Check"; return text; }
+async function refresh() { try { const body = await api("/app/status"); render(body.app); } catch (err) { showError(err.message); } }
+function nextRefreshDelay() {
+  if (!latest) return 700;
+  const activityRecent = latest.activity_at && ((Date.now() / 1000) - latest.activity_at) < 8;
+  const activityBusy = latest.activity_progress > 0 && latest.activity_progress < 100;
+  return (latest.running || latest.starting || activityRecent || activityBusy) ? 400 : 1500;
+}
+async function refreshLoop() {
+  await refresh();
+  refreshTimer = setTimeout(refreshLoop, nextRefreshDelay());
+}
+function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[char])); }
+function countsText(counts) { if (!counts) return ""; return Object.keys(counts).sort().map((key) => key + ":" + counts[key]).join(" · "); }
+function detailSummary(change) { if (change.source_summary) return (change.source_summary.line_count || 0) + " lines · " + (change.source_summary.char_count || 0) + " chars"; if (change.payload_summary) { const p = change.payload_summary; return "props=" + (p.property_count || 0) + " attrs=" + (p.attribute_count || 0) + " tags=" + (p.tag_count || 0); } return ""; }
+function setRevisionSummary(body, changes) { $("revisionSummary").innerHTML = '<div class="mini-stat"><div class="label">Revision</div><div class="value">' + escapeHtml(body.rev || "-") + '</div></div><div class="mini-stat"><div class="label">Changes</div><div class="value">' + escapeHtml(body.change_count || changes.length || 0) + '</div></div><div class="mini-stat"><div class="label">Ops</div><div class="hint">' + escapeHtml(countsText(body.op_counts) || "-") + '</div></div><div class="mini-stat"><div class="label">Git</div><div class="hint">' + escapeHtml(body.git_commit_short || "-") + '</div></div>'; }
+function renderHistoryTimeline() {
+  const timeline = $("historyTimeline");
+  if (historyRevisions.length === 0) { timeline.innerHTML = '<div class="empty">History will appear after file changes publish revisions.</div>'; return; }
+  timeline.innerHTML = historyRevisions.map((rev) => '<button type="button" class="history-item' + (String(rev.rev) === String(selectedHistoryRev) ? ' active' : '') + '" data-rev="' + escapeHtml(rev.rev) + '"><span class="history-dot"></span><span><span class="history-item-title">Rev ' + escapeHtml(rev.rev) + '</span><span class="history-item-meta">' + escapeHtml(rev.change_count || 0) + ' changes' + (rev.git_commit_short ? ' · ' + escapeHtml(rev.git_commit_short) : '') + '</span></span></button>').join("");
+  timeline.querySelectorAll(".history-item").forEach((item) => item.onclick = () => loadHistoryDetail(item.dataset.rev));
+}
+async function loadHistoryList(selectLatest) {
+  try {
+    const body = await api("/app/history");
+    historyRevisions = body.revisions || []; renderHistoryTimeline();
+    const selectedStillExists = historyRevisions.some((revision) => String(revision.rev) === String(selectedHistoryRev));
+    if ((selectLatest || !selectedHistoryRev || !selectedStillExists) && historyRevisions[0]) loadHistoryDetail(historyRevisions[0].rev);
+    if (historyRevisions.length === 0 && !selectedHistoryRev) { setRevisionSummary({ rev: "-", change_count: 0, op_counts: {}, git_commit_short: "-" }, []); $("historyDetail").innerHTML = '<div class="empty">History will appear after file changes publish revisions.</div>'; }
+  } catch (err) { historyRevisions = []; $("historyTimeline").innerHTML = '<div class="empty">' + escapeHtml(err.message) + '</div>'; }
+}
+async function loadHistoryDetail(revision) {
+  const rev = parseInt(revision, 10); if (!rev) { $("historyDetail").innerHTML = '<div class="empty">Choose a revision first.</div>'; return; }
+  selectedHistoryRev = rev;
+  try {
+    const body = await api("/app/history?rev=" + encodeURIComponent(rev));
+    if (!body.found) { $("historyDetail").innerHTML = '<div class="empty">Revision ' + escapeHtml(rev) + ' was not found.</div>'; return; }
+    const changes = body.changes || []; setRevisionSummary(body, changes);
+    $("historyDetail").innerHTML = changes.length === 0 ? '<div class="empty">No changes in this revision.</div>' : changes.map((change) => {
+      const op = change.op || "upsert"; const entity = change.entity || "-"; const className = change.class_name ? " · " + change.class_name : ""; const mainPath = change.rbx_path || change.new_rbx_path || change.old_rbx_path || change.local_path || "-";
+      const rename = change.old_rbx_path || change.new_rbx_path ? '<div class="change-meta">' + escapeHtml(change.old_rbx_path || "-") + ' -> ' + escapeHtml(change.new_rbx_path || change.rbx_path || "-") + '</div>' : ""; const summary = detailSummary(change);
+      return '<div class="change-row"><strong>' + escapeHtml(op) + ' · ' + escapeHtml(entity) + escapeHtml(className) + '</strong><div class="change-meta">' + escapeHtml(mainPath) + '</div><div class="change-meta">' + escapeHtml(change.local_path || "") + '</div>' + rename + (summary ? '<div class="change-meta">' + escapeHtml(summary) + '</div>' : "") + '</div>';
+    }).join("");
+    renderHistoryTimeline();
+  } catch (err) { $("historyDetail").innerHTML = '<div class="empty">' + escapeHtml(err.message) + '</div>'; }
+}
+async function action(path, options) { setBusy(true); try { const body = await api(path, options || { method: "POST" }); if (body.app) render(body.app); } catch (err) { showError(err.message); } finally { setBusy(false); refresh(); } }
+function setConfigStatus(message, kind) {
+  const node = $("configApplyStatus");
+  node.textContent = message;
+  node.style.color = kind === "error" ? "var(--bad)" : kind === "active" ? "var(--accent-2)" : "var(--muted)";
+}
+function configPayload() {
+  return {
+    config_path: $("configInput").value,
+    sync_root: $("syncRootInput").value,
+    host: $("hostInput").value,
+    port: $("portInput").value,
+    git_enabled: true,
+    debug: $("debugInput").checked,
+    legacy_scan: false
+  };
+}
+async function applyConfig() {
+  if (latest && (latest.running || latest.starting)) { setConfigStatus("Stop sync before editing config.", "error"); return; }
+  if (applyingConfig) return;
+  applyingConfig = true;
+  configDirty = true;
+  setConfigStatus("Applying...", "active");
+  try {
+    const body = await api("/app/config/apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(configPayload()) });
+    configDirty = false;
+    if (body.app) render(body.app);
+    setConfigStatus(body.result === "restarted" ? "Restarted" : "Saved", "ok");
+  } catch (err) {
+    showError(err.message);
+    setConfigStatus(err.message, "error");
+  } finally {
+    applyingConfig = false;
+    refresh();
+  }
+}
+async function pickFolder() {
+  if (latest && (latest.running || latest.starting)) { setConfigStatus("Stop sync before editing config.", "error"); return; }
+  setBusy(true);
+  try {
+    const body = await api("/app/pick-folder", { method: "POST" });
+    if (body.selected && body.path) {
+      configDirty = true;
+      $("syncRootInput").value = body.path;
+      setConfigStatus("Folder selected. Applying...", "active");
+      await applyConfig();
+    } else if (body.app && !configDirty) {
+      render(body.app);
+    }
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    setBusy(false);
+  }
+}
+function requestQuit(path) { fetch(path || "/app/window/close", { method: "POST", keepalive: true }).catch(() => {}); try { if (window.appCloseWindow) window.appCloseWindow(); } catch (_) {} }
+function formatLogTime(seconds) { if (!seconds) return "--:--:--"; return new Date(seconds * 1000).toLocaleTimeString(); }
+function formatLogsPayload(payload) {
+  const lines = [];
+  lines.push("RiftSync local terminal");
+  lines.push("revision=" + (payload.revision || 0) + " running=" + (!!payload.running));
+  if (payload.git) lines.push("git=" + (payload.git.status || "-") + (payload.git.last_commit_short ? " @" + payload.git.last_commit_short : ""));
+  if (payload.metrics && payload.metrics.last_changes) {
+    const c = payload.metrics.last_changes;
+    lines.push("last /changes since=" + (c.since_rev ?? "-") + " target=" + (c.target_rev ?? "-") + " count=" + (c.change_count ?? 0) + " waited=" + (Number(c.waited_sec || 0).toFixed(2)) + "s");
+  }
+  if (payload.activity && payload.activity.text) lines.push("studio=" + payload.activity.text);
+  if (payload.scan_warnings && payload.scan_warnings.length) {
+    lines.push("");
+    lines.push("warnings:");
+    payload.scan_warnings.forEach((warning) => lines.push("  " + warning));
+  }
+  lines.push("");
+  lines.push("events:");
+  (payload.events || []).forEach((event) => lines.push("[" + formatLogTime(event.ts) + "] " + event.kind + "  " + event.message));
+  return lines.join("\n");
+}
+async function loadLogs() {
+  try {
+    const body = await api("/app/logs");
+    $("logsText").textContent = formatLogsPayload(body);
+  } catch (err) {
+    $("logsText").textContent = err.message;
+  }
+}
+function openLogs() {
+  logsOpen = true;
+  $("logsModal").classList.add("open");
+  loadLogs();
+  if (!logsTimer) logsTimer = setInterval(() => { if (logsOpen) loadLogs(); }, 1000);
+}
+function closeLogs() {
+  logsOpen = false;
+  $("logsModal").classList.remove("open");
+  if (logsTimer) { clearInterval(logsTimer); logsTimer = null; }
+}
+document.querySelectorAll(".tab").forEach((tab) => tab.onclick = () => setTab(tab.dataset.tab));
+["configInput","syncRootInput","hostInput","portInput"].forEach((id) => {
+  const input = $(id);
+  input.addEventListener("input", () => { if (input.disabled) return; configDirty = true; setConfigStatus("Unsaved", "active"); });
+  input.addEventListener("blur", () => { if (configDirty) applyConfig(); });
+  input.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); input.blur(); applyConfig(); } });
+});
+document.querySelectorAll(".toggle-switch input").forEach((input) => input.onchange = () => { if (input.disabled) return; configDirty = true; updateSwitchText(); applyConfig(); });
+$("appHeader").addEventListener("mousedown", (event) => { if (event.target.closest("button,input")) return; if (window.appDragWindow) window.appDragWindow(); });
+$("minimizeBtn").onclick = (event) => { event.stopPropagation(); if (window.appMinimizeWindow) window.appMinimizeWindow(); else action("/app/window/minimize"); };
+$("closeBtn").onclick = (event) => { event.stopPropagation(); requestQuit("/app/window/close"); };
+$("startBtn").onclick = () => action("/app/start"); $("stopBtn").onclick = () => action("/app/stop"); $("openBtn").onclick = () => action("/app/open-folder"); $("configOpenBtn").onclick = () => action("/app/open-folder");
+$("changePathBtn").onclick = () => { setTab("configPanel"); $("syncRootInput").focus(); };
+$("syncRootPickerBtn").onclick = pickFolder;
+$("historyRefreshBtn").onclick = () => loadHistoryList(false);
+$("logsBtn").onclick = openLogs;
+$("refreshLogsBtn").onclick = loadLogs;
+$("closeLogsBtn").onclick = closeLogs;
+$("logsModal").onclick = (event) => { if (event.target.id === "logsModal") closeLogs(); };
+$("errorDetailsBtn").onclick = showErrorModal;
+$("closeErrorBtn").onclick = hideErrorModal;
+$("errorModal").onclick = (event) => { if (event.target.id === "errorModal") hideErrorModal(); };
+$("copyErrorBtn").onclick = async () => {
+  const text = lastFullError || "";
+  try { await navigator.clipboard.writeText(text); return; } catch (_) {}
+  const area = document.createElement("textarea");
+  area.value = text; area.style.position = "fixed"; area.style.left = "-9999px";
+  document.body.appendChild(area); area.focus(); area.select();
+  try { document.execCommand("copy"); } catch (_) {}
+  area.remove();
+};
+refreshLoop(); loadHistoryList(false);
+</script>
+</body>
+</html>`
+}

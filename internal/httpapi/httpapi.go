@@ -1,0 +1,616 @@
+package httpapi
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"riftsync/internal/config"
+	"riftsync/internal/scanner"
+	"riftsync/internal/state"
+)
+
+const (
+	protocol            = "rbxsync/2.0.0"
+	legacyProtocol      = "rbxsync/1.0.0"
+	encodingCompactJSON = "compact-json-v1"
+	encodingVerboseJSON = "verbose-json-v1"
+)
+
+type API struct {
+	state          *state.AppState
+	version        string
+	mux            *http.ServeMux
+	scanCache      *scanner.Cache
+	refreshWatches func() error
+}
+
+func New(appState *state.AppState, version string) http.Handler {
+	return NewWithScannerCache(appState, version, scanner.NewCache())
+}
+
+func NewWithScannerCache(appState *state.AppState, version string, scanCache *scanner.Cache) http.Handler {
+	return NewWithScannerCacheAndWatchRefresh(appState, version, scanCache, nil)
+}
+
+func NewWithScannerCacheAndWatchRefresh(appState *state.AppState, version string, scanCache *scanner.Cache, refreshWatches func() error) http.Handler {
+	if scanCache == nil {
+		scanCache = scanner.NewCache()
+	}
+	api := &API{
+		state:          appState,
+		version:        version,
+		mux:            http.NewServeMux(),
+		scanCache:      scanCache,
+		refreshWatches: refreshWatches,
+	}
+	api.routes()
+	return api
+}
+
+func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	a.state.RecordRequest()
+	a.mux.ServeHTTP(w, r)
+}
+
+func (a *API) routes() {
+	a.mux.HandleFunc("/health", a.method(http.MethodGet, a.health))
+	a.mux.HandleFunc("/handshake", a.method(http.MethodPost, a.handshake))
+	a.mux.HandleFunc("/snapshot", a.method(http.MethodGet, a.snapshot))
+	a.mux.HandleFunc("/changes", a.method(http.MethodGet, a.changes))
+	a.mux.HandleFunc("/history", a.method(http.MethodGet, a.history))
+	a.mux.HandleFunc("/history/", a.method(http.MethodGet, a.historyDetailPath))
+	a.mux.HandleFunc("/bootstrap", a.method(http.MethodPost, a.bootstrap))
+	a.mux.HandleFunc("/ack", a.method(http.MethodPost, a.ack))
+	a.mux.HandleFunc("/activity", a.method(http.MethodPost, a.activity))
+	a.mux.HandleFunc("/debug/state", a.method(http.MethodGet, a.debugState))
+}
+
+func (a *API) method(method string, handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != method {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		handler(w, r)
+	}
+}
+
+func (a *API) health(w http.ResponseWriter, _ *http.Request) {
+	cfg := a.state.Config()
+	counts := a.state.IndexedCounts()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":                    "ok",
+		"version":                   a.version,
+		"protocol":                  protocol,
+		"server_rev":                a.state.Revision(),
+		"sync_root":                 cfg.SyncRootAbs,
+		"indexed_entry_count":       counts.Entry,
+		"indexed_script_count":      counts.Script,
+		"indexed_ui_count":          counts.UI,
+		"indexed_props_count":       counts.UI,
+		"strict_property_whitelist": cfg.StrictPropertyWhitelist,
+		"extra_allowed_class_count": len(cfg.ExtraAllowedProperties),
+		"git":                       a.state.GitState(),
+	})
+}
+
+func (a *API) handshake(w http.ResponseWriter, r *http.Request) {
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		payload = map[string]any{}
+	}
+
+	gotProtocol, _ := payload["protocol"].(string)
+	if gotProtocol != protocol && gotProtocol != legacyProtocol {
+		writeError(w, http.StatusConflict, fmt.Sprintf("Protocol mismatch. expected=%s got=%s", protocol, gotProtocol))
+		return
+	}
+	selectedEncoding := selectChangeEncoding(gotProtocol, payload["accept_encodings"])
+
+	clientID, _ := payload["client_id"].(string)
+	if clientID == "" {
+		clientID = "unknown"
+	}
+	sessionID := newSessionID()
+	a.state.RecordHandshake(clientID, sessionID, payload["last_applied_rev"])
+
+	cfg := a.state.Config()
+	counts := a.state.IndexedCounts()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":                     "ok",
+		"version":                    a.version,
+		"protocol":                   protocol,
+		"legacy_protocol":            legacyProtocol,
+		"selected_change_encoding":   selectedEncoding,
+		"supported_change_encodings": []string{encodingCompactJSON, encodingVerboseJSON},
+		"session_id":                 sessionID,
+		"server_rev":                 a.state.Revision(),
+		"poll_timeout_sec":           cfg.PollTimeoutSec,
+		"managed_roots":              cfg.ManagedRoots,
+		"ignored_rbx_paths":          cfg.IgnoredRbxPaths,
+		"indexed_script_count":       counts.Script,
+		"indexed_ui_count":           counts.UI,
+		"indexed_props_count":        counts.UI,
+		"indexed_entry_count":        counts.Entry,
+		"strict_property_whitelist":  cfg.StrictPropertyWhitelist,
+		"extra_allowed_properties":   cfg.ExtraAllowedProperties,
+	})
+}
+
+func (a *API) ack(w http.ResponseWriter, r *http.Request) {
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		payload = map[string]any{}
+	}
+
+	clientID, _ := payload["client_id"].(string)
+	if clientID == "" {
+		clientID = "unknown"
+	}
+	statusText, _ := payload["status"].(string)
+	if statusText == "" {
+		statusText = "ok"
+	}
+	a.state.RecordAck(clientID, statusText, payload["applied_rev"], sanitizeErrors(payload["errors"]))
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (a *API) activity(w http.ResponseWriter, r *http.Request) {
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	text := firstNonEmpty(stringValue(payload["text"]), stringValue(payload["message"]))
+	if strings.TrimSpace(text) == "" {
+		writeError(w, http.StatusBadRequest, "activity text is required")
+		return
+	}
+	if len(text) > 300 {
+		text = text[:300]
+	}
+
+	activity := a.state.RecordActivity(state.Activity{
+		Text:      text,
+		Operation: stringValue(payload["operation"]),
+		Error:     boolValue(payload["error"]),
+		Progress:  intValue(payload["progress"], 0),
+		ClientID:  stringValue(payload["client_id"]),
+		Revision:  intValue(payload["revision"], 0),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "activity": activity})
+}
+
+func (a *API) snapshot(w http.ResponseWriter, r *http.Request) {
+	encoding := requestedChangeEncoding(r.URL.Query().Get("encoding"))
+	var changes []map[string]any
+	if encoding == encodingCompactJSON {
+		changes = a.state.CompactSnapshotUpserts()
+	} else {
+		changes = a.state.SnapshotUpserts()
+	}
+	payload := map[string]any{
+		"status":          "ok",
+		"server_rev":      a.state.Revision(),
+		"change_encoding": encoding,
+		"changes":         changes,
+	}
+	payloadBytes := encodedPayloadBytes(payload)
+	a.state.RecordSnapshotRequest(len(changes), encoding, payloadBytes)
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (a *API) changes(w http.ResponseWriter, r *http.Request) {
+	requestStarted := time.Now()
+
+	sinceRev, err := strconv.Atoi(firstNonEmpty(r.URL.Query().Get("since_rev"), "0"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "since_rev must be an integer")
+		return
+	}
+
+	timeoutSeconds := a.state.Config().PollTimeoutSec
+	if raw := r.URL.Query().Get("timeout"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			timeoutSeconds = parsed
+		}
+	}
+	if timeoutSeconds < 1 {
+		timeoutSeconds = 1
+	}
+	if timeoutSeconds > 60 {
+		timeoutSeconds = 60
+	}
+
+	a.state.WaitForRevisionAfter(sinceRev, time.Duration(timeoutSeconds)*time.Second)
+	encoding := requestedChangeEncoding(r.URL.Query().Get("encoding"))
+	var changesPayload []map[string]any
+	var targetRev int
+	var needsSnapshot bool
+	if encoding == encodingCompactJSON {
+		changesPayload, targetRev, needsSnapshot = a.state.FlattenCompactChanges(sinceRev)
+	} else {
+		changesPayload, targetRev, needsSnapshot = a.state.FlattenChanges(sinceRev)
+	}
+	waitedSec := time.Since(requestStarted).Seconds()
+	timedOut := waitedSec >= float64(timeoutSeconds) && a.state.Revision() <= sinceRev
+	payload := map[string]any{
+		"status":          "ok",
+		"base_rev":        sinceRev,
+		"target_rev":      targetRev,
+		"server_rev":      a.state.Revision(),
+		"needs_snapshot":  needsSnapshot,
+		"change_encoding": encoding,
+		"changes":         changesPayload,
+	}
+	payloadBytes := encodedPayloadBytes(payload)
+	a.state.RecordChangesRequest(sinceRev, targetRev, needsSnapshot, len(changesPayload), timedOut, waitedSec, encoding, payloadBytes)
+
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (a *API) history(w http.ResponseWriter, r *http.Request) {
+	if revArg := r.URL.Query().Get("rev"); revArg != "" {
+		revision, err := strconv.Atoi(revArg)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "rev must be an integer")
+			return
+		}
+		a.writeHistoryDetail(w, revision)
+		return
+	}
+
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "ok",
+		"server_rev": a.state.Revision(),
+		"git":        a.state.GitState(),
+		"revisions":  a.state.RevisionSummaries(limit),
+	})
+}
+
+func (a *API) historyDetailPath(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimPrefix(r.URL.Path, "/history/")
+	revision, err := strconv.Atoi(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "rev must be an integer")
+		return
+	}
+	a.writeHistoryDetail(w, revision)
+}
+
+func (a *API) writeHistoryDetail(w http.ResponseWriter, revision int) {
+	summary, changes, found := a.state.RevisionDetail(revision)
+	payload := map[string]any{
+		"status":     "ok",
+		"found":      found,
+		"rev":        revision,
+		"server_rev": a.state.Revision(),
+		"git":        a.state.GitState(),
+		"changes":    changes,
+	}
+	if found {
+		payload["ts"] = summary.TS
+		payload["change_count"] = summary.ChangeCount
+		payload["op_counts"] = summary.OpCounts
+		payload["entity_counts"] = summary.EntityCounts
+		payload["git_commit"] = summary.GitCommit
+		payload["git_commit_short"] = summary.GitCommitShort
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		payload = map[string]any{}
+	}
+
+	mode, _ := payload["mode"].(string)
+	if mode == "" {
+		mode = "replace"
+	}
+	if mode != "replace" && mode != "merge" {
+		writeError(w, http.StatusBadRequest, "Unsupported bootstrap mode")
+		return
+	}
+	files, ok := payload["files"].([]any)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "files must be an array")
+		return
+	}
+
+	cfg := a.state.Config()
+	writeErrors := []string{}
+	writtenCount := 0
+	newCount := 0
+	updatedCount := 0
+	unchangedCount := 0
+	deletedCount := 0
+
+	if mode == "replace" {
+		count, err := clearSyncRootContents(cfg.SyncRootAbs)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Unable to reset sync_root: "+err.Error())
+			return
+		}
+		a.scanCache.InvalidateSubtree(".")
+		deletedCount = count
+	}
+
+	for _, rawItem := range files {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			writeErrors = append(writeErrors, "Invalid file payload entry")
+			continue
+		}
+		localPath := fmt.Sprint(item["local_path"])
+		source, ok := item["source"].(string)
+		if !ok {
+			writeErrors = append(writeErrors, fmt.Sprintf("Invalid source for %s", localPath))
+			continue
+		}
+		target, err := cfg.ResolveInsideSyncRoot(localPath)
+		if err != nil {
+			writeErrors = append(writeErrors, fmt.Sprintf("Invalid local_path %s", localPath))
+			continue
+		}
+
+		targetExists := false
+		if info, err := os.Stat(target); err == nil && !info.IsDir() {
+			targetExists = true
+		}
+		if mode == "merge" && targetExists {
+			existingSource, err := os.ReadFile(target)
+			if err != nil {
+				writeErrors = append(writeErrors, fmt.Sprintf("Failed reading existing %s: %v", localPath, err))
+				continue
+			}
+			if normalizePullText(string(existingSource)) == normalizePullText(source) {
+				unchangedCount++
+				continue
+			}
+		}
+
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			writeErrors = append(writeErrors, fmt.Sprintf("Failed creating parent for %s: %v", localPath, err))
+			continue
+		}
+		if err := os.WriteFile(target, []byte(source), 0o644); err != nil {
+			writeErrors = append(writeErrors, fmt.Sprintf("Failed writing %s: %v", localPath, err))
+			continue
+		}
+		a.scanCache.Invalidate(localPath)
+		writtenCount++
+		if targetExists {
+			updatedCount++
+		} else {
+			newCount++
+		}
+	}
+
+	if a.refreshWatches != nil {
+		if err := a.refreshWatches(); err != nil {
+			writeErrors = append(writeErrors, fmt.Sprintf("Failed refreshing file watcher: %v", err))
+		}
+	}
+
+	scanStarted := time.Now()
+	snapshot, scanErr := a.scanCache.Scan(cfg)
+	if scanErr != nil {
+		writeErrors = append(writeErrors, scanErr.Error())
+	}
+	a.state.ApplySnapshot(snapshot.Records, snapshot.Warnings, snapshot.InvalidPaths)
+	a.state.RecordPerformance(len(files), 0, time.Since(scanStarted), 0, snapshot.CacheHits, snapshot.CacheMisses)
+	a.state.RecordBootstrap(writtenCount, updatedCount, unchangedCount, deletedCount, len(writeErrors))
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":          "ok",
+		"written_count":   writtenCount,
+		"new_count":       newCount,
+		"updated_count":   updatedCount,
+		"unchanged_count": unchangedCount,
+		"deleted_count":   deletedCount,
+		"error_count":     len(writeErrors),
+		"errors":          writeErrors,
+		"scan_warnings":   firstWarnings(snapshot.Warnings, 20),
+		"server_rev":      a.state.Revision(),
+	})
+}
+
+func (a *API) debugState(w http.ResponseWriter, r *http.Request) {
+	limit := 40
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			if parsed < 1 {
+				parsed = 1
+			}
+			if parsed > 200 {
+				parsed = 200
+			}
+			limit = parsed
+		}
+	}
+
+	cfg := a.state.Config()
+	counts := a.state.IndexedCounts()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":                    "ok",
+		"server_rev":                a.state.Revision(),
+		"indexed_entry_count":       counts.Entry,
+		"indexed_script_count":      counts.Script,
+		"indexed_ui_count":          counts.UI,
+		"indexed_props_count":       counts.UI,
+		"sessions_active":           a.state.SessionsActive(),
+		"sync_root":                 cfg.SyncRootAbs,
+		"scan_interval_sec":         cfg.ScanIntervalSec,
+		"strict_property_whitelist": cfg.StrictPropertyWhitelist,
+		"extra_allowed_properties":  cfg.ExtraAllowedProperties,
+		"extra_allowed_class_count": len(cfg.ExtraAllowedProperties),
+		"git":                       a.state.GitState(),
+		"metrics":                   a.state.Metrics(),
+		"activity":                  a.state.Activity(),
+		"events":                    a.state.Events(limit),
+		"scan_warnings":             a.state.ScanWarnings(limit),
+	})
+}
+
+func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func encodedPayloadBytes(payload any) int {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0
+	}
+	return len(body)
+}
+
+func requestedChangeEncoding(raw string) string {
+	if raw == encodingCompactJSON {
+		return encodingCompactJSON
+	}
+	return encodingVerboseJSON
+}
+
+func selectChangeEncoding(protocolValue string, value any) string {
+	raw, ok := value.([]any)
+	if !ok {
+		if protocolValue == protocol {
+			return encodingCompactJSON
+		}
+		return encodingVerboseJSON
+	}
+	for _, item := range raw {
+		if text, ok := item.(string); ok && text == encodingCompactJSON {
+			return encodingCompactJSON
+		}
+	}
+	return encodingVerboseJSON
+}
+
+func writeError(w http.ResponseWriter, statusCode int, message string) {
+	writeJSON(w, statusCode, map[string]any{
+		"status":  "error",
+		"message": message,
+	})
+}
+
+func sanitizeErrors(value any) []string {
+	raw, ok := value.([]any)
+	if !ok {
+		return []string{}
+	}
+	limit := len(raw)
+	if limit > 5 {
+		limit = 5
+	}
+	result := make([]string, 0, limit)
+	for _, item := range raw[:limit] {
+		result = append(result, fmt.Sprint(item))
+	}
+	return result
+}
+
+func newSessionID() string {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "session-fallback"
+	}
+	bytes[6] = (bytes[6] & 0x0f) | 0x40
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(bytes[:])
+	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32]
+}
+
+func clearSyncRootContents(syncRoot string) (int, error) {
+	if err := os.MkdirAll(syncRoot, 0o755); err != nil {
+		return 0, err
+	}
+	entries, err := os.ReadDir(syncRoot)
+	if err != nil {
+		return 0, err
+	}
+	deleted := 0
+	for _, entry := range entries {
+		if entry.Name() == ".git" || entry.Name() == config.MetadataDir {
+			continue
+		}
+		target := filepath.Join(syncRoot, entry.Name())
+		if err := os.RemoveAll(target); err != nil {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
+func normalizePullText(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	return strings.ReplaceAll(value, "\r", "\n")
+}
+
+func firstWarnings(warnings []string, limit int) []string {
+	if len(warnings) <= limit {
+		return warnings
+	}
+	return warnings[:limit]
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func stringValue(value any) string {
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprint(value)
+}
+
+func boolValue(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return typed == "true" || typed == "1"
+	default:
+		return false
+	}
+}
+
+func intValue(value any, fallback int) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case string:
+		parsed, err := strconv.Atoi(typed)
+		if err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
