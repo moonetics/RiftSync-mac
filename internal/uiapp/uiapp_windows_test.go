@@ -141,6 +141,9 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`errorDetailText`,
 		`copyErrorBtn`,
 		`activity_progress`,
+		`aria-live="polite"`,
+		`aria-busy="false"`,
+		`role="progressbar"`,
 		`setConfigLocked`,
 		`Stop sync before editing config.`,
 		`syncRootPickerBtn`,
@@ -261,6 +264,67 @@ func TestConfigApplyStoppedSavesWithoutStarting(t *testing.T) {
 	}
 	if !strings.Contains(string(cfg), `"git_versioning_enabled": true`) {
 		t.Fatalf("saved config did not force git on: %s", string(cfg))
+	}
+}
+
+func TestConfigApplyStoppedStatusUsesNewPathAfterPreviousRun(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sync_config.json")
+	oldSyncRoot := filepath.Join(root, "old-game")
+	newSyncRoot := filepath.Join(root, "new-game")
+	port := freePort(t)
+	configBody, err := json.Marshal(map[string]any{
+		"host":      "127.0.0.1",
+		"port":      port,
+		"sync_root": oldSyncRoot,
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, configBody, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	runner := serverapp.New(serverapp.Options{ConfigPath: configPath, PortOverride: -1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := runner.Start(ctx); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := runner.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop returned error: %v", err)
+	}
+
+	controller := &appController{
+		runner:  runner,
+		options: serverapp.Options{ConfigPath: configPath, PortOverride: -1},
+		ctx:     ctx,
+		quit:    make(chan struct{}),
+	}
+	mux := http.NewServeMux()
+	controller.registerRoutes(mux)
+
+	body, err := json.Marshal(map[string]any{
+		"config_path": configPath,
+		"sync_root":   newSyncRoot,
+		"host":        "127.0.0.1",
+		"port":        strconv.Itoa(port),
+		"git_enabled": true,
+		"debug":       false,
+		"legacy_scan": false,
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/app/config/apply", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("/app/config/apply code=%d body=%q", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"sync_root":"`+strings.ReplaceAll(newSyncRoot, `\`, `\\`)+`"`) {
+		t.Fatalf("response kept stale sync root: %s", response.Body.String())
 	}
 }
 

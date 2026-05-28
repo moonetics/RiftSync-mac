@@ -631,7 +631,7 @@ func (a *appController) configLocked() bool {
 }
 
 func hydrateStoppedStatus(status serverapp.Status, options serverapp.Options) serverapp.Status {
-	if status.Port > 0 && status.SyncRoot != "" && status.ConfigPath != "" {
+	if status.Running && status.Port > 0 && status.SyncRoot != "" && status.ConfigPath != "" {
 		return status
 	}
 	cfg, err := config.Load(fallback(options.ConfigPath, "sync_config.json"))
@@ -649,7 +649,14 @@ func hydrateStoppedStatus(status serverapp.Status, options serverapp.Options) se
 		if options.GitVersioningOverride != nil {
 			cfg.GitVersioningEnabled = *options.GitVersioningOverride
 		}
-		if status.Host == "" {
+		if !status.Running {
+			status.Host = cfg.Host
+			status.Port = cfg.Port
+			status.SyncRoot = cfg.SyncRootAbs
+			if status.SyncRoot == "" {
+				status.SyncRoot = cfg.SyncRoot
+			}
+		} else if status.Host == "" {
 			status.Host = cfg.Host
 		}
 		if status.Port == 0 {
@@ -664,7 +671,15 @@ func hydrateStoppedStatus(status serverapp.Status, options serverapp.Options) se
 		status.Git.Enabled = true
 	} else {
 		defaults := config.Default()
-		if status.Host == "" {
+		if !status.Running {
+			status.Host = fallback(options.HostOverride, defaults.Host)
+			if options.PortOverride > 0 {
+				status.Port = options.PortOverride
+			} else {
+				status.Port = defaults.Port
+			}
+			status.SyncRoot = fallback(options.SyncRootOverride, defaults.SyncRoot)
+		} else if status.Host == "" {
 			status.Host = fallback(options.HostOverride, defaults.Host)
 		}
 		if status.Port == 0 {
@@ -1194,6 +1209,11 @@ button:focus-visible, input:focus-visible, .toggle-switch input:focus-visible + 
 .activity-card { min-width: 0; }
 .activity-bar { height: 7px; margin-top: 8px; border-radius: 999px; background: rgba(4,8,20,.7); border: 1px solid var(--line); overflow: hidden; }
 .activity-fill { width: 0%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .18s ease; }
+.activity-card.busy .activity-fill { width: 42%; animation: activity-slide 1.05s ease-in-out infinite; }
+@keyframes activity-slide {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(250%); }
+}
 .modal-backdrop { position: fixed; inset: 0; z-index: 500; display: none; place-items: center; background: rgba(2,6,18,.72); padding: 22px; }
 .modal-backdrop.open { display: grid; }
 .modal { width: min(860px, 100%); max-height: min(620px, 88vh); display: grid; grid-template-rows: auto 1fr; gap: 12px; border: 1px solid var(--line); border-radius: 14px; background: #10162a; box-shadow: 0 24px 70px rgba(0,0,0,.48); padding: 15px; }
@@ -1257,7 +1277,7 @@ input { width: 100%; border: 1px solid var(--line); border-radius: 10px; backgro
 <main class="app">
   <header id="appHeader" class="app-header">
     <div class="brand"><h1>RiftSync</h1><div class="sub">Live sync for Roblox Studio</div></div>
-    <div class="header-status"><span id="statusPill" class="pill"><span class="dot"></span><span id="statusText">Stopped</span></span><span id="addressText">127.0.0.1:8765</span></div>
+    <div class="header-status"><span id="statusPill" class="pill" role="status" aria-live="polite"><span class="dot"></span><span id="statusText">Stopped</span></span><span id="addressText">127.0.0.1:8765</span></div>
     <div class="header-actions">
       <button id="logsBtn" class="ghost">Logs</button><button id="startBtn" class="primary">Start</button><button id="stopBtn">Stop</button>
       <span class="window-actions"><button id="minimizeBtn" class="icon" title="Minimize">_</button><button id="closeBtn" class="icon danger" title="Close">x</button></span>
@@ -1289,7 +1309,7 @@ input { width: 100%; border: 1px solid var(--line); border-radius: 10px; backgro
           </article>
         </div>
         <div class="status-band"><div class="label">Last error</div><div class="error-row"><div id="errorText" class="error-summary clear">Clear</div><button id="errorDetailsBtn" class="details-button ghost" type="button" disabled>Details</button></div></div>
-        <div class="status-band"><div class="label">Studio activity</div><div class="activity-card"><div id="activityText" class="error">No Studio activity yet.</div><div id="activityHint" class="hint"></div><div class="activity-bar"><div id="activityFill" class="activity-fill"></div></div></div></div>
+        <div class="status-band"><div class="label">Studio activity</div><div class="activity-card" role="status" aria-live="polite" aria-busy="false"><div id="activityText" class="error">No Studio activity yet.</div><div id="activityHint" class="hint"></div><div class="activity-bar" role="progressbar" aria-label="Sync activity"><div id="activityFill" class="activity-fill"></div></div></div></div>
       </div>
     </section>
     <section id="historyPanel" class="tab-panel">
@@ -1384,7 +1404,19 @@ function showErrorModal() { if (lastFullError && lastFullError !== "Clear") $("e
 function hideErrorModal() { $("errorModal").classList.remove("open"); }
 function setActivityProgress(value, active) {
   const progress = Math.max(0, Math.min(100, Number(value) || 0));
+  const card = $("activityText").parentElement;
+  card.classList.remove("busy");
+  card.setAttribute("aria-busy", "false");
   $("activityFill").style.width = active ? progress + "%" : "0%";
+  $("activityFill").style.transform = "";
+}
+function setStartupProgress(active) {
+  const card = $("activityText").parentElement;
+  card.classList.toggle("busy", !!active);
+  card.setAttribute("aria-busy", active ? "true" : "false");
+  if (active) {
+    $("activityFill").style.width = "42%";
+  }
 }
 function render(app) {
   latest = app;
@@ -1396,10 +1428,10 @@ function render(app) {
     $("debugInput").checked = !!app.debug; updateSwitchText();
   }
   $("requestsText").textContent = app.request_count || 0; $("pollsText").textContent = app.polls || 0; $("gitText").textContent = app.git_status || "Pending"; $("lastScanText").textContent = app.indexed ? app.indexed + " items" : "Ready"; showError(app.last_error || "Clear");
-  $("activityText").textContent = app.activity_text || "No Studio activity yet."; $("activityText").style.color = app.activity_error ? "var(--bad)" : "var(--ink)";
+  $("activityText").textContent = app.starting ? "Starting server and scanning project files..." : (app.activity_text || "No Studio activity yet."); $("activityText").style.color = app.activity_error ? "var(--bad)" : "var(--ink)";
   const activityBits = []; if (app.activity_operation) activityBits.push(app.activity_operation); if (app.activity_progress) activityBits.push(app.activity_progress + "%"); if (app.activity_revision) activityBits.push("rev " + app.activity_revision);
-  $("activityHint").textContent = activityBits.join(" · ");
-  setActivityProgress(app.activity_progress, !!app.activity_progress && !app.activity_error);
+  $("activityHint").textContent = app.starting ? "Preparing watcher, Git, and local index" : activityBits.join(" · ");
+  if (app.starting) setStartupProgress(true); else setActivityProgress(app.activity_progress, !!app.activity_progress && !app.activity_error);
   $("startBtn").disabled = busy || app.running || app.starting; $("stopBtn").disabled = busy || !app.running;
   setConfigLocked(busy || app.running || app.starting);
   if ((app.running || app.starting) && !configDirty && !applyingConfig) setConfigStatus("Stop sync before editing config.", "active");
@@ -1451,7 +1483,23 @@ async function loadHistoryDetail(revision) {
     renderHistoryTimeline();
   } catch (err) { $("historyDetail").innerHTML = '<div class="empty">' + escapeHtml(err.message) + '</div>'; }
 }
-async function action(path, options) { setBusy(true); try { const body = await api(path, options || { method: "POST" }); if (body.app) render(body.app); } catch (err) { showError(err.message); } finally { setBusy(false); refresh(); } }
+function showStartPending() {
+  const app = latest || {};
+  render({
+    ...app,
+    address: app.address || "127.0.0.1:8765",
+    host: app.host || "127.0.0.1",
+    port: app.port || 8765,
+    sync_root: app.sync_root || $("syncRootInput").value || "src/game",
+    config_path: app.config_path || $("configInput").value || "sync_config.json",
+    starting: true,
+    running: false,
+    status: "Starting",
+    activity_error: false,
+    activity_text: "Starting server and scanning project files..."
+  });
+}
+async function action(path, options) { setBusy(true); if (path === "/app/start") showStartPending(); try { const body = await api(path, options || { method: "POST" }); if (body.app) render(body.app); } catch (err) { showError(err.message); } finally { setBusy(false); refresh(); } }
 function setConfigStatus(message, kind) {
   const node = $("configApplyStatus");
   node.textContent = message;
