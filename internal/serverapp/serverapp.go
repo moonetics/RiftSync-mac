@@ -41,6 +41,7 @@ type Runner struct {
 	watcher    *watcher.Service
 	cancel     context.CancelFunc
 	done       chan error
+	safetyDone <-chan struct{}
 	running    bool
 	startedAt  time.Time
 }
@@ -135,7 +136,7 @@ func (r *Runner) Start(parent context.Context) error {
 		_ = watchService.Close()
 		return fmt.Errorf("watcher error: %w", err)
 	}
-	StartSafetyScanner(ctx, cfg, scanCache, appState, watchService, options.Debug, options.Stdout)
+	safetyDone := StartSafetyScanner(ctx, cfg, scanCache, appState, watchService, options.Debug, options.Stdout)
 
 	server := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
@@ -162,6 +163,7 @@ func (r *Runner) Start(parent context.Context) error {
 	r.watcher = watchService
 	r.cancel = cancel
 	r.done = done
+	r.safetyDone = safetyDone
 	r.running = true
 	r.startedAt = time.Now()
 	r.mu.Unlock()
@@ -177,6 +179,7 @@ func (r *Runner) Stop(ctx context.Context) error {
 	server := r.server
 	cancel := r.cancel
 	done := r.done
+	safetyDone := r.safetyDone
 	gitService := r.gitService
 	watchService := r.watcher
 	r.running = false
@@ -185,15 +188,22 @@ func (r *Runner) Stop(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
+	var shutdownErr error
+	if server != nil {
+		shutdownErr = server.Shutdown(ctx)
+	}
+	if safetyDone != nil {
+		select {
+		case <-safetyDone:
+		case <-ctx.Done():
+			shutdownErr = ctx.Err()
+		}
+	}
 	if watchService != nil {
 		_ = watchService.Close()
 	}
 	if gitService != nil {
 		gitService.Close()
-	}
-	var shutdownErr error
-	if server != nil {
-		shutdownErr = server.Shutdown(ctx)
 	}
 	if done != nil {
 		select {
@@ -320,12 +330,14 @@ func normalizeOptions(options Options) Options {
 	return options
 }
 
-func StartSafetyScanner(ctx context.Context, cfg config.Config, scanCache *scanner.Cache, appState *state.AppState, watchService *watcher.Service, debug bool, stdout io.Writer) {
+func StartSafetyScanner(ctx context.Context, cfg config.Config, scanCache *scanner.Cache, appState *state.AppState, watchService *watcher.Service, debug bool, stdout io.Writer) <-chan struct{} {
 	interval := time.Duration(cfg.ScanIntervalSec * float64(time.Second))
 	if interval <= 0 {
 		interval = 400 * time.Millisecond
 	}
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -347,16 +359,20 @@ func StartSafetyScanner(ctx context.Context, cfg config.Config, scanCache *scann
 			}
 		}
 	}()
+	return done
 }
 
-func StartLegacyScanner(ctx context.Context, cfg config.Config, scanCache *scanner.Cache, appState *state.AppState, debug bool, stdout io.Writer) {
-	StartSafetyScanner(ctx, cfg, scanCache, appState, nil, debug, stdout)
+func StartLegacyScanner(ctx context.Context, cfg config.Config, scanCache *scanner.Cache, appState *state.AppState, debug bool, stdout io.Writer) <-chan struct{} {
+	return StartSafetyScanner(ctx, cfg, scanCache, appState, nil, debug, stdout)
 }
 
 func LegacyScanOnce(cfg config.Config, scanCache *scanner.Cache, appState *state.AppState, interval time.Duration) (state.RevisionEvent, error) {
 	if scanCache == nil {
 		scanCache = scanner.NewCache()
 	}
+	appState.LockReconciliation()
+	defer appState.UnlockReconciliation()
+
 	scanStarted := time.Now()
 	snapshot, err := scanCache.Scan(cfg)
 	parseDuration := time.Since(scanStarted)

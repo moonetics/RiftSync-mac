@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"riftsync/internal/records"
 	"riftsync/internal/scanner"
 	"riftsync/internal/state"
+	"riftsync/internal/watcher"
 )
 
 func newTestHandler(t *testing.T) http.Handler {
@@ -492,6 +495,53 @@ func TestBootstrapMergeWriteAndChanges(t *testing.T) {
 	}
 }
 
+func TestBootstrapWaitsForReconciliationLock(t *testing.T) {
+	cfg := config.Default()
+	root := t.TempDir()
+	cfg.SyncRoot = root
+	handler, appState := newTestHandlerWithConfig(t, cfg)
+	target := filepath.Join(root, "ServerScriptService", "Foo.server.luau")
+
+	appState.LockReconciliation()
+	locked := true
+	defer func() {
+		if locked {
+			appState.UnlockReconciliation()
+		}
+	}()
+
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		body := `{"mode":"merge","files":[{"local_path":"ServerScriptService/Foo.server.luau","source":"print(1)"}]}`
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap", bytes.NewBufferString(body)))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("bootstrap completed while reconciliation lock was held")
+	case <-time.After(25 * time.Millisecond):
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("bootstrap wrote target while reconciliation lock was held: %v", err)
+	}
+
+	appState.UnlockReconciliation()
+	locked = false
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap did not resume after reconciliation lock was released")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("written file missing: %v", err)
+	}
+}
+
 func TestBootstrapRefreshesWatches(t *testing.T) {
 	cfg := config.Default()
 	root := t.TempDir()
@@ -502,18 +552,90 @@ func TestBootstrapRefreshesWatches(t *testing.T) {
 	appState := state.New(cfg)
 	refreshCount := 0
 	handler := NewWithScannerCacheAndWatchRefresh(appState, "3.0.0", scanner.NewCache(), func() error {
+		appState.LockReconciliation()
+		defer appState.UnlockReconciliation()
 		refreshCount++
 		return nil
 	})
 
 	body := `{"mode":"merge","files":[{"local_path":"ServerScriptService/Pulled/Foo.server.luau","source":"print(1)"}]}`
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap", bytes.NewBufferString(body)))
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap", bytes.NewBufferString(body)))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap deadlocked while refreshing watches")
+	}
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
 	}
 	if refreshCount != 1 {
 		t.Fatalf("refreshCount = %d, want 1", refreshCount)
+	}
+}
+
+func TestBootstrapRefreshesRealWatcherWithoutDeadlock(t *testing.T) {
+	cfg := config.Default()
+	root := t.TempDir()
+	cfg.SyncRoot = root
+	cfg.GitVersioningEnabled = false
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		t.Fatalf("NormalizeAndValidate returned error: %v", err)
+	}
+	appState := state.New(cfg)
+	cache := scanner.NewCache()
+	watchService, err := watcher.New(cfg, appState, watcher.Options{
+		Cache:    cache,
+		Debounce: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("watcher.New returned error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := watchService.Start(ctx); err != nil {
+		cancel()
+		_ = watchService.Close()
+		t.Fatalf("watcher.Start returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = watchService.Close()
+	})
+
+	handler := NewWithScannerCacheAndWatchRefresh(appState, "3.0.0", cache, func() error {
+		_, err := watchService.SyncTree()
+		return err
+	})
+	files := make([]map[string]any, 0, 150)
+	for index := 0; index < 150; index++ {
+		files = append(files, map[string]any{
+			"local_path": fmt.Sprintf("ServerScriptService/Nested%d/Foo.server.luau", index),
+			"source":     fmt.Sprintf("print(%d)", index),
+		})
+	}
+	body, err := json.Marshal(map[string]any{"mode": "replace", "files": files})
+	if err != nil {
+		t.Fatalf("marshal bootstrap payload: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap", bytes.NewReader(body)))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bootstrap deadlocked while refreshing real watcher")
+	}
+	payload := decodeResponse(t, recorder)
+	if recorder.Code != http.StatusOK || payload["written_count"] != float64(len(files)) {
+		t.Fatalf("status=%d payload=%#v", recorder.Code, payload)
 	}
 }
 

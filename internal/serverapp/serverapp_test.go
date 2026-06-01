@@ -10,6 +10,10 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"riftsync/internal/config"
+	"riftsync/internal/scanner"
+	"riftsync/internal/state"
 )
 
 func TestRunnerStartStopAndHealth(t *testing.T) {
@@ -133,6 +137,59 @@ func TestHybridSafetyScannerDetectsNestedLocalSave(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("safety scanner did not detect nested save; status=%#v", runner.Status(5))
+}
+
+func TestLegacyScanOnceWaitsForReconciliationLock(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.SyncRoot = root
+	cfg.GitVersioningEnabled = false
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		t.Fatalf("NormalizeAndValidate returned error: %v", err)
+	}
+	cache := scanner.NewCache()
+	appState := state.New(cfg)
+	target := filepath.Join(root, "ServerScriptService", "Foo.server.luau")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("print(1)"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	appState.LockReconciliation()
+	locked := true
+	defer func() {
+		if locked {
+			appState.UnlockReconciliation()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := LegacyScanOnce(cfg, cache, appState, 10*time.Millisecond)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("LegacyScanOnce completed while reconciliation lock was held: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	appState.UnlockReconciliation()
+	locked = false
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("LegacyScanOnce returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LegacyScanOnce did not resume after reconciliation lock was released")
+	}
+	if appState.Revision() != 1 {
+		t.Fatalf("revision = %d, want 1", appState.Revision())
+	}
 }
 
 func freePort(t *testing.T) int {

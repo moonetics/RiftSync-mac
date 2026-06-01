@@ -126,6 +126,7 @@ type Session struct {
 
 type AppState struct {
 	mu              sync.Mutex
+	reconcileMu     sync.Mutex
 	cfg             config.Config
 	bootTime        time.Time
 	revision        int
@@ -180,6 +181,14 @@ func initialGitStatus(enabled bool) string {
 
 func (s *AppState) Config() config.Config {
 	return s.cfg
+}
+
+func (s *AppState) LockReconciliation() {
+	s.reconcileMu.Lock()
+}
+
+func (s *AppState) UnlockReconciliation() {
+	s.reconcileMu.Unlock()
 }
 
 func (s *AppState) Revision() int {

@@ -1,7 +1,7 @@
 {
   "host": "127.0.0.1",
   "port": 8765,
-  "sync_root": "C:\\Users\\BIMO YUDISTIRA ARIEL\\Documents\\maproblox\\summitkitblue",
+  "sync_root": "C:\\Users\\BIMO YUDISTIRA ARIEL\\Documents\\maproblox\\mtdranix",
   "scan_interval_sec": 0.4,
   "poll_timeout_sec": 25,
   "change_retention": 2048,

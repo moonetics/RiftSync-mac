@@ -32,6 +32,7 @@ type Service struct {
 	notifications  chan revisionRequest
 	stopOnce       sync.Once
 	cancel         context.CancelFunc
+	wg             sync.WaitGroup
 }
 
 type revisionRequest struct {
@@ -77,7 +78,11 @@ func (s *Service) Start(parent context.Context) {
 		Status:   state.GitStatusChecking,
 		RepoPath: s.cfg.SyncRootAbs,
 	})
-	go s.run(ctx)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.run(ctx)
+	}()
 }
 
 func (s *Service) Close() {
@@ -86,6 +91,7 @@ func (s *Service) Close() {
 			s.cancel()
 		}
 	})
+	s.wg.Wait()
 }
 
 func (s *Service) NotifyRevision(event state.RevisionEvent) {

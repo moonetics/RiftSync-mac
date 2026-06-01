@@ -341,9 +341,11 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	unchangedCount := 0
 	deletedCount := 0
 
+	a.state.LockReconciliation()
 	if mode == "replace" {
 		count, err := clearSyncRootContents(cfg.SyncRootAbs)
 		if err != nil {
+			a.state.UnlockReconciliation()
 			writeError(w, http.StatusInternalServerError, "Unable to reset sync_root: "+err.Error())
 			return
 		}
@@ -401,6 +403,7 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 			newCount++
 		}
 	}
+	a.state.UnlockReconciliation()
 
 	if a.refreshWatches != nil {
 		if err := a.refreshWatches(); err != nil {
@@ -408,6 +411,7 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	a.state.LockReconciliation()
 	scanStarted := time.Now()
 	snapshot, scanErr := a.scanCache.Scan(cfg)
 	if scanErr != nil {
@@ -416,6 +420,7 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	a.state.ApplySnapshot(snapshot.Records, snapshot.Warnings, snapshot.InvalidPaths)
 	a.state.RecordPerformance(len(files), 0, time.Since(scanStarted), 0, snapshot.CacheHits, snapshot.CacheMisses)
 	a.state.RecordBootstrap(writtenCount, updatedCount, unchangedCount, deletedCount, len(writeErrors))
+	a.state.UnlockReconciliation()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":          "ok",

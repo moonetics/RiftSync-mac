@@ -33,9 +33,11 @@ type Service struct {
 	debounce time.Duration
 	watcher  *fsnotify.Watcher
 
-	mu       sync.Mutex
-	watches  map[string]bool
-	stopOnce sync.Once
+	mu        sync.Mutex
+	processMu sync.Mutex
+	watches   map[string]bool
+	stopOnce  sync.Once
+	wg        sync.WaitGroup
 }
 
 type SyncResult struct {
@@ -74,7 +76,11 @@ func (s *Service) Start(ctx context.Context) error {
 	if _, err := s.SyncTree(); err != nil {
 		return err
 	}
-	go s.run(ctx)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.run(ctx)
+	}()
 	return nil
 }
 
@@ -83,6 +89,7 @@ func (s *Service) Close() error {
 	s.stopOnce.Do(func() {
 		err = s.watcher.Close()
 	})
+	s.wg.Wait()
 	return err
 }
 
@@ -97,7 +104,11 @@ func (s *Service) run(ctx context.Context) {
 		}
 		batch := pending
 		pending = map[string]fsnotify.Op{}
-		s.processBatch(batch)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.processBatch(batch)
+		}()
 	}
 
 	for {
@@ -142,12 +153,18 @@ func (s *Service) run(ctx context.Context) {
 }
 
 func (s *Service) processBatch(batch map[string]fsnotify.Op) {
+	s.processMu.Lock()
+	defer s.processMu.Unlock()
+
 	batchStarted := time.Now()
 	paths := make([]string, 0, len(batch))
 	for path := range batch {
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
+
+	s.state.LockReconciliation()
+	defer s.state.UnlockReconciliation()
 
 	nextRecords := s.state.RecordsCopy()
 	warnings := []string{}
@@ -228,6 +245,9 @@ func (s *Service) processBatch(batch map[string]fsnotify.Op) {
 }
 
 func (s *Service) processWarnings(warnings []string) {
+	s.state.LockReconciliation()
+	defer s.state.UnlockReconciliation()
+
 	current := s.state.RecordsCopy()
 	snapshot := scanner.NormalizeRecords(current, warnings, nil)
 	s.state.ApplySnapshot(snapshot.Records, snapshot.Warnings, snapshot.InvalidPaths)

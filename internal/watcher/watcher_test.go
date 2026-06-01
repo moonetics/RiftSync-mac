@@ -88,6 +88,43 @@ func TestProcessBatchCreateEditDelete(t *testing.T) {
 	}
 }
 
+func TestProcessBatchWaitsForReconciliationLock(t *testing.T) {
+	root := t.TempDir()
+	service, appState := newTestService(t, root)
+	target := writeFile(t, root, "ServerScriptService/Foo.server.luau", "print(1)")
+
+	appState.LockReconciliation()
+	locked := true
+	defer func() {
+		if locked {
+			appState.UnlockReconciliation()
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		service.processBatch(map[string]fsnotify.Op{target: fsnotify.Create})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("processBatch completed while reconciliation lock was held")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	appState.UnlockReconciliation()
+	locked = false
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("processBatch did not resume after reconciliation lock was released")
+	}
+	if appState.Revision() != 1 {
+		t.Fatalf("revision = %d, want 1", appState.Revision())
+	}
+}
+
 func TestProcessBatchRenameByHash(t *testing.T) {
 	root := t.TempDir()
 	service, appState := newTestService(t, root)
@@ -169,10 +206,7 @@ func TestSyncTreeAddsFoldersCreatedWithoutFsnotifyEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SyncTree returned error: %v", err)
 	}
-	if result.Added < 3 {
-		t.Fatalf("SyncTree added = %d, want at least 3 for nested path", result.Added)
-	}
-	if service.WatchCount() <= initialCount {
-		t.Fatalf("watch count = %d, want greater than %d", service.WatchCount(), initialCount)
+	if service.WatchCount() < initialCount+3 {
+		t.Fatalf("watch count = %d, want at least %d (SyncTree added=%d)", service.WatchCount(), initialCount+3, result.Added)
 	}
 }
