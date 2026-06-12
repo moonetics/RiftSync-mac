@@ -74,6 +74,30 @@ func decodeResponse(t *testing.T, recorder *httptest.ResponseRecorder) map[strin
 	return payload
 }
 
+func writeFile(t *testing.T, root, rel, body string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func payloadListContains(value any, needle string) bool {
+	items, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		if fmt.Sprint(item) == needle {
+			return true
+		}
+	}
+	return false
+}
+
 func TestHealth(t *testing.T) {
 	handler := newTestHandler(t)
 	recorder := httptest.NewRecorder()
@@ -663,6 +687,82 @@ func TestBootstrapValidation(t *testing.T) {
 	}
 }
 
+func TestBootstrapPreviewReplaceDiffAndNoMutation(t *testing.T) {
+	cfg := config.Default()
+	root := t.TempDir()
+	cfg.SyncRoot = root
+	handler, _ := newTestHandlerWithConfig(t, cfg)
+	writeFile(t, root, "ServerScriptService/Same.server.luau", "print(1)\n")
+	writeFile(t, root, "ServerScriptService/Changed.server.luau", "print('old')")
+	writeFile(t, root, "ServerScriptService/Stale.server.luau", "print('stale')")
+
+	body := `{"mode":"replace","files":[` +
+		`{"local_path":"ServerScriptService/Same.server.luau","source":"print(1)\r\n"},` +
+		`{"local_path":"ServerScriptService/Changed.server.luau","source":"print('new')"},` +
+		`{"local_path":"ServerScriptService/New.server.luau","source":"print('new file')"}]}`
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap/preview", bytes.NewBufferString(body)))
+	payload := decodeResponse(t, recorder)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d payload=%#v", recorder.Code, payload)
+	}
+	if payload["add_count"] != float64(1) || payload["update_count"] != float64(1) || payload["delete_count"] != float64(1) || payload["unchanged_count"] != float64(1) {
+		t.Fatalf("preview counts = %#v", payload)
+	}
+	if !payloadListContains(payload["files_to_add"], "ServerScriptService/New.server.luau") {
+		t.Fatalf("files_to_add = %#v", payload["files_to_add"])
+	}
+	if !payloadListContains(payload["files_to_update"], "ServerScriptService/Changed.server.luau") {
+		t.Fatalf("files_to_update = %#v", payload["files_to_update"])
+	}
+	if !payloadListContains(payload["files_to_delete"], "ServerScriptService/Stale.server.luau") {
+		t.Fatalf("files_to_delete = %#v", payload["files_to_delete"])
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "ServerScriptService", "Changed.server.luau")); err != nil || string(body) != "print('old')" {
+		t.Fatalf("preview mutated changed file: body=%q err=%v", string(body), err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "ServerScriptService", "New.server.luau")); !os.IsNotExist(err) {
+		t.Fatalf("preview wrote new file or unexpected err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "ServerScriptService", "Stale.server.luau")); err != nil {
+		t.Fatalf("preview removed stale file: %v", err)
+	}
+}
+
+func TestBootstrapPreviewIgnoresMetadataAndReportsInvalidPaths(t *testing.T) {
+	cfg := config.Default()
+	root := t.TempDir()
+	cfg.SyncRoot = root
+	handler, _ := newTestHandlerWithConfig(t, cfg)
+	writeFile(t, root, ".git/config", "git")
+	writeFile(t, root, filepath.ToSlash(filepath.Join(config.MetadataDir, "history.json")), "history")
+	writeFile(t, root, filepath.ToSlash(filepath.Join(config.GuidebookDir, "README.md")), "guide")
+	writeFile(t, root, "ServerScriptService/Stale.server.luau", "print('stale')")
+
+	body := `{"mode":"replace","files":[{"local_path":"../outside.server.luau","source":"bad"}]}`
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap/preview", bytes.NewBufferString(body)))
+	payload := decodeResponse(t, recorder)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d payload=%#v", recorder.Code, payload)
+	}
+	if payload["delete_count"] != float64(1) || !payloadListContains(payload["files_to_delete"], "ServerScriptService/Stale.server.luau") {
+		t.Fatalf("delete preview = %#v", payload)
+	}
+	for _, metadataPath := range []string{".git/config", config.MetadataDir + "/history.json", config.GuidebookDir + "/README.md"} {
+		if payloadListContains(payload["files_to_delete"], metadataPath) {
+			t.Fatalf("metadata path %s appeared in delete list: %#v", metadataPath, payload["files_to_delete"])
+		}
+	}
+	errorsPayload, ok := payload["errors"].([]any)
+	if !ok || len(errorsPayload) == 0 {
+		t.Fatalf("errors = %#v, want invalid path error", payload["errors"])
+	}
+	if _, err := os.Stat(filepath.Join(root, "ServerScriptService", "Stale.server.luau")); err != nil {
+		t.Fatalf("preview removed stale file: %v", err)
+	}
+}
+
 func TestBootstrapMergeWriteAndChanges(t *testing.T) {
 	cfg := config.Default()
 	root := t.TempDir()
@@ -916,6 +1016,18 @@ func TestBootstrapReplaceRemovesStaleAndWritesIncoming(t *testing.T) {
 	} else if string(body) != "print('new')" {
 		t.Fatalf("incoming body = %q, want new source", string(body))
 	}
+	backupPath, ok := payload["backup_path"].(string)
+	if !ok || backupPath == "" {
+		t.Fatalf("backup_path = %#v, want backup path", payload["backup_path"])
+	}
+	if body, err := os.ReadFile(filepath.Join(backupPath, "ServerScriptService", "Old.server.luau")); err != nil {
+		t.Fatalf("backup stale file missing: %v", err)
+	} else if string(body) != "print('old')" {
+		t.Fatalf("backup stale body = %q", string(body))
+	}
+	if _, err := os.Stat(filepath.Join(root, config.GuidebookDir, config.GuidebookStatus)); err != nil {
+		t.Fatalf("guidebook status missing after bootstrap: %v", err)
+	}
 }
 
 func TestBootstrapReplacePreservesGitAndDeletesOthers(t *testing.T) {
@@ -974,5 +1086,85 @@ func TestBootstrapReplacePreservesGitAndDeletesOthers(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "old.txt")); !os.IsNotExist(err) {
 		t.Fatalf("old.txt still exists or unexpected err: %v", err)
+	}
+	backupPath, _ := payload["backup_path"].(string)
+	if backupPath == "" {
+		t.Fatal("backup_path empty, want backup path")
+	}
+	if _, err := os.Stat(filepath.Join(backupPath, "old.txt")); err != nil {
+		t.Fatalf("old.txt missing from backup: %v", err)
+	}
+	for _, preserved := range []string{".git", config.MetadataDir, config.GuidebookDir} {
+		if _, err := os.Stat(filepath.Join(backupPath, preserved)); !os.IsNotExist(err) {
+			t.Fatalf("%s copied into backup or unexpected err: %v", preserved, err)
+		}
+	}
+}
+
+func TestBootstrapReplaceBackupFailureAbortsDelete(t *testing.T) {
+	original := createReplaceBackup
+	createReplaceBackup = func(string, time.Time) (string, int, error) {
+		return "", 0, fmt.Errorf("backup boom")
+	}
+	t.Cleanup(func() {
+		createReplaceBackup = original
+	})
+
+	cfg := config.Default()
+	root := t.TempDir()
+	cfg.SyncRoot = root
+	handler, _ := newTestHandlerWithConfig(t, cfg)
+	stalePath := filepath.Join(root, "ServerScriptService", "Old.server.luau")
+	if err := os.MkdirAll(filepath.Dir(stalePath), 0o755); err != nil {
+		t.Fatalf("mkdir stale parent: %v", err)
+	}
+	if err := os.WriteFile(stalePath, []byte("print('old')"), 0o644); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+
+	body := `{"mode":"replace","files":[{"local_path":"ServerScriptService/New.server.luau","source":"print('new')"}]}`
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap", bytes.NewBufferString(body)))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
+	}
+	if body, err := os.ReadFile(stalePath); err != nil {
+		t.Fatalf("stale file removed after backup failure: %v", err)
+	} else if string(body) != "print('old')" {
+		t.Fatalf("stale body = %q", string(body))
+	}
+	if _, err := os.Stat(filepath.Join(root, "ServerScriptService", "New.server.luau")); !os.IsNotExist(err) {
+		t.Fatalf("incoming file written after backup failure or unexpected err: %v", err)
+	}
+}
+
+func TestBootstrapMergeDoesNotBackupOrDeleteStaleFiles(t *testing.T) {
+	cfg := config.Default()
+	root := t.TempDir()
+	cfg.SyncRoot = root
+	handler, _ := newTestHandlerWithConfig(t, cfg)
+	stalePath := filepath.Join(root, "ServerScriptService", "Old.server.luau")
+	if err := os.MkdirAll(filepath.Dir(stalePath), 0o755); err != nil {
+		t.Fatalf("mkdir stale parent: %v", err)
+	}
+	if err := os.WriteFile(stalePath, []byte("print('old')"), 0o644); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+
+	body := `{"mode":"merge","files":[{"local_path":"ServerScriptService/New.server.luau","source":"print('new')"}]}`
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap", bytes.NewBufferString(body)))
+	payload := decodeResponse(t, recorder)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d payload=%#v", recorder.Code, payload)
+	}
+	if payload["backup_path"] != "" || payload["backup_count"] != float64(0) {
+		t.Fatalf("merge backup payload = %#v", payload)
+	}
+	if _, err := os.Stat(stalePath); err != nil {
+		t.Fatalf("stale file missing after merge: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, config.MetadataDir, "backups")); !os.IsNotExist(err) {
+		t.Fatalf("merge created backups dir or unexpected err: %v", err)
 	}
 }

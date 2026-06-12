@@ -61,6 +61,17 @@ func TestRunnerStartStopAndHealth(t *testing.T) {
 	} else if !strings.Contains(string(body), "--config") || !strings.Contains(string(body), " exec @execArgs") {
 		t.Fatalf("guidebook exec launcher content = %q", string(body))
 	}
+	statusBody, err := os.ReadFile(filepath.Join(syncRoot, config.GuidebookDir, config.GuidebookStatus))
+	if err != nil {
+		t.Fatalf("guidebook status missing after start: %v", err)
+	}
+	var statusPayload config.GuidebookStatusPayload
+	if err := json.Unmarshal(statusBody, &statusPayload); err != nil {
+		t.Fatalf("decode guidebook status: %v", err)
+	}
+	if statusPayload.ConfigPath != configPath || statusPayload.SyncRoot != syncRoot || statusPayload.Version != Version || statusPayload.LastKnownRevision != status.Revision {
+		t.Fatalf("guidebook status payload = %#v, runner status=%#v", statusPayload, status)
+	}
 
 	resp, err := http.Get("http://" + status.Host + ":" + strconv.Itoa(status.Port) + "/health")
 	if err != nil {

@@ -1,30 +1,26 @@
 # Changelog
 
-Semua perubahan fitur, fix, penghapusan fitur, atau perubahan perilaku harus menaikkan versi dan dicatat di file ini.
+Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
-## 3.3.0 - 2026-06-12
+## 3.7.0 - 2026-06-12
 
-- Fixed `Pull Studio` to use replace semantics so local files deleted in Studio are removed locally.
-- Kept `.git`, `.rblxsync`, and `.guidebook` preserved during Pull Studio replacement.
-- Pull Studio status/debug summaries now include deleted file counts.
-- Bumped RiftSync server and Studio plugin version from `3.2.0` to `3.3.0`.
+Rilis development terkini. Entry ini menggabungkan iterasi internal `3.1.0` sampai `3.7.0` agar changelog tetap enak dibaca walaupun beberapa perubahan dibuat di hari yang sama.
 
-## 3.2.0 - 2026-06-12
+- Added Remote Exec file shortcut untuk `.lua`/`.luau`, termasuk direct CLI shortcut `riftsync-server.exe exec .\studio-command.lua --timeout 30`.
+- Added script `properties.init.json` support untuk folder-style scripts, termasuk properti `Disabled` untuk `Script` dan `LocalScript`.
+- Fixed `Pull Studio` replace semantics agar file lokal yang sudah dihapus di Studio ikut terhapus secara lokal.
+- Added compact RiftSync brand icon di header desktop app.
+- Added `riftsync-server validate [--json]` untuk validasi config/project non-destruktif.
+- Added generated `.guidebook/status.json` untuk status mesin yang bisa dibaca manusia/AI.
+- Added safe backup `.rblxsync/backups/<timestamp>/` sebelum Pull Studio replace menghapus konten lokal.
+- Added Remote Exec command history di `.rblxsync/exec-history.json`.
+- Added `riftsync-server exec --last` untuk rerun command Remote Exec terakhir.
+- Added desktop app `Exec` tab untuk paste/run Luau, melihat output, dan rerun recent commands.
+- Added non-mutating Pull Studio preview dengan add/update/delete/unchanged counts.
+- Added inline Confirm/Cancel flow di Studio plugin sebelum Pull Studio replace berjalan.
+- Improved Studio plugin health checklist untuk HTTP/server reachability, connection, token, sync, exec, dan edit mode.
 
-- Added script `properties.init.json` support for folder-style scripts.
-- Script source records now carry optional `payload.properties`, so changing `Disabled` on `Script`/`LocalScript` produces a sync delta.
-- Studio apply now writes script properties/attributes/tags after updating script source.
-- Updated README and generated guidebook template with script properties examples.
-- Bumped RiftSync server and Studio plugin version from `3.1.0` to `3.2.0`.
-
-## 3.1.0 - 2026-06-12
-
-- Added Remote Exec file shortcut: `.guidebook/riftsync-exec.ps1 .\studio-command.lua --timeout 30` sekarang otomatis membaca `.lua`/`.luau` sebagai source file.
-- Added direct CLI shortcut: `riftsync-server.exe exec .\studio-command.lua --timeout 30` setara dengan `--file`.
-- Updated generated `.guidebook/README.md` with file-based Remote Exec examples.
-- Bumped RiftSync server and Studio plugin version from `3.0.0` to `3.1.0`.
-
-## 3.0.0 - 2026-06-12
+## 3.0.0 - 2026-05
 
 - Major refactor and migration from the older Python-based local server to a Go-based RiftSync app/server.
 - Added `riftsync.exe` native app launcher and `riftsync-server.exe` console/headless server workflow.

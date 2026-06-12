@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +27,8 @@ const (
 	encodingCompactJSON = "compact-json-v1"
 	encodingVerboseJSON = "verbose-json-v1"
 )
+
+var createReplaceBackup = createReplaceBackupOnDisk
 
 type API struct {
 	state          *state.AppState
@@ -69,6 +73,7 @@ func (a *API) routes() {
 	a.mux.HandleFunc("/changes", a.method(http.MethodGet, a.changes))
 	a.mux.HandleFunc("/history", a.method(http.MethodGet, a.history))
 	a.mux.HandleFunc("/history/", a.method(http.MethodGet, a.historyDetailPath))
+	a.mux.HandleFunc("/bootstrap/preview", a.method(http.MethodPost, a.bootstrapPreview))
 	a.mux.HandleFunc("/bootstrap", a.method(http.MethodPost, a.bootstrap))
 	a.mux.HandleFunc("/ack", a.method(http.MethodPost, a.ack))
 	a.mux.HandleFunc("/activity", a.method(http.MethodPost, a.activity))
@@ -455,6 +460,122 @@ func (a *API) writeHistoryDetail(w http.ResponseWriter, revision int) {
 	writeJSON(w, http.StatusOK, payload)
 }
 
+type bootstrapPreviewResult struct {
+	Status         string   `json:"status"`
+	Mode           string   `json:"mode"`
+	AddCount       int      `json:"add_count"`
+	UpdateCount    int      `json:"update_count"`
+	DeleteCount    int      `json:"delete_count"`
+	UnchangedCount int      `json:"unchanged_count"`
+	FilesToAdd     []string `json:"files_to_add"`
+	FilesToUpdate  []string `json:"files_to_update"`
+	FilesToDelete  []string `json:"files_to_delete"`
+	Errors         []string `json:"errors"`
+}
+
+func (a *API) bootstrapPreview(w http.ResponseWriter, r *http.Request) {
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		payload = map[string]any{}
+	}
+	mode, _ := payload["mode"].(string)
+	if mode == "" {
+		mode = "replace"
+	}
+	if mode != "replace" && mode != "merge" {
+		writeError(w, http.StatusBadRequest, "Unsupported bootstrap mode")
+		return
+	}
+	files, ok := payload["files"].([]any)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "files must be an array")
+		return
+	}
+	preview := calculateBootstrapPreview(a.state.Config(), mode, files)
+	writeJSON(w, http.StatusOK, preview)
+}
+
+func calculateBootstrapPreview(cfg config.Config, mode string, files []any) bootstrapPreviewResult {
+	preview := bootstrapPreviewResult{
+		Status:        "ok",
+		Mode:          mode,
+		FilesToAdd:    []string{},
+		FilesToUpdate: []string{},
+		FilesToDelete: []string{},
+		Errors:        []string{},
+	}
+	incoming := map[string]string{}
+	for _, rawItem := range files {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			preview.Errors = append(preview.Errors, "Invalid file payload entry")
+			continue
+		}
+		localPath := fmt.Sprint(item["local_path"])
+		source, ok := item["source"].(string)
+		if !ok {
+			preview.Errors = append(preview.Errors, fmt.Sprintf("Invalid source for %s", localPath))
+			continue
+		}
+		target, err := cfg.ResolveInsideSyncRoot(localPath)
+		if err != nil {
+			preview.Errors = append(preview.Errors, fmt.Sprintf("Invalid local_path %s", localPath))
+			continue
+		}
+		relative, err := filepath.Rel(cfg.SyncRootAbs, target)
+		if err != nil {
+			preview.Errors = append(preview.Errors, fmt.Sprintf("Invalid local_path %s", localPath))
+			continue
+		}
+		relPosix := filepath.ToSlash(relative)
+		incoming[relPosix] = source
+
+		info, statErr := os.Stat(target)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				preview.FilesToAdd = append(preview.FilesToAdd, relPosix)
+				continue
+			}
+			preview.Errors = append(preview.Errors, fmt.Sprintf("Failed stat %s: %v", relPosix, statErr))
+			continue
+		}
+		if info.IsDir() {
+			preview.FilesToAdd = append(preview.FilesToAdd, relPosix)
+			continue
+		}
+		existingSource, readErr := os.ReadFile(target)
+		if readErr != nil {
+			preview.Errors = append(preview.Errors, fmt.Sprintf("Failed reading existing %s: %v", relPosix, readErr))
+			continue
+		}
+		if normalizePullText(string(existingSource)) == normalizePullText(source) {
+			preview.UnchangedCount++
+			continue
+		}
+		preview.FilesToUpdate = append(preview.FilesToUpdate, relPosix)
+	}
+
+	if mode == "replace" {
+		localFiles, err := listSyncRootFiles(cfg.SyncRootAbs)
+		if err != nil {
+			preview.Errors = append(preview.Errors, fmt.Sprintf("Failed walking sync_root: %v", err))
+		}
+		for _, relPosix := range localFiles {
+			if _, exists := incoming[relPosix]; !exists {
+				preview.FilesToDelete = append(preview.FilesToDelete, relPosix)
+			}
+		}
+	}
+
+	sort.Strings(preview.FilesToAdd)
+	sort.Strings(preview.FilesToUpdate)
+	sort.Strings(preview.FilesToDelete)
+	preview.AddCount = len(preview.FilesToAdd)
+	preview.UpdateCount = len(preview.FilesToUpdate)
+	preview.DeleteCount = len(preview.FilesToDelete)
+	return preview
+}
+
 func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	var payload map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -482,10 +603,20 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	updatedCount := 0
 	unchangedCount := 0
 	deletedCount := 0
+	backupPath := ""
+	backupCount := 0
 
 	a.state.LockReconciliation()
 	if mode == "replace" {
-		count, err := clearSyncRootContents(cfg.SyncRootAbs)
+		path, count, err := createReplaceBackup(cfg.SyncRootAbs, time.Now())
+		if err != nil {
+			a.state.UnlockReconciliation()
+			writeError(w, http.StatusInternalServerError, "Unable to backup sync_root: "+err.Error())
+			return
+		}
+		backupPath = path
+		backupCount = count
+		count, err = clearSyncRootContents(cfg.SyncRootAbs)
 		if err != nil {
 			a.state.UnlockReconciliation()
 			writeError(w, http.StatusInternalServerError, "Unable to reset sync_root: "+err.Error())
@@ -566,6 +697,12 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	a.state.ApplySnapshot(snapshot.Records, snapshot.Warnings, snapshot.InvalidPaths)
 	a.state.RecordPerformance(len(files), 0, time.Since(scanStarted), 0, snapshot.CacheHits, snapshot.CacheMisses)
+	if err := config.WriteGuidebookStatus(cfg, config.ScaffoldOptions{
+		Version:           a.version,
+		LastKnownRevision: a.state.Revision(),
+	}); err != nil {
+		writeErrors = append(writeErrors, fmt.Sprintf("Failed writing guidebook status: %v", err))
+	}
 	a.state.RecordBootstrap(writtenCount, updatedCount, unchangedCount, deletedCount, len(writeErrors))
 	a.state.UnlockReconciliation()
 
@@ -576,6 +713,8 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 		"updated_count":   updatedCount,
 		"unchanged_count": unchangedCount,
 		"deleted_count":   deletedCount,
+		"backup_path":     backupPath,
+		"backup_count":    backupCount,
 		"error_count":     len(writeErrors),
 		"errors":          writeErrors,
 		"scan_warnings":   firstWarnings(snapshot.Warnings, 20),
@@ -724,6 +863,129 @@ func newSessionID() string {
 	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32]
 }
 
+func createReplaceBackupOnDisk(syncRoot string, at time.Time) (string, int, error) {
+	if err := os.MkdirAll(syncRoot, 0o755); err != nil {
+		return "", 0, err
+	}
+	entries, err := os.ReadDir(syncRoot)
+	if err != nil {
+		return "", 0, err
+	}
+	content := make([]os.DirEntry, 0, len(entries))
+	for _, entry := range entries {
+		if isPreservedRootEntry(entry.Name()) {
+			continue
+		}
+		content = append(content, entry)
+	}
+	if len(content) == 0 {
+		return "", 0, nil
+	}
+
+	backupRoot := filepath.Join(syncRoot, config.MetadataDir, "backups")
+	if err := os.MkdirAll(backupRoot, 0o755); err != nil {
+		return "", 0, err
+	}
+	backupPath, err := uniqueBackupPath(backupRoot, at)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := os.MkdirAll(backupPath, 0o755); err != nil {
+		return "", 0, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = os.RemoveAll(backupPath)
+		}
+	}()
+
+	for _, entry := range content {
+		source := filepath.Join(syncRoot, entry.Name())
+		target := filepath.Join(backupPath, entry.Name())
+		if err := copyFileTree(source, target); err != nil {
+			return "", 0, err
+		}
+	}
+	success = true
+	return backupPath, len(content), nil
+}
+
+func uniqueBackupPath(backupRoot string, at time.Time) (string, error) {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	base := at.UTC().Format("20060102T150405.000000000Z")
+	for index := 0; index < 1000; index++ {
+		name := base
+		if index > 0 {
+			name = fmt.Sprintf("%s-%d", base, index)
+		}
+		candidate := filepath.Join(backupRoot, name)
+		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("unable to choose unique backup path under %s", backupRoot)
+}
+
+func copyFileTree(source, target string) error {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to backup symlink %s", source)
+	}
+	if !info.IsDir() {
+		return copyRegularFile(source, target, info.Mode().Perm())
+	}
+	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		targetPath := filepath.Join(target, rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to backup symlink %s", path)
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(targetPath, info.Mode().Perm())
+		}
+		return copyRegularFile(path, targetPath, info.Mode().Perm())
+	})
+}
+
+func copyRegularFile(source, target string, perm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(output, input)
+	closeErr := output.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
 func clearSyncRootContents(syncRoot string) (int, error) {
 	if err := os.MkdirAll(syncRoot, 0o755); err != nil {
 		return 0, err
@@ -734,7 +996,7 @@ func clearSyncRootContents(syncRoot string) (int, error) {
 	}
 	deleted := 0
 	for _, entry := range entries {
-		if entry.Name() == ".git" || entry.Name() == config.MetadataDir || entry.Name() == config.GuidebookDir {
+		if isPreservedRootEntry(entry.Name()) {
 			continue
 		}
 		target := filepath.Join(syncRoot, entry.Name())
@@ -744,6 +1006,45 @@ func clearSyncRootContents(syncRoot string) (int, error) {
 		deleted++
 	}
 	return deleted, nil
+}
+
+func listSyncRootFiles(syncRoot string) ([]string, error) {
+	files := []string{}
+	if _, err := os.Stat(syncRoot); err != nil {
+		if os.IsNotExist(err) {
+			return files, nil
+		}
+		return files, err
+	}
+	err := filepath.WalkDir(syncRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == syncRoot {
+			return nil
+		}
+		if entry.IsDir() && isPreservedRootEntry(entry.Name()) {
+			relative, err := filepath.Rel(syncRoot, path)
+			if err == nil && !strings.Contains(filepath.ToSlash(relative), "/") {
+				return filepath.SkipDir
+			}
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(syncRoot, path)
+		if err != nil {
+			return nil
+		}
+		files = append(files, filepath.ToSlash(relative))
+		return nil
+	})
+	sort.Strings(files)
+	return files, err
+}
+
+func isPreservedRootEntry(name string) bool {
+	return name == ".git" || name == config.MetadataDir || name == config.GuidebookDir
 }
 
 func normalizePullText(value string) string {

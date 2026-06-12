@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"riftsync/internal/config"
+	"riftsync/internal/exechistory"
 	"riftsync/internal/records"
 	"riftsync/internal/scanner"
 	"riftsync/internal/serverapp"
@@ -103,6 +104,16 @@ func TestParseOptionsExecFile(t *testing.T) {
 	}
 }
 
+func TestParseOptionsExecLast(t *testing.T) {
+	options, err := parseOptions([]string{"exec", "--last", "--timeout", "20", "--json"})
+	if err != nil {
+		t.Fatalf("parseOptions returned error: %v", err)
+	}
+	if options.command != "exec" || !options.exec.useLast || options.exec.timeoutSec != 20 || !options.exec.timeoutExplicit || !options.exec.jsonOutput {
+		t.Fatalf("options = %#v", options)
+	}
+}
+
 func TestParseOptionsExecLuaFileShortcut(t *testing.T) {
 	options, err := parseOptions([]string{"exec", "studio-command.lua", "--json"})
 	if err != nil {
@@ -126,6 +137,9 @@ func TestParseOptionsExecRejectsAmbiguousSource(t *testing.T) {
 		{"exec", "--stdin", "--file", "x.luau"},
 		{"exec", "--stdin", "print(1)"},
 		{"exec", "--file", "x.luau", "print(1)"},
+		{"exec", "--last", "print(1)"},
+		{"exec", "--last", "--file", "x.luau"},
+		{"exec", "--last", "--stdin"},
 		{"exec"},
 		{"exec", "--json", "--raw", "print(1)"},
 	}
@@ -133,6 +147,94 @@ func TestParseOptionsExecRejectsAmbiguousSource(t *testing.T) {
 		if _, err := parseOptions(args); err == nil {
 			t.Fatalf("parseOptions(%v) returned nil error, want ambiguous source error", args)
 		}
+	}
+}
+
+func TestParseOptionsValidate(t *testing.T) {
+	options, err := parseOptions([]string{"--config", "custom.json", "validate"})
+	if err != nil {
+		t.Fatalf("parseOptions returned error: %v", err)
+	}
+	if options.command != "validate" || options.configPath != "custom.json" || options.validate.jsonOutput {
+		t.Fatalf("options = %#v", options)
+	}
+
+	options, err = parseOptions([]string{"validate", "--json"})
+	if err != nil {
+		t.Fatalf("parseOptions validate --json returned error: %v", err)
+	}
+	if options.command != "validate" || !options.validate.jsonOutput {
+		t.Fatalf("options = %#v", options)
+	}
+}
+
+func TestRunValidateCommandCleanProject(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "ServerScriptService/Foo.server.luau", "print(1)")
+	configPath := writeValidateTestConfig(t, root)
+	options, err := parseOptions([]string{"--config", configPath, "validate"})
+	if err != nil {
+		t.Fatalf("parseOptions returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runValidateCommand(options, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("code=%d stdout=%q stderr=%q, want 0", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Summary: status=ok") {
+		t.Fatalf("stdout = %q, want ok summary", stdout.String())
+	}
+}
+
+func TestRunValidateCommandReportsInvalidJSONAndDuplicateStableIDs(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "StarterGui/Main.ScreenGui/properties.init.json", `{"id":"dup","className":"ScreenGui"}`)
+	writeFile(t, root, "StarterGui/Menu.ScreenGui/properties.init.json", `{"id":"dup","className":"ScreenGui"}`)
+	writeFile(t, root, "StarterGui/Broken.Frame/properties.init.json", `{"className":`)
+	configPath := writeValidateTestConfig(t, root)
+	options, err := parseOptions([]string{"--config", configPath, "validate", "--json"})
+	if err != nil {
+		t.Fatalf("parseOptions returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runValidateCommand(options, &stdout, &stderr)
+	if code != exitCommandError {
+		t.Fatalf("code=%d stdout=%q stderr=%q, want validation error", code, stdout.String(), stderr.String())
+	}
+	var report validateReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("decode validate JSON: %v; output=%q", err, stdout.String())
+	}
+	if report.Status != "error" || report.Counts["invalid_json"] != 1 || report.Counts["duplicate_stable_ids"] != 1 || report.Counts["errors"] < 2 {
+		t.Fatalf("report = %#v", report)
+	}
+	if report.ConfigPath == "" || report.SyncRoot != root {
+		t.Fatalf("paths in report = config %q sync_root %q", report.ConfigPath, report.SyncRoot)
+	}
+}
+
+func TestRunValidateCommandJSONIncludesWarningsAndCounts(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "ServerScriptService/Plain.luau", "return {}")
+	configPath := writeValidateTestConfig(t, root)
+	options, err := parseOptions([]string{"--config", configPath, "validate", "--json"})
+	if err != nil {
+		t.Fatalf("parseOptions returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runValidateCommand(options, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("code=%d stdout=%q stderr=%q, want warning-only success", code, stdout.String(), stderr.String())
+	}
+	var report validateReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("decode validate JSON: %v", err)
+	}
+	if report.Status != "warning" || report.Counts["unsupported_paths"] != 1 || len(report.Warnings) == 0 || len(report.Errors) != 0 {
+		t.Fatalf("report = %#v", report)
 	}
 }
 
@@ -319,6 +421,112 @@ func TestRunExecCommandAgainstMockServer(t *testing.T) {
 	}
 }
 
+func TestRunExecCommandRecordsHistory(t *testing.T) {
+	var syncRoot string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/exec/commands":
+			_, _ = w.Write([]byte(`{"status":"ok","command_id":"cmd_history"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/exec/commands/cmd_history":
+			_, _ = w.Write([]byte(`{"status":"ok","command":{"id":"cmd_history","state":"done","ok":true,"duration_ms":3,"prints":[],"returns":["ok"],"error":"","traceback":"","late_result":false}}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeExecTestConfigWithRoot(t, server.URL, "secret", t.TempDir())
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	syncRoot = cfg.SyncRootAbs
+	options, err := parseOptions([]string{"--config", configPath, "exec", "return", `"ok"`})
+	if err != nil {
+		t.Fatalf("parseOptions returned error: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := runExecCommand(context.Background(), options, strings.NewReader(""), &stdout, &stderr, server.Client())
+	if code != exitOK {
+		t.Fatalf("code = %d stderr=%q stdout=%q, want 0", code, stderr.String(), stdout.String())
+	}
+
+	history, warning, err := exechistory.Load(syncRoot)
+	if err != nil || warning != "" {
+		t.Fatalf("load history warning=%q err=%v", warning, err)
+	}
+	if len(history.Entries) != 1 {
+		t.Fatalf("history entries = %#v", history.Entries)
+	}
+	entry := history.Entries[0]
+	if entry.SubmittedBy != "cli" || entry.SourceKind != "inline" || entry.Source != `return "ok"` || entry.ResultState != "done" || !entry.OK || entry.CommandID != "cmd_history" {
+		t.Fatalf("history entry = %#v", entry)
+	}
+}
+
+func TestRunExecCommandLastUsesHistoryTimeoutAndOverride(t *testing.T) {
+	run := func(t *testing.T, args []string, wantTimeout float64) {
+		t.Helper()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/exec/commands":
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatalf("decode submit payload: %v", err)
+				}
+				if payload["source"] != "print('last')" || payload["timeout_sec"] != wantTimeout {
+					t.Fatalf("submit payload = %#v, want source last timeout %.0f", payload, wantTimeout)
+				}
+				_, _ = w.Write([]byte(`{"status":"ok","command_id":"cmd_last"}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/exec/commands/cmd_last":
+				_, _ = w.Write([]byte(`{"status":"ok","command":{"id":"cmd_last","state":"done","ok":true,"duration_ms":5,"prints":[{"level":"print","text":"last","at_ms":1}],"returns":[],"error":"","traceback":"","late_result":false}}`))
+			default:
+				t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+
+		root := t.TempDir()
+		configPath := writeExecTestConfigWithRoot(t, server.URL, "secret", root)
+		_, _, err := exechistory.Append(root, exechistory.Entry{
+			ID:          "entry_last",
+			SubmittedBy: "cli",
+			SourceKind:  "inline",
+			Source:      "print('last')",
+			TimeoutSec:  17,
+			ResultState: "done",
+			OK:          true,
+		}, exechistory.DefaultLimit)
+		if err != nil {
+			t.Fatalf("append history: %v", err)
+		}
+		fullArgs := append([]string{"--config", configPath}, args...)
+		options, err := parseOptions(fullArgs)
+		if err != nil {
+			t.Fatalf("parseOptions returned error: %v", err)
+		}
+		var stdout, stderr bytes.Buffer
+		code := runExecCommand(context.Background(), options, strings.NewReader(""), &stdout, &stderr, server.Client())
+		if code != exitOK {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		history, _, err := exechistory.Load(root)
+		if err != nil {
+			t.Fatalf("load history: %v", err)
+		}
+		if len(history.Entries) != 2 || history.Entries[0].RerunOfID != "entry_last" {
+			t.Fatalf("history entries = %#v", history.Entries)
+		}
+	}
+
+	t.Run("stored timeout", func(t *testing.T) {
+		run(t, []string{"exec", "--last"}, 17)
+	})
+	t.Run("override timeout", func(t *testing.T) {
+		run(t, []string{"exec", "--last", "--timeout", "9"}, 9)
+	})
+}
+
 func TestRunExecCommandMapsSubmitFailureToServerExitCode(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"status":"error","message":"remote exec is disabled"}`, http.StatusForbidden)
@@ -337,6 +545,17 @@ func TestRunExecCommandMapsSubmitFailureToServerExitCode(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "HTTP 403") {
 		t.Fatalf("stderr = %q, want HTTP 403", stderr.String())
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	history, _, err := exechistory.Load(cfg.SyncRootAbs)
+	if err != nil {
+		t.Fatalf("load history: %v", err)
+	}
+	if len(history.Entries) != 1 || history.Entries[0].ResultState != "submit_failed" || history.Entries[0].OK {
+		t.Fatalf("history entries = %#v", history.Entries)
 	}
 }
 
@@ -403,6 +622,11 @@ func writeFile(t *testing.T, root, rel, body string) {
 
 func writeExecTestConfig(t *testing.T, serverURL, token string) string {
 	t.Helper()
+	return writeExecTestConfigWithRoot(t, serverURL, token, t.TempDir())
+}
+
+func writeExecTestConfigWithRoot(t *testing.T, serverURL, token, syncRoot string) string {
+	t.Helper()
 	parsed, err := url.Parse(serverURL)
 	if err != nil {
 		t.Fatalf("parse server URL: %v", err)
@@ -417,10 +641,25 @@ func writeExecTestConfig(t *testing.T, serverURL, token string) string {
   "sync_root": %q,
   "remote_exec_enabled": true,
   "remote_exec_token": %q
-}`, parsed.Hostname(), port, filepath.ToSlash(t.TempDir()), token)
+}`, parsed.Hostname(), port, filepath.ToSlash(syncRoot), token)
 	path := filepath.Join(t.TempDir(), "sync_config.json")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write exec test config: %v", err)
+	}
+	return path
+}
+
+func writeValidateTestConfig(t *testing.T, syncRoot string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "sync_config.json")
+	body := fmt.Sprintf(`{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "sync_root": %q,
+  "git_versioning_enabled": false
+}`, filepath.ToSlash(syncRoot))
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write validate test config: %v", err)
 	}
 	return path
 }

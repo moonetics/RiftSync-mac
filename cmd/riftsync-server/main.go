@@ -12,11 +12,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"riftsync/internal/config"
+	"riftsync/internal/exechistory"
+	"riftsync/internal/records"
+	"riftsync/internal/scanner"
 	"riftsync/internal/serverapp"
 	"riftsync/internal/uiapp"
 )
@@ -39,15 +43,30 @@ type cliOptions struct {
 	headless         bool
 	command          string
 	exec             execOptions
+	validate         validateOptions
 }
 
 type execOptions struct {
-	useStdin   bool
-	filePath   string
-	timeoutSec int
+	useStdin        bool
+	useLast         bool
+	filePath        string
+	timeoutSec      int
+	timeoutExplicit bool
+	jsonOutput      bool
+	rawOutput       bool
+	inline          string
+}
+
+type execSourceRequest struct {
+	Source     string
+	SourceKind string
+	FilePath   string
+	RerunOfID  string
+	TimeoutSec int
+}
+
+type validateOptions struct {
 	jsonOutput bool
-	rawOutput  bool
-	inline     string
 }
 
 func main() {
@@ -62,6 +81,9 @@ func main() {
 	}
 	if options.command == "exec" {
 		os.Exit(runExecCommand(context.Background(), options, os.Stdin, os.Stdout, os.Stderr, nil))
+	}
+	if options.command == "validate" {
+		os.Exit(runValidateCommand(options, os.Stdout, os.Stderr))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -98,15 +120,24 @@ func parseOptions(args []string) (cliOptions, error) {
 	}
 	remaining := flags.Args()
 	if len(remaining) > 0 {
-		if remaining[0] != "exec" {
+		switch remaining[0] {
+		case "exec":
+			execOptions, err := parseExecOptions(remaining[1:])
+			if err != nil {
+				return cliOptions{}, err
+			}
+			options.command = "exec"
+			options.exec = execOptions
+		case "validate":
+			validateOptions, err := parseValidateOptions(remaining[1:])
+			if err != nil {
+				return cliOptions{}, err
+			}
+			options.command = "validate"
+			options.validate = validateOptions
+		default:
 			return cliOptions{}, fmt.Errorf("unknown command: %s", remaining[0])
 		}
-		execOptions, err := parseExecOptions(remaining[1:])
-		if err != nil {
-			return cliOptions{}, err
-		}
-		options.command = "exec"
-		options.exec = execOptions
 	}
 	if options.configPath == "" {
 		return cliOptions{}, fmt.Errorf("--config must not be empty")
@@ -134,6 +165,23 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Exec:")
 	fmt.Fprintln(out, "  riftsync-server [global flags] exec [--stdin | --file path | path.lua | inline source] [--timeout seconds] [--json | --raw]")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Validate:")
+	fmt.Fprintln(out, "  riftsync-server [global flags] validate [--json]")
+}
+
+func parseValidateOptions(args []string) (validateOptions, error) {
+	options := validateOptions{}
+	flags := flag.NewFlagSet("riftsync-server validate", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.BoolVar(&options.jsonOutput, "json", false, "print JSON validation report")
+	if err := flags.Parse(args); err != nil {
+		return validateOptions{}, err
+	}
+	if len(flags.Args()) > 0 {
+		return validateOptions{}, fmt.Errorf("validate does not accept positional arguments")
+	}
+	return options, nil
 }
 
 func parseExecOptions(args []string) (execOptions, error) {
@@ -141,10 +189,12 @@ func parseExecOptions(args []string) (execOptions, error) {
 	flags := flag.NewFlagSet("riftsync-server exec", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.BoolVar(&options.useStdin, "stdin", false, "read Luau source from stdin")
+	flags.BoolVar(&options.useLast, "last", false, "rerun the latest Remote Exec command from history")
 	flags.StringVar(&options.filePath, "file", "", "read Luau source from file")
 	flags.IntVar(&options.timeoutSec, "timeout", 0, "command timeout in seconds")
 	flags.BoolVar(&options.jsonOutput, "json", false, "print JSON output")
 	flags.BoolVar(&options.rawOutput, "raw", false, "print raw output")
+	options.timeoutExplicit = hasTimeoutArg(args)
 	if err := flags.Parse(normalizeExecShortcutArgs(args)); err != nil {
 		return execOptions{}, err
 	}
@@ -163,6 +213,9 @@ func parseExecOptions(args []string) (execOptions, error) {
 	hasInline := len(inlineArgs) > 0
 	sourceModes := 0
 	if options.useStdin {
+		sourceModes++
+	}
+	if options.useLast {
 		sourceModes++
 	}
 	if strings.TrimSpace(options.filePath) != "" {
@@ -216,7 +269,16 @@ func normalizeExecShortcutArgs(args []string) []string {
 
 func hasExplicitExecSourceFlag(args []string) bool {
 	for _, arg := range args {
-		if arg == "--stdin" || arg == "--file" || strings.HasPrefix(arg, "--file=") {
+		if arg == "--stdin" || arg == "--last" || arg == "--file" || strings.HasPrefix(arg, "--file=") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTimeoutArg(args []string) bool {
+	for _, arg := range args {
+		if arg == "--timeout" || strings.HasPrefix(arg, "--timeout=") {
 			return true
 		}
 	}
@@ -241,6 +303,265 @@ func runHeadless(ctx context.Context, options cliOptions, stdout io.Writer) erro
 	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return runner.Stop(stopCtx)
+}
+
+type validateReport struct {
+	Status     string         `json:"status"`
+	ConfigPath string         `json:"config_path"`
+	SyncRoot   string         `json:"sync_root"`
+	Errors     []string       `json:"errors"`
+	Warnings   []string       `json:"warnings"`
+	Counts     map[string]int `json:"counts"`
+}
+
+func runValidateCommand(options cliOptions, stdout, stderr io.Writer) int {
+	report, err := validateProject(options)
+	if err != nil {
+		if options.validate.jsonOutput {
+			_ = json.NewEncoder(stdout).Encode(validateReport{
+				Status: "cli_error",
+				Errors: []string{err.Error()},
+				Counts: map[string]int{},
+			})
+		} else {
+			fmt.Fprintf(stderr, "validation setup error: %v\n", err)
+		}
+		return exitArgumentError
+	}
+	if options.validate.jsonOutput {
+		if err := json.NewEncoder(stdout).Encode(report); err != nil {
+			fmt.Fprintf(stderr, "validation output error: %v\n", err)
+			return exitArgumentError
+		}
+	} else {
+		writeValidateHuman(stdout, report)
+	}
+	if len(report.Errors) > 0 {
+		return exitCommandError
+	}
+	return exitOK
+}
+
+func validateProject(options cliOptions) (validateReport, error) {
+	cfg, err := config.Load(options.configPath)
+	if err != nil {
+		return validateReport{}, fmt.Errorf("config error: %w", err)
+	}
+	if options.hostOverride != "" {
+		cfg.Host = options.hostOverride
+	}
+	if options.portOverride > 0 {
+		cfg.Port = options.portOverride
+	}
+	if options.syncRootOverride != "" {
+		cfg.SyncRoot = options.syncRootOverride
+	}
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		return validateReport{}, fmt.Errorf("config error: %w", err)
+	}
+
+	report := validateReport{
+		Status:     "ok",
+		ConfigPath: cfg.ConfigPathAbs,
+		SyncRoot:   cfg.SyncRootAbs,
+		Counts: map[string]int{
+			"scripts":                  0,
+			"ui":                       0,
+			"entries":                  0,
+			"invalid_json":             0,
+			"duplicate_stable_ids":     0,
+			"unsupported_paths":        0,
+			"ignored_metadata_folders": countIgnoredMetadataFolders(cfg.SyncRootAbs),
+			"warnings":                 0,
+			"errors":                   0,
+		},
+	}
+	if strings.TrimSpace(report.ConfigPath) == "" {
+		if abs, absErr := filepath.Abs(options.configPath); absErr == nil {
+			report.ConfigPath = filepath.Clean(abs)
+		}
+	}
+
+	if info, statErr := os.Stat(cfg.SyncRootAbs); statErr != nil {
+		report.Errors = append(report.Errors, fmt.Sprintf("sync_root is not accessible: %v", statErr))
+		finalizeValidateReport(&report)
+		return report, nil
+	} else if !info.IsDir() {
+		report.Errors = append(report.Errors, "sync_root is not a directory")
+		finalizeValidateReport(&report)
+		return report, nil
+	}
+	if _, traversalErr := cfg.ResolveInsideSyncRoot("../__riftsync_validate_outside__"); traversalErr == nil {
+		report.Errors = append(report.Errors, "path traversal safety check failed")
+	}
+
+	cache := scanner.NewCache()
+	snapshot, scanErr := cache.Scan(cfg)
+	if scanErr != nil {
+		report.Errors = append(report.Errors, fmt.Sprintf("scanner failed: %v", scanErr))
+		finalizeValidateReport(&report)
+		return report, nil
+	}
+	report.Counts["scripts"] = snapshot.ScriptCount
+	report.Counts["ui"] = snapshot.UICount
+	report.Counts["entries"] = len(snapshot.Records)
+
+	for _, invalidPath := range snapshot.InvalidPaths {
+		report.Errors = append(report.Errors, "invalid metadata JSON: "+invalidPath)
+	}
+	for _, warning := range snapshot.Warnings {
+		if strings.Contains(strings.ToLower(warning), "duplicate stable id") {
+			report.Errors = append(report.Errors, warning)
+			continue
+		}
+		if strings.Contains(strings.ToLower(warning), "invalid json") {
+			continue
+		}
+		report.Warnings = append(report.Warnings, warning)
+	}
+
+	unsupported, err := findUnsupportedSyncPaths(cfg, snapshot)
+	if err != nil {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("unsupported path scan incomplete: %v", err))
+	}
+	for _, path := range unsupported {
+		report.Warnings = append(report.Warnings, "unsupported sync path: "+path)
+	}
+	report.Counts["invalid_json"] = len(snapshot.InvalidPaths)
+	report.Counts["duplicate_stable_ids"] = countDuplicateStableIDErrors(report.Errors)
+	report.Counts["unsupported_paths"] = len(unsupported)
+	finalizeValidateReport(&report)
+	return report, nil
+}
+
+func finalizeValidateReport(report *validateReport) {
+	report.Counts["warnings"] = len(report.Warnings)
+	report.Counts["errors"] = len(report.Errors)
+	switch {
+	case len(report.Errors) > 0:
+		report.Status = "error"
+	case len(report.Warnings) > 0:
+		report.Status = "warning"
+	default:
+		report.Status = "ok"
+	}
+}
+
+func writeValidateHuman(out io.Writer, report validateReport) {
+	fmt.Fprintln(out, "RiftSync validate")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "OK:")
+	if report.ConfigPath != "" {
+		fmt.Fprintf(out, "- Config: %s\n", report.ConfigPath)
+	}
+	if report.SyncRoot != "" {
+		fmt.Fprintf(out, "- Sync root: %s\n", report.SyncRoot)
+	}
+	fmt.Fprintf(out, "- Scripts: %d\n", report.Counts["scripts"])
+	fmt.Fprintf(out, "- UI metadata: %d\n", report.Counts["ui"])
+	fmt.Fprintf(out, "- Ignored metadata folders: %d\n", report.Counts["ignored_metadata_folders"])
+
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Warnings:")
+	if len(report.Warnings) == 0 {
+		fmt.Fprintln(out, "- None")
+	} else {
+		for _, warning := range report.Warnings {
+			fmt.Fprintln(out, "- "+warning)
+		}
+	}
+
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Errors:")
+	if len(report.Errors) == 0 {
+		fmt.Fprintln(out, "- None")
+	} else {
+		for _, validationError := range report.Errors {
+			fmt.Fprintln(out, "- "+validationError)
+		}
+	}
+
+	fmt.Fprintln(out, "")
+	fmt.Fprintf(out, "Summary: status=%s entries=%d warnings=%d errors=%d\n",
+		report.Status,
+		report.Counts["entries"],
+		report.Counts["warnings"],
+		report.Counts["errors"],
+	)
+}
+
+func findUnsupportedSyncPaths(cfg config.Config, snapshot scanner.Snapshot) ([]string, error) {
+	unsupported := []string{}
+	err := filepath.WalkDir(cfg.SyncRootAbs, func(absPath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == config.MetadataDir || entry.Name() == config.GuidebookDir {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		relative, err := filepath.Rel(cfg.SyncRootAbs, absPath)
+		if err != nil {
+			return nil
+		}
+		relPosix := filepath.ToSlash(relative)
+		if _, ok := snapshot.Records[relPosix]; ok {
+			return nil
+		}
+		if containsString(snapshot.InvalidPaths, relPosix) {
+			return nil
+		}
+		if looksLikeUnsupportedSyncPath(relPosix) {
+			unsupported = append(unsupported, relPosix)
+		}
+		return nil
+	})
+	sort.Strings(unsupported)
+	return unsupported, err
+}
+
+func looksLikeUnsupportedSyncPath(relPosix string) bool {
+	filename := filepath.Base(filepath.FromSlash(relPosix))
+	lower := strings.ToLower(filename)
+	if lower == records.UIPropertiesFilename || lower == records.UIInitMetaFilename || strings.HasSuffix(lower, records.UIModelJSONSuffix) {
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(lower))
+	if ext == ".lua" || ext == ".luau" {
+		return true
+	}
+	return false
+}
+
+func countIgnoredMetadataFolders(syncRoot string) int {
+	count := 0
+	for _, name := range []string{".git", config.MetadataDir, config.GuidebookDir} {
+		if info, err := os.Stat(filepath.Join(syncRoot, name)); err == nil && info.IsDir() {
+			count++
+		}
+	}
+	return count
+}
+
+func countDuplicateStableIDErrors(errors []string) int {
+	count := 0
+	for _, item := range errors {
+		if strings.Contains(strings.ToLower(item), "duplicate stable id") {
+			count++
+		}
+	}
+	return count
+}
+
+func containsString(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
 }
 
 type execHTTPClient interface {
@@ -285,12 +606,6 @@ type execDetailResponse struct {
 }
 
 func runExecCommand(ctx context.Context, options cliOptions, stdin io.Reader, stdout, stderr io.Writer, client execHTTPClient) int {
-	source, err := readExecSource(options.exec, stdin)
-	if err != nil {
-		fmt.Fprintf(stderr, "argument error: %v\n", err)
-		return exitArgumentError
-	}
-
 	cfg, err := config.Load(options.configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "config error: %v\n", err)
@@ -302,12 +617,24 @@ func runExecCommand(ctx context.Context, options cliOptions, stdin io.Reader, st
 	if options.portOverride > 0 {
 		cfg.Port = options.portOverride
 	}
+	if options.syncRootOverride != "" {
+		cfg.SyncRoot = options.syncRootOverride
+	}
 	if err := cfg.NormalizeAndValidate(); err != nil {
 		fmt.Fprintf(stderr, "config error: %v\n", err)
 		return exitArgumentError
 	}
 
+	sourceRequest, err := readExecSourceRequest(options.exec, stdin, cfg.SyncRootAbs)
+	if err != nil {
+		fmt.Fprintf(stderr, "argument error: %v\n", err)
+		return exitArgumentError
+	}
+
 	timeoutSec := options.exec.timeoutSec
+	if options.exec.useLast && !options.exec.timeoutExplicit {
+		timeoutSec = sourceRequest.TimeoutSec
+	}
 	if timeoutSec <= 0 {
 		timeoutSec = cfg.RemoteExecDefaultTimeoutSec
 	}
@@ -327,8 +654,14 @@ func runExecCommand(ctx context.Context, options cliOptions, stdin io.Reader, st
 		httpClient:   client,
 		pollInterval: 200 * time.Millisecond,
 	}
-	commandID, err := execClient.submit(ctx, source, timeoutSec)
+	commandStarted := time.Now()
+	commandID, err := execClient.submit(ctx, sourceRequest.Source, timeoutSec)
 	if err != nil {
+		recordExecHistory(cfg.SyncRootAbs, sourceRequest, timeoutSec, execCommandResult{
+			State: "submit_failed",
+			OK:    false,
+			Error: err.Error(),
+		}, "")
 		fmt.Fprintf(stderr, "exec submit failed: %v\n", err)
 		return exitServerError
 	}
@@ -337,7 +670,20 @@ func runExecCommand(ctx context.Context, options cliOptions, stdin io.Reader, st
 	defer cancel()
 	result, err := execClient.wait(waitCtx, commandID)
 	if err != nil {
+		state := "wait_failed"
+		exitCode := exitServerError
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			state = "timeout"
+			exitCode = exitCommandTimedOut
+		}
+		recordExecHistory(cfg.SyncRootAbs, sourceRequest, timeoutSec, execCommandResult{
+			ID:         commandID,
+			State:      state,
+			OK:         false,
+			Error:      err.Error(),
+			DurationMS: float64(time.Since(commandStarted).Milliseconds()),
+		}, commandID)
+		if exitCode == exitCommandTimedOut {
 			fmt.Fprintln(stderr, "exec timed out waiting for result")
 			return exitCommandTimedOut
 		}
@@ -345,11 +691,76 @@ func runExecCommand(ctx context.Context, options cliOptions, stdin io.Reader, st
 		return exitServerError
 	}
 
+	recordExecHistory(cfg.SyncRootAbs, sourceRequest, timeoutSec, result, commandID)
 	if err := writeExecOutput(stdout, result, options.exec); err != nil {
 		fmt.Fprintf(stderr, "exec output failed: %v\n", err)
 		return exitServerError
 	}
 	return execExitCode(result)
+}
+
+func readExecSourceRequest(options execOptions, stdin io.Reader, syncRoot string) (execSourceRequest, error) {
+	if options.useLast {
+		file, warning, err := exechistory.Load(syncRoot)
+		if err != nil {
+			return execSourceRequest{}, err
+		}
+		if warning != "" {
+			return execSourceRequest{}, fmt.Errorf("%s", warning)
+		}
+		entry, ok := exechistory.LatestUsable(file)
+		if !ok {
+			return execSourceRequest{}, fmt.Errorf("no usable Remote Exec history")
+		}
+		return execSourceRequest{
+			Source:     entry.Source,
+			SourceKind: firstNonEmpty(entry.SourceKind, "inline"),
+			FilePath:   entry.FilePath,
+			RerunOfID:  entry.ID,
+			TimeoutSec: entry.TimeoutSec,
+		}, nil
+	}
+
+	source, err := readExecSource(options, stdin)
+	if err != nil {
+		return execSourceRequest{}, err
+	}
+	sourceKind := "inline"
+	filePath := ""
+	switch {
+	case options.useStdin:
+		sourceKind = "stdin"
+	case strings.TrimSpace(options.filePath) != "":
+		sourceKind = "file"
+		filePath = options.filePath
+	}
+	return execSourceRequest{
+		Source:     source,
+		SourceKind: sourceKind,
+		FilePath:   filePath,
+	}, nil
+}
+
+func recordExecHistory(syncRoot string, sourceRequest execSourceRequest, timeoutSec int, result execCommandResult, commandID string) {
+	if strings.TrimSpace(syncRoot) == "" || strings.TrimSpace(sourceRequest.Source) == "" {
+		return
+	}
+	if strings.TrimSpace(commandID) == "" {
+		commandID = result.ID
+	}
+	_, _, _ = exechistory.Append(syncRoot, exechistory.Entry{
+		SubmittedBy: "cli",
+		SourceKind:  sourceRequest.SourceKind,
+		Source:      sourceRequest.Source,
+		FilePath:    sourceRequest.FilePath,
+		TimeoutSec:  timeoutSec,
+		ResultState: result.State,
+		OK:          result.OK,
+		Error:       result.Error,
+		DurationMS:  result.DurationMS,
+		CommandID:   commandID,
+		RerunOfID:   sourceRequest.RerunOfID,
+	}, exechistory.DefaultLimit)
 }
 
 func readExecSource(options execOptions, stdin io.Reader) (string, error) {
@@ -562,6 +973,15 @@ func formatMillis(value float64) string {
 		return fmt.Sprintf("%d", int64(value))
 	}
 	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", value), "0"), ".")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func toServerOptions(options cliOptions, stdout io.Writer) serverapp.Options {

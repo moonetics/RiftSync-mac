@@ -364,6 +364,15 @@ local function formatHttpError(response : {[string]: any})
 	return "HTTP " .. statusCode .. " " .. statusMessage .. " " .. body
 end
 
+local function isAuthFailureText(message : any)
+	local lowered = string.lower(tostring(message or ""))
+	return string.find(lowered, "http 401", 1, true) ~= nil
+		or string.find(lowered, "http 403", 1, true) ~= nil
+		or string.find(lowered, "unauthorized", 1, true) ~= nil
+		or string.find(lowered, "forbidden", 1, true) ~= nil
+		or string.find(lowered, "token", 1, true) ~= nil
+end
+
 local function buildQuery(params : {[string]: string | number})
 	local fields = {}
 	for key, value in pairs(params) do
@@ -848,6 +857,8 @@ self.serverIndexedCount = 0
 	self.remoteExecBusy = false
 	self.remoteExecLoopRunning = false
 	self.lastExecStatus = "Exec disabled"
+	self.lastExecAuthError = false
+	self.pendingPullPreview = nil
 	self.debugEvents = {}
 	self.serverDebugState = {}
 	self.debugState = {
@@ -918,6 +929,7 @@ end
 
 function SyncAPI:setRemoteExecEnabled(enabled : boolean)
 	self.remoteExecEnabled = enabled == true
+	self.lastExecAuthError = false
 	if self.remoteExecEnabled then
 		if tostring(self.remoteExecToken or "") == "" then
 			self.lastExecStatus = "Exec error: token required"
@@ -941,6 +953,7 @@ end
 
 function SyncAPI:setRemoteExecToken(token : string)
 	self.remoteExecToken = tostring(token or "")
+	self.lastExecAuthError = false
 	self.plugin:SetSetting(SETTING_KEYS.RemoteExecToken, self.remoteExecToken)
 	if self.remoteExecEnabled and self.remoteExecToken == "" then
 		self.lastExecStatus = "Exec error: token required"
@@ -981,6 +994,17 @@ function SyncAPI:buildDebugPayload()
 	for key, value in pairs(self.serverDebugState) do
 		serverState[key] = value
 	end
+	local tokenConfigured = tostring(self.remoteExecToken or "") ~= ""
+	local editMode = not runService:IsRunning()
+	local httpReachable = self.debugState.handshake == true
+		or tostring(serverState.sync_root or "") ~= ""
+	local connected = self.running == true and self.debugState.handshake == true
+	local tokenValid = self.remoteExecEnabled == true
+		and tokenConfigured
+		and self.lastExecAuthError ~= true
+	local execActive = connected
+		and tokenValid
+		and editMode
 
 	return {
 		enabled = self.debugEnabled == true,
@@ -991,6 +1015,12 @@ function SyncAPI:buildDebugPayload()
 			delta = self.debugState.delta,
 			ack_sent = self.debugState.ackSent,
 			ack_ok = self.debugState.ackOk,
+			http_server_reachable = httpReachable,
+			connected_to_server = connected,
+			token_valid = tokenValid,
+			sync_active = connected and self.debugState.poll == true,
+			exec_active = execActive,
+			edit_mode = editMode,
 		},
 		stats = {
 			last_applied_rev = self.lastAppliedRevision,
@@ -1000,6 +1030,8 @@ function SyncAPI:buildDebugPayload()
 			poll_error_count = self.debugState.pollErrorCount,
 			last_error = self.debugState.lastError,
 			remote_exec_enabled = self.remoteExecEnabled == true,
+			remote_exec_token_configured = tokenConfigured,
+			remote_exec_auth_error = self.lastExecAuthError == true,
 			remote_exec_busy = self.remoteExecBusy == true,
 			remote_exec_status = self.lastExecStatus or "Exec disabled",
 		},
@@ -1945,6 +1977,7 @@ function SyncAPI:pollRemoteExecCommand()
 	}, self:remoteExecHeaders())
 	if not response then
 		self.lastExecStatus = "Exec error: " .. tostring(requestError)
+		self.lastExecAuthError = isAuthFailureText(requestError)
 		self.remoteExecBusy = false
 		self:appendDebugEvent("Remote Exec poll gagal: " .. tostring(requestError), true)
 		self:pushDebugUpdate()
@@ -1952,10 +1985,12 @@ function SyncAPI:pollRemoteExecCommand()
 	end
 	if response.status ~= "ok" then
 		self.lastExecStatus = "Exec error: " .. tostring(response.status)
+		self.lastExecAuthError = isAuthFailureText(response.status)
 		self.remoteExecBusy = false
 		self:pushDebugUpdate()
 		return
 	end
+	self.lastExecAuthError = false
 	if typeof(response.command) ~= "table" then
 		self.lastExecStatus = "Exec ready"
 		self.remoteExecBusy = false
@@ -2082,16 +2117,19 @@ end
 function SyncAPI:postRemoteExecResult(result : {[string]: any})
 	local response, requestError = self:requestJsonWithHeaders("POST", TypeList.ENDPOINTS.ExecResult, result, nil, self:remoteExecHeaders())
 	if not response then
+		self.lastExecAuthError = isAuthFailureText(requestError)
 		self:appendDebugEvent("Remote Exec result gagal: " .. tostring(requestError), true)
 		self.lastExecStatus = "Exec error: result post failed"
 		return false, requestError
 	end
 	if response.status ~= "ok" then
+		self.lastExecAuthError = isAuthFailureText(response.status)
 		local message = "Remote Exec result rejected: " .. tostring(response.status)
 		self:appendDebugEvent(message, true)
 		self.lastExecStatus = "Exec error: result rejected"
 		return false, message
 	end
+	self.lastExecAuthError = false
 	self:appendDebugEvent("Remote Exec result terkirim id=" .. tostring(result.command_id), result.ok ~= true)
 	return true
 end
@@ -2244,19 +2282,7 @@ function SyncAPI:forceSnapshot()
 	return false, snapshotError
 end
 
-function SyncAPI:pullStudioToLocal()
-	if not self.running then
-		return false, "Start sync dulu sebelum pull Studio"
-	end
-
-	self.updateStatus("Pulling Studio snapshot to local... (25%)", false)
-	local success, responseOrError = self:pushStudioSnapshot("replace", "Pull Studio")
-	if not success then
-		self.updateStatus("Not synced - pull Studio failed: " .. tostring(responseOrError), true)
-		return false, responseOrError
-	end
-
-	local response = responseOrError
+function SyncAPI:finishConfirmedPullStudio(response : {[string]: any}?)
 	local serverRevision = typeof(response) == "table" and tonumber(response.server_rev) or nil
 	if serverRevision then
 		self.lastAppliedRevision = serverRevision
@@ -2290,7 +2316,101 @@ function SyncAPI:pullStudioToLocal()
 	})
 	self.updateStatus("Idle - pulled Studio rev " .. tostring(self.lastAppliedRevision), false)
 	self:pushDebugUpdate()
+end
+
+function SyncAPI:previewPullStudioToLocal()
+	if not self.running then
+		return false, "Start sync dulu sebelum pull Studio"
+	end
+
+	self.updateStatus("Preparing Pull Studio preview... (25%)", false)
+	local files, skippedCount, sourceReadFailedCount, skipInfo = self:collectStudioSnapshot()
+	local payload = {
+		client_id = self.clientId,
+		session_id = self.sessionId,
+		mode = "replace",
+		files = files,
+	}
+
+	local response, requestError = self:requestJson("POST", TypeList.ENDPOINTS.BootstrapPreview, payload, nil)
+	if not response then
+		self:setDebugError("Pull Studio preview gagal: " .. tostring(requestError))
+		self.updateStatus("Not synced - pull preview failed: " .. tostring(requestError), true)
+		return false, requestError
+	end
+
+	if response.status ~= "ok" then
+		local message = "Pull Studio preview rejected: " .. tostring(response.status)
+		self:setDebugError(message)
+		self.updateStatus("Not synced - pull preview failed: " .. message, true)
+		return false, message
+	end
+
+	self.pendingPullPreview = {
+		response = response,
+		files = files,
+		skippedCount = skippedCount,
+		sourceReadFailedCount = sourceReadFailedCount,
+		skipInfo = skipInfo,
+	}
+
+	self.updateStatus(
+		"Pull Studio preview ready: "
+			.. tostring(tonumber(response.add_count) or 0)
+			.. " add, "
+			.. tostring(tonumber(response.update_count) or 0)
+			.. " update, "
+			.. tostring(tonumber(response.delete_count) or 0)
+			.. " delete",
+		false
+	)
+	self:appendDebugEvent(
+		"Pull Studio preview ready add="
+			.. tostring(tonumber(response.add_count) or 0)
+			.. " update="
+			.. tostring(tonumber(response.update_count) or 0)
+			.. " delete="
+			.. tostring(tonumber(response.delete_count) or 0),
+		false
+	)
+	self:pushDebugUpdate()
+	return true, self.pendingPullPreview
+end
+
+function SyncAPI:confirmPullStudioToLocal()
+	if typeof(self.pendingPullPreview) ~= "table" then
+		return false, "Tidak ada preview Pull Studio yang menunggu konfirmasi"
+	end
+
+	local pending = self.pendingPullPreview
+	self.pendingPullPreview = nil
+	self.updateStatus("Pulling Studio snapshot to local... (70%)", false)
+	local success, responseOrError = self:pushStudioSnapshot(
+		"replace",
+		"Pull Studio",
+		pending.files,
+		pending.skippedCount,
+		pending.sourceReadFailedCount,
+		pending.skipInfo
+	)
+	if not success then
+		self.updateStatus("Not synced - pull Studio failed: " .. tostring(responseOrError), true)
+		return false, responseOrError
+	end
+
+	self:finishConfirmedPullStudio(responseOrError)
+	return true, responseOrError
+end
+
+function SyncAPI:cancelPullStudioToLocal()
+	self.pendingPullPreview = nil
+	self:appendDebugEvent("Pull Studio preview dibatalkan", false)
+	self:pushDebugUpdate()
 	return true
+end
+
+function SyncAPI:pullStudioToLocal()
+	return self:previewPullStudioToLocal()
 end
 
 
@@ -3515,8 +3635,23 @@ function SyncAPI:collectStudioSnapshot()
 	}
 end
 
-function SyncAPI:pushStudioSnapshot(bootstrapMode : string?, displayLabel : string?)
-	local files, skippedCount, sourceReadFailedCount, skipInfo = self:collectStudioSnapshot()
+function SyncAPI:pushStudioSnapshot(
+	bootstrapMode : string?,
+	displayLabel : string?,
+	precomputedFiles : {any}?,
+	precomputedSkippedCount : number?,
+	precomputedSourceReadFailedCount : number?,
+	precomputedSkipInfo : {[string]: any}?
+)
+	local files, skippedCount, sourceReadFailedCount, skipInfo
+	if typeof(precomputedFiles) == "table" then
+		files = precomputedFiles
+		skippedCount = tonumber(precomputedSkippedCount) or 0
+		sourceReadFailedCount = tonumber(precomputedSourceReadFailedCount) or 0
+		skipInfo = precomputedSkipInfo
+	else
+		files, skippedCount, sourceReadFailedCount, skipInfo = self:collectStudioSnapshot()
+	end
 	local mode = bootstrapMode == "merge" and "merge" or "replace"
 
 	local skipSummaryText = ""

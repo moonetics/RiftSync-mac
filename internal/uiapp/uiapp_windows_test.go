@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"riftsync/internal/exechistory"
 	"riftsync/internal/serverapp"
 	"riftsync/internal/state"
 )
@@ -110,9 +111,11 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`stopBtn`,
 		`overviewTab`,
 		`historyTab`,
+		`execTab`,
 		`configTab`,
 		`overviewPanel`,
 		`historyPanel`,
+		`execPanel`,
 		`configPanel`,
 		`metricStrip`,
 		`workspacePanel`,
@@ -120,6 +123,9 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`configPathPanel`,
 		`serverSettingsPanel`,
 		`appHeader`,
+		`brand-title`,
+		`brand-icon`,
+		`aria-hidden="true"`,
 		`minimizeBtn`,
 		`closeBtn`,
 		`overflow: hidden`,
@@ -149,6 +155,15 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`syncRootPickerBtn`,
 		`toggle-switch`,
 		`historyDetail`,
+		`execSourceInput`,
+		`execTimeoutInput`,
+		`execRunBtn`,
+		`execLatestBtn`,
+		`execOutputText`,
+		`execHistoryList`,
+		`/app/exec/run`,
+		`/app/exec/rerun`,
+		`/app/exec/history`,
 	} {
 		if !strings.Contains(document, needle) {
 			t.Fatalf("htmlDocument missing %q", needle)
@@ -220,6 +235,137 @@ func TestAppRoutesServeStatusAndHTML(t *testing.T) {
 	mux.ServeHTTP(logsResponse, httptest.NewRequest(http.MethodGet, "/app/logs", nil))
 	if logsResponse.Code != http.StatusOK || !strings.Contains(logsResponse.Body.String(), `"events"`) || !strings.Contains(logsResponse.Body.String(), `"metrics"`) {
 		t.Fatalf("/app/logs code=%d body=%q", logsResponse.Code, logsResponse.Body.String())
+	}
+
+	execHistoryResponse := httptest.NewRecorder()
+	mux.ServeHTTP(execHistoryResponse, httptest.NewRequest(http.MethodGet, "/app/exec/history", nil))
+	if execHistoryResponse.Code != http.StatusOK || !strings.Contains(execHistoryResponse.Body.String(), `"entries"`) {
+		t.Fatalf("/app/exec/history code=%d body=%q", execHistoryResponse.Code, execHistoryResponse.Body.String())
+	}
+}
+
+func TestAppExecHistoryRouteHandlesCorruptFile(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sync_config.json")
+	syncRoot := filepath.Join(root, "game")
+	configBody, err := json.Marshal(map[string]any{
+		"host":      "127.0.0.1",
+		"port":      8765,
+		"sync_root": syncRoot,
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, configBody, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(exechistory.Path(syncRoot)), 0o755); err != nil {
+		t.Fatalf("mkdir history: %v", err)
+	}
+	if err := os.WriteFile(exechistory.Path(syncRoot), []byte("{bad"), 0o644); err != nil {
+		t.Fatalf("write corrupt history: %v", err)
+	}
+	controller := &appController{
+		runner:  serverapp.New(serverapp.Options{ConfigPath: configPath, PortOverride: -1}),
+		options: serverapp.Options{ConfigPath: configPath, PortOverride: -1},
+		quit:    make(chan struct{}),
+	}
+	mux := http.NewServeMux()
+	controller.registerRoutes(mux)
+
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/app/exec/history", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "ignored corrupt exec history") || !strings.Contains(response.Body.String(), `"entries":[]`) {
+		t.Fatalf("/app/exec/history code=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestAppExecRunStoppedIsRejected(t *testing.T) {
+	controller := &appController{
+		runner:  serverapp.New(serverapp.Options{ConfigPath: "sync_config.json", PortOverride: -1}),
+		options: serverapp.Options{ConfigPath: "sync_config.json", PortOverride: -1},
+		quit:    make(chan struct{}),
+	}
+	mux := http.NewServeMux()
+	controller.registerRoutes(mux)
+
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/app/exec/run", bytes.NewBufferString(`{"source":"print(1)","timeout_sec":1}`)))
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "Start RiftSync first") {
+		t.Fatalf("/app/exec/run code=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestAppExecRunAndRerunWithRunningServer(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sync_config.json")
+	syncRoot := filepath.Join(root, "game")
+	port := freePort(t)
+	configBody, err := json.Marshal(map[string]any{
+		"host":                "127.0.0.1",
+		"port":                port,
+		"sync_root":           syncRoot,
+		"remote_exec_enabled": true,
+		"remote_exec_token":   "secret",
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, configBody, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	runner := serverapp.New(serverapp.Options{ConfigPath: configPath, PortOverride: -1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := runner.Start(ctx); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		_ = runner.Stop(stopCtx)
+	})
+	workerDone := startExecWorker(t, port, "secret", 2)
+
+	controller := &appController{
+		runner:  runner,
+		options: serverapp.Options{ConfigPath: configPath, PortOverride: -1},
+		ctx:     ctx,
+		quit:    make(chan struct{}),
+	}
+	mux := http.NewServeMux()
+	controller.registerRoutes(mux)
+
+	runResponse := httptest.NewRecorder()
+	mux.ServeHTTP(runResponse, httptest.NewRequest(http.MethodPost, "/app/exec/run", bytes.NewBufferString(`{"source":"print('app')","timeout_sec":3}`)))
+	if runResponse.Code != http.StatusOK || !strings.Contains(runResponse.Body.String(), `[print] hello`) {
+		t.Fatalf("/app/exec/run code=%d body=%q", runResponse.Code, runResponse.Body.String())
+	}
+	history, _, err := exechistory.Load(syncRoot)
+	if err != nil {
+		t.Fatalf("load history: %v", err)
+	}
+	if len(history.Entries) != 1 || history.Entries[0].SubmittedBy != "app" || history.Entries[0].SourceKind != "app" {
+		t.Fatalf("history after run = %#v", history.Entries)
+	}
+
+	rerunResponse := httptest.NewRecorder()
+	mux.ServeHTTP(rerunResponse, httptest.NewRequest(http.MethodPost, "/app/exec/rerun", bytes.NewBufferString(`{}`)))
+	if rerunResponse.Code != http.StatusOK || !strings.Contains(rerunResponse.Body.String(), `[print] hello`) {
+		t.Fatalf("/app/exec/rerun code=%d body=%q", rerunResponse.Code, rerunResponse.Body.String())
+	}
+	history, _, err = exechistory.Load(syncRoot)
+	if err != nil {
+		t.Fatalf("load history after rerun: %v", err)
+	}
+	if len(history.Entries) != 2 || history.Entries[0].RerunOfID != history.Entries[1].ID {
+		t.Fatalf("history after rerun = %#v", history.Entries)
+	}
+
+	select {
+	case <-workerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exec worker did not finish")
 	}
 }
 
@@ -431,6 +577,72 @@ func TestNoWalkDependency(t *testing.T) {
 	}
 }
 
+func startExecWorker(t *testing.T, port int, token string, count int) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client := http.Client{Timeout: 10 * time.Second}
+		for index := 0; index < count; index++ {
+			req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(port)+"/exec/commands/next?client_id=test-worker&timeout=5", nil)
+			if err != nil {
+				t.Errorf("create next request: %v", err)
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Errorf("claim command: %v", err)
+				return
+			}
+			var payload map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+				_ = resp.Body.Close()
+				t.Errorf("decode next: %v", err)
+				return
+			}
+			_ = resp.Body.Close()
+			command, ok := payload["command"].(map[string]any)
+			if !ok || command == nil {
+				t.Errorf("missing command payload: %#v", payload)
+				return
+			}
+			commandID, _ := command["id"].(string)
+			resultBody, err := json.Marshal(map[string]any{
+				"command_id":  commandID,
+				"client_id":   "test-worker",
+				"ok":          true,
+				"duration_ms": 6,
+				"prints":      []map[string]any{{"level": "print", "text": "hello", "at_ms": 1}},
+				"returns":     []any{"ok"},
+			})
+			if err != nil {
+				t.Errorf("marshal result: %v", err)
+				return
+			}
+			resultReq, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+strconv.Itoa(port)+"/exec/commands/result", bytes.NewReader(resultBody))
+			if err != nil {
+				t.Errorf("create result request: %v", err)
+				return
+			}
+			resultReq.Header.Set("Authorization", "Bearer "+token)
+			resultReq.Header.Set("Content-Type", "application/json")
+			resultResp, err := client.Do(resultReq)
+			if err != nil {
+				t.Errorf("post result: %v", err)
+				return
+			}
+			if resultResp.StatusCode != http.StatusOK {
+				t.Errorf("post result status = %d", resultResp.StatusCode)
+				_ = resultResp.Body.Close()
+				return
+			}
+			_ = resultResp.Body.Close()
+		}
+	}()
+	return done
+}
+
 func TestPluginUISimplifiedActions(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join("..", "..", "plugin", "RiftSyncPlugin.lua"))
 	if err != nil {
@@ -450,6 +662,64 @@ func TestPluginUISimplifiedActions(t *testing.T) {
 	}
 	if strings.Contains(document, `snapshotButton.Text = "Snapshot"`) {
 		t.Fatal("plugin still labels snapshot button as Snapshot")
+	}
+}
+
+func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
+	pluginBody, err := os.ReadFile(filepath.Join("..", "..", "plugin", "RiftSyncPlugin.lua"))
+	if err != nil {
+		t.Fatalf("read plugin: %v", err)
+	}
+	apiBody, err := os.ReadFile(filepath.Join("..", "..", "plugin", "API.lua"))
+	if err != nil {
+		t.Fatalf("read API: %v", err)
+	}
+	typeListBody, err := os.ReadFile(filepath.Join("..", "..", "plugin", "TypeList.lua"))
+	if err != nil {
+		t.Fatalf("read TypeList: %v", err)
+	}
+
+	pluginDocument := string(pluginBody)
+	apiDocument := string(apiBody)
+	typeListDocument := string(typeListBody)
+	for _, needle := range []string{
+		`BootstrapPreview = "/bootstrap/preview"`,
+		`TypeList.VERSION = "3.7.0"`,
+	} {
+		if !strings.Contains(typeListDocument, needle) {
+			t.Fatalf("TypeList missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		`previewPullStudioToLocal`,
+		`confirmPullStudioToLocal`,
+		`cancelPullStudioToLocal`,
+		`TypeList.ENDPOINTS.BootstrapPreview`,
+		`pendingPullPreview`,
+		`self:pushStudioSnapshot(`,
+	} {
+		if !strings.Contains(apiDocument, needle) {
+			t.Fatalf("API missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		`pullPreviewFrame`,
+		`Pull Studio preview`,
+		`confirmPullButton`,
+		`cancelPullButton`,
+		`client:previewPullStudioToLocal()`,
+		`client:confirmPullStudioToLocal()`,
+		`client:cancelPullStudioToLocal()`,
+		`HTTP/server reachable`,
+		`connected to server`,
+		`token valid`,
+		`sync active`,
+		`exec active`,
+		`edit mode`,
+	} {
+		if !strings.Contains(pluginDocument, needle) {
+			t.Fatalf("plugin UI missing %q", needle)
+		}
 	}
 }
 

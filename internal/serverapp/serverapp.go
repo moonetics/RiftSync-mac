@@ -18,7 +18,7 @@ import (
 	"riftsync/internal/watcher"
 )
 
-const Version = "3.3.0"
+const Version = "3.7.0"
 
 type Options struct {
 	ConfigPath            string
@@ -111,8 +111,10 @@ func (r *Runner) Start(parent context.Context) error {
 		return fmt.Errorf("executable path error: %w", err)
 	}
 	if err := config.EnsureSyncRootScaffold(cfg, config.ScaffoldOptions{
-		ConfigPath:     options.ConfigPath,
-		ExecutablePath: executablePath,
+		ConfigPath:      options.ConfigPath,
+		ExecutablePath:  executablePath,
+		Version:         Version,
+		WriteStatusJSON: true,
 	}); err != nil {
 		return fmt.Errorf("sync root setup error: %w", err)
 	}
@@ -129,6 +131,13 @@ func (r *Runner) Start(parent context.Context) error {
 		fmt.Fprintf(options.Stdout, "[debug] load history error: %v\n", err)
 	}
 	appState.RecordPerformance(0, 0, time.Since(scanStarted), 0, snapshot.CacheHits, snapshot.CacheMisses)
+	if err := config.WriteGuidebookStatus(cfg, config.ScaffoldOptions{
+		ConfigPath:        options.ConfigPath,
+		Version:           Version,
+		LastKnownRevision: appState.Revision(),
+	}); err != nil {
+		return fmt.Errorf("guidebook status error: %w", err)
+	}
 
 	ctx, cancel := context.WithCancel(parent)
 	gitService := gitversion.New(cfg, appState, gitversion.Options{})

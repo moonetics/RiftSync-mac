@@ -1,10 +1,12 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadExistingConfig(t *testing.T) {
@@ -285,6 +287,87 @@ func TestEnsureSyncRootScaffoldWritesExecLauncherAndOverwritesIt(t *testing.T) {
 	}
 	if !strings.Contains(string(body), nextServerPath) || strings.Contains(string(body), "old launcher") {
 		t.Fatalf("launcher was not regenerated: %s", string(body))
+	}
+}
+
+func TestWriteGuidebookStatusIncludesRuntimeContext(t *testing.T) {
+	root := t.TempDir()
+	cfg := Default()
+	cfg.SyncRoot = root
+	cfg.RemoteExecEnabled = true
+	cfg.RemoteExecToken = "secret"
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		t.Fatalf("NormalizeAndValidate returned error: %v", err)
+	}
+	configPath := filepath.Join(root, "sync_config.json")
+	generatedAt := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	if err := EnsureSyncRootScaffold(cfg, ScaffoldOptions{
+		ConfigPath:        configPath,
+		Version:           "3.5.0",
+		LastKnownRevision: 7,
+		GeneratedAt:       generatedAt,
+		WriteStatusJSON:   true,
+	}); err != nil {
+		t.Fatalf("EnsureSyncRootScaffold returned error: %v", err)
+	}
+
+	var payload GuidebookStatusPayload
+	body, err := os.ReadFile(filepath.Join(root, GuidebookDir, GuidebookStatus))
+	if err != nil {
+		t.Fatalf("read guidebook status: %v", err)
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode guidebook status: %v", err)
+	}
+	if payload.SyncRoot != root || payload.ConfigPath != configPath || payload.Version != "3.5.0" || payload.LastKnownRevision != 7 {
+		t.Fatalf("status payload = %#v", payload)
+	}
+	if !payload.RemoteExecEnabled || !payload.RemoteExecConfigured || !payload.RemoteExecAvailable {
+		t.Fatalf("remote exec booleans = enabled %t configured %t available %t", payload.RemoteExecEnabled, payload.RemoteExecConfigured, payload.RemoteExecAvailable)
+	}
+	if len(payload.SupportedFileFormats) == 0 {
+		t.Fatal("supported formats empty")
+	}
+	if !payload.GeneratedAt.Equal(generatedAt) {
+		t.Fatalf("GeneratedAt = %s, want %s", payload.GeneratedAt, generatedAt)
+	}
+}
+
+func TestGuidebookStatusOverwritesButReadmeDoesNot(t *testing.T) {
+	root := t.TempDir()
+	cfg := Default()
+	cfg.SyncRoot = root
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		t.Fatalf("NormalizeAndValidate returned error: %v", err)
+	}
+	guidebook := filepath.Join(root, GuidebookDir, "README.md")
+	if err := os.MkdirAll(filepath.Dir(guidebook), 0o755); err != nil {
+		t.Fatalf("mkdir guidebook: %v", err)
+	}
+	if err := os.WriteFile(guidebook, []byte("custom guide"), 0o644); err != nil {
+		t.Fatalf("write guidebook: %v", err)
+	}
+	statusPath := filepath.Join(root, GuidebookDir, GuidebookStatus)
+	if err := os.WriteFile(statusPath, []byte(`{"old":true}`), 0o644); err != nil {
+		t.Fatalf("write old status: %v", err)
+	}
+
+	if err := EnsureSyncRootScaffold(cfg, ScaffoldOptions{Version: "3.5.0", LastKnownRevision: 3, WriteStatusJSON: true}); err != nil {
+		t.Fatalf("EnsureSyncRootScaffold returned error: %v", err)
+	}
+	readmeBody, err := os.ReadFile(guidebook)
+	if err != nil {
+		t.Fatalf("read guidebook: %v", err)
+	}
+	if string(readmeBody) != "custom guide" {
+		t.Fatalf("guidebook overwritten = %q", string(readmeBody))
+	}
+	statusBody, err := os.ReadFile(statusPath)
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if strings.Contains(string(statusBody), `"old":true`) || !strings.Contains(string(statusBody), `"last_known_revision": 3`) {
+		t.Fatalf("status was not regenerated: %s", string(statusBody))
 	}
 }
 

@@ -1,6 +1,6 @@
 # RiftSync Plugin (One-Way + Properties Tree)
 
-Versi: `3.3.0`
+Versi: `3.7.0`
 Protocol sync: `rbxsync/2.0.0`
 
 One-way sync untuk Roblox Studio:
@@ -229,7 +229,7 @@ Saat server/app start, RiftSync otomatis memastikan folder service dasar tersedi
 - `StarterPack`
 - `StarterPlayer`
 
-RiftSync juga membuat `.guidebook/README.md` di dalam `sync_root` jika belum ada. File ini adalah playbook lokal untuk manusia/AI: struktur folder, workflow sync, Remote Exec, metadata yang tidak boleh disync, dan cara cek Git. RiftSync juga menulis `.guidebook/riftsync-exec.ps1` sebagai launcher lokal auto-generated untuk menjalankan Remote Exec dari folder game. Folder metadata `.git`, `.rblxsync`, dan `.guidebook` tidak dikirim ke Studio.
+RiftSync juga membuat `.guidebook/README.md` di dalam `sync_root` jika belum ada. File ini adalah playbook lokal untuk manusia/AI: struktur folder, workflow sync, Remote Exec, metadata yang tidak boleh disync, dan cara cek Git. RiftSync juga menulis `.guidebook/riftsync-exec.ps1` sebagai launcher lokal auto-generated untuk menjalankan Remote Exec dari folder game, serta `.guidebook/status.json` sebagai status mesin yang bisa dibaca tool/AI. Folder metadata `.git`, `.rblxsync`, dan `.guidebook` tidak dikirim ke Studio.
 
 Contoh minimal:
 
@@ -239,6 +239,7 @@ Contoh minimal:
 ├─ .rblxsync/
 ├─ .guidebook/
 │  ├─ README.md
+│  ├─ status.json
 │  └─ riftsync-exec.ps1
 ├─ ServerScriptService/
 │  └─ Bootstrap.Script/
@@ -296,11 +297,21 @@ Untuk debug/automation dari terminal:
 .\riftsync-server.exe --headless
 ```
 
+Untuk validasi project tanpa menjalankan server:
+
+```powershell
+.\riftsync-server.exe validate
+.\riftsync-server.exe validate --json
+```
+
+`validate` mengecek config, akses `sync_root`, metadata JSON invalid, duplicate stable ID, path script/UI yang tidak didukung, folder metadata yang di-ignore, dan proteksi path traversal. Warning tidak membuat exit code gagal; error validasi mengembalikan exit code `1`, sedangkan error argumen/config load mengembalikan exit code `2`.
+
 Untuk mengirim command Luau ke Studio melalui Remote Exec CLI dari `sync_root`, jalankan server/app terlebih dahulu lalu gunakan launcher lokal:
 
 ```powershell
 .\.guidebook\riftsync-exec.ps1 "print(workspace.Name)"
 .\.guidebook\riftsync-exec.ps1 .\studio-command.lua --timeout 30
+.\.guidebook\riftsync-exec.ps1 --last
 @'
 local part = workspace:WaitForChild("MyPart", 10)
 print(part:GetFullName())
@@ -311,11 +322,23 @@ return part.Name
 
 Remote Exec membutuhkan `"remote_exec_enabled": true` dan `"remote_exec_token": "..."` di config lokal. CLI membaca token itu dan mengirim `Authorization: Bearer <token>` ke server. Launcher `.guidebook/riftsync-exec.ps1` auto-generated per mesin dan meneruskan argumen ke `riftsync-server.exe --config <config> exec`. Jika argumen pertama berakhiran `.lua` atau `.luau`, launcher/CLI membacanya sebagai file source sehingga script command bar bisa disimpan dan dirawat seperti file biasa. Subcommand `exec` hanya menghubungi server yang sudah berjalan; ia tidak menyalakan server baru. Gunakan `--json` untuk output terstruktur atau `--raw` untuk output plain tanpa label.
 
+Setiap command Remote Exec dari CLI dan tab Exec app dicatat ke `.rblxsync/exec-history.json`. History ini local-only, menyimpan source penuh untuk rerun, dan otomatis dibatasi ke 100 entry terbaru. Jalankan ulang command terakhir dengan:
+
+```powershell
+.\riftsync-server.exe --config .\sync_config.json exec --last
+.\.guidebook\riftsync-exec.ps1 --last
+```
+
+App `riftsync.exe` juga memiliki tab `Exec` untuk paste Luau, set timeout, run command, melihat output, dan rerun command terbaru/recent. Tab ini tetap membutuhkan server sudah Start, Studio plugin sudah sync, token cocok, dan `Exec ON` aktif.
+
+`.guidebook/status.json` berisi `sync_root`, path config absolut, host/port, versi RiftSync, status Remote Exec, format file yang didukung, revision terakhir, dan timestamp generasi. File ini boleh dioverwrite otomatis oleh RiftSync; `.guidebook/README.md` tetap tidak dioverwrite jika sudah ada.
+
 Fallback langsung jika tidak berada di `sync_root`:
 
 ```powershell
 .\riftsync-server.exe --config .\sync_config.json exec "print(workspace.Name)"
 .\riftsync-server.exe --config .\sync_config.json exec .\studio-command.lua --timeout 30
+.\riftsync-server.exe --config .\sync_config.json exec --last
 ```
 
 Manual test Studio Remote Exec:
@@ -379,6 +402,7 @@ App UI lokal memakai layout tab tanpa scroll halaman utama:
 
 - `Overview`: status, sync root, indexed counts, health, Git, dan quick actions.
 - `History`: revision list + detail viewer dengan scroll internal.
+- `Exec`: paste/run Remote Exec Luau, output, dan recent rerun.
 - `Config`: config path, sync root, host, port, Git/debug/legacy scan, dan Save & Restart.
 
 Header app custom menggantikan title bar Windows bila frameless mode berhasil. Jika Win32 frameless gagal di mesin tertentu, app tetap jalan dengan title bar normal.
@@ -414,13 +438,14 @@ git diff --check
 5. Klik `Start`.
 6. Save file di VS Code, perubahan akan otomatis muncul di Studio.
 7. Jika ada error, status bar tampil ringkas dan detail lengkap muncul di panel `Output` Studio.
-8. Aktifkan `Debug` di widget untuk checklist live:
-   - Handshake
-   - Snapshot
-   - Poll
-   - Delta
-   - ACK Sent
-   - ACK OK
+8. Klik `Pull Studio` untuk mirror Studio ke folder lokal. Widget akan menampilkan preview add/update/delete/unchanged, lalu kamu harus pilih `Confirm` atau `Cancel`.
+9. Aktifkan `Debug` di widget untuk checklist live:
+   - HTTP/server reachable
+   - connected to server
+   - token valid
+   - sync active
+   - exec active
+   - edit mode
    plus tail event log dan ringkasan status server (`/debug/state`).
 
 ### Icon Plugin Studio
@@ -486,5 +511,9 @@ Field penting:
 ## Catatan Deletion
 
 - Delete folder/file di VS Code dipropagasikan end-to-end menjadi opcode `delete` dan `Destroy()` di Studio.
+- Pull Studio memakai replace semantics: file lokal yang sudah tidak ada di Studio ikut dihapus dari folder lokal.
+- Pull Studio selalu menampilkan preview add/update/delete/unchanged dan hanya melakukan replace setelah `Confirm`.
+- `Cancel` pada preview tidak mengubah file lokal.
+- Setelah `Confirm`, sebelum Pull Studio replace menghapus konten lokal, RiftSync membuat backup di `.rblxsync/backups/<timestamp>/` untuk konten yang akan dihapus/diganti. `.git`, `.rblxsync`, dan `.guidebook` tetap dipreservasi dan tidak dicopy ke backup.
 - Root service (`StarterGui`, `Workspace`, `Lighting`, `ReplicatedStorage`, `ReplicatedFirst`) dan `Terrain` tetap diproteksi agar tidak ter-destroy salah.
 - Untuk scope property sync (`StarterGui`, `Workspace`, `Lighting`), delete instance non-managed juga diproses (filesystem authoritative) supaya kasus folder terhapus tapi instance tetap nongol di Studio tidak terjadi lagi.

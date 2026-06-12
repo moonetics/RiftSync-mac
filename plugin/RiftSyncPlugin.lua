@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------------------
--- RiftSyncPlugin v3.3.0
+-- RiftSyncPlugin v3.7.0
 -- One-way sync plugin: local folder -> Roblox Studio
 --------------------------------------------------------------------------------------------
 
@@ -497,7 +497,7 @@ debugFrame.Size = UDim2.new(1, 0, 0, 0)
 debugFrame.Position = UDim2.new(0, 0, 1, -252)
 applyPadding(debugFrame, 10, 8, 10, 8)
 
-local debugChecklistLabel = makeText(debugFrame, "[ ] Handshake  [ ] Snapshot  [ ] Poll  [ ] Delta\n[ ] ACK Sent  [ ] ACK OK", 11, COLORS.DebugText, Enum.Font.Code, 1)
+local debugChecklistLabel = makeText(debugFrame, "[ ] HTTP/server reachable  [ ] connected to server  [ ] token valid\n[ ] sync active  [ ] exec active  [ ] edit mode", 11, COLORS.DebugText, Enum.Font.Code, 1)
 debugChecklistLabel.Size = UDim2.new(1, 0, 0, 28)
 debugChecklistLabel.Position = UDim2.new(0, 0, 0, 0)
 debugChecklistLabel.TextWrapped = true
@@ -516,11 +516,45 @@ debugEventsLabel.Position = UDim2.new(0, 0, 0, 60)
 debugEventsLabel.TextSize = 11
 debugEventsLabel.TextYAlignment = Enum.TextYAlignment.Top
 
+local pullPreviewFrame = makePanel(card, 118, COLORS.PanelSoft, 6)
+pullPreviewFrame.Position = UDim2.new(0, 0, 0, 354)
+pullPreviewFrame.Visible = false
+applyPadding(pullPreviewFrame, 10, 8, 10, 8)
+
+local pullPreviewTitleLabel = makeText(pullPreviewFrame, "Pull Studio preview", 12, COLORS.Text, Enum.Font.GothamBold, 1)
+pullPreviewTitleLabel.Size = UDim2.new(0.55, 0, 0, 18)
+pullPreviewTitleLabel.Position = UDim2.new(0, 0, 0, 0)
+
+local pullPreviewCountLabel = makeText(pullPreviewFrame, "add 0 | update 0 | delete 0 | unchanged 0", 11, COLORS.DebugText, Enum.Font.Code, 2)
+pullPreviewCountLabel.Size = UDim2.new(0.45, 0, 0, 18)
+pullPreviewCountLabel.Position = UDim2.new(0.55, 0, 0, 0)
+pullPreviewCountLabel.TextXAlignment = Enum.TextXAlignment.Right
+
+local pullPreviewSamplesLabel = makeText(pullPreviewFrame, "Collecting preview...", 11, COLORS.DebugMuted, Enum.Font.Code, 3)
+pullPreviewSamplesLabel.Size = UDim2.new(1, -126, 0, 72)
+pullPreviewSamplesLabel.Position = UDim2.new(0, 0, 0, 28)
+pullPreviewSamplesLabel.TextWrapped = true
+pullPreviewSamplesLabel.TextYAlignment = Enum.TextYAlignment.Top
+
+local confirmPullButton = Instance.new("TextButton")
+confirmPullButton.Size = UDim2.new(0, 58, 0, 28)
+confirmPullButton.Position = UDim2.new(1, -122, 1, -32)
+confirmPullButton.Text = "Confirm"
+confirmPullButton.Parent = pullPreviewFrame
+styleButton(confirmPullButton, COLORS.Pull, COLORS.ButtonText)
+
+local cancelPullButton = Instance.new("TextButton")
+cancelPullButton.Size = UDim2.new(0, 56, 0, 28)
+cancelPullButton.Position = UDim2.new(1, -56, 1, -32)
+cancelPullButton.Text = "Cancel"
+cancelPullButton.Parent = pullPreviewFrame
+styleButton(cancelPullButton, COLORS.DebugOff, COLORS.ButtonMutedText)
+
 local buttonRow = Instance.new("Frame")
 buttonRow.Size = UDim2.new(1, 0, 0, 42)
 buttonRow.Position = UDim2.new(0, 0, 0, 300)
 buttonRow.BackgroundTransparency = 1
-buttonRow.LayoutOrder = 6
+buttonRow.LayoutOrder = 7
 buttonRow.Parent = card
 applyList(buttonRow, Enum.FillDirection.Horizontal, 8)
 
@@ -1044,6 +1078,58 @@ local function checkMark(value)
 	return "[ ]"
 end
 
+local function previewCount(response, keyName)
+	if typeof(response) ~= "table" then
+		return 0
+	end
+	return tonumber(response[keyName]) or 0
+end
+
+local function previewSamples(response, keyName, label)
+	local list = typeof(response) == "table" and response[keyName] or nil
+	if typeof(list) ~= "table" or #list == 0 then
+		return label .. ": -"
+	end
+
+	local samples = {}
+	local limit = math.min(#list, 3)
+	for index = 1, limit do
+		table.insert(samples, tostring(list[index]))
+	end
+	if #list > limit then
+		table.insert(samples, "+" .. tostring(#list - limit) .. " more")
+	end
+	return label .. ": " .. table.concat(samples, ", ")
+end
+
+local function showPullPreview(preview)
+	local response = typeof(preview) == "table" and preview.response or preview
+	local addCount = previewCount(response, "add_count")
+	local updateCount = previewCount(response, "update_count")
+	local deleteCount = previewCount(response, "delete_count")
+	local unchangedCount = previewCount(response, "unchanged_count")
+	pullPreviewFrame.Visible = true
+	pullPreviewCountLabel.Text = "add "
+		.. tostring(addCount)
+		.. " | update "
+		.. tostring(updateCount)
+		.. " | delete "
+		.. tostring(deleteCount)
+		.. " | unchanged "
+		.. tostring(unchangedCount)
+	pullPreviewSamplesLabel.Text = table.concat({
+		previewSamples(response, "files_to_add", "add"),
+		previewSamples(response, "files_to_update", "update"),
+		previewSamples(response, "files_to_delete", "delete"),
+	}, "\n")
+end
+
+local function hidePullPreview()
+	pullPreviewFrame.Visible = false
+	pullPreviewSamplesLabel.Text = "Collecting preview..."
+	pullPreviewCountLabel.Text = "add 0 | update 0 | delete 0 | unchanged 0"
+end
+
 local function updateDebugToggleUi(enabled)
 	if enabled then
 		debugToggleButton.BackgroundColor3 = COLORS.DebugOn
@@ -1132,7 +1218,7 @@ local function updateDebugPanel(payload)
 	end
 
 	if not enabled then
-		debugChecklistLabel.Text = "[ ] Handshake  [ ] Snapshot  [ ] Poll  [ ] Delta\n[ ] ACK Sent  [ ] ACK OK"
+		debugChecklistLabel.Text = "[ ] HTTP/server reachable  [ ] connected to server  [ ] token valid\n[ ] sync active  [ ] exec active  [ ] edit mode"
 		debugServerLabel.TextColor3 = COLORS.DebugMuted
 		debugServerLabel.Text = "Debug nonaktif."
 		debugEventsLabel.TextColor3 = COLORS.DebugMuted
@@ -1145,14 +1231,14 @@ local function updateDebugPanel(payload)
 	local server = typeof(payload.server) == "table" and payload.server or {}
 
 	local checklistLineOne = table.concat({
-		checkMark(checks.handshake) .. " Handshake",
-		checkMark(checks.snapshot) .. " Snapshot",
-		checkMark(checks.poll) .. " Poll",
-		checkMark(checks.delta) .. " Delta",
+		checkMark(checks.http_server_reachable) .. " HTTP/server reachable",
+		checkMark(checks.connected_to_server) .. " connected to server",
+		checkMark(checks.token_valid) .. " token valid",
 	}, "  ")
 	local checklistLineTwo = table.concat({
-		checkMark(checks.ack_sent) .. " ACK Sent",
-		checkMark(checks.ack_ok) .. " ACK OK",
+		checkMark(checks.sync_active) .. " sync active",
+		checkMark(checks.exec_active) .. " exec active",
+		checkMark(checks.edit_mode) .. " edit mode",
 	}, "  ")
 	debugChecklistLabel.Text = checklistLineOne .. "\n" .. checklistLineTwo
 
@@ -1277,17 +1363,42 @@ snapshotButton.MouseButton1Click:Connect(function()
 end)
 
 pullStudioButton.MouseButton1Click:Connect(function()
-	if not client.pullStudioToLocal then
-		updateStatus("Pull Studio tidak tersedia di API ini", true)
+	if not client.previewPullStudioToLocal then
+		updateStatus("Pull Studio preview tidak tersedia di API ini", true)
 		return
 	end
 
-	local ok, err = client:pullStudioToLocal()
+	hidePullPreview()
+	local ok, previewOrError = client:previewPullStudioToLocal()
+	if not ok then
+		updateStatus("Pull Studio preview gagal: " .. tostring(previewOrError), true)
+	else
+		showPullPreview(previewOrError)
+		updateStatus("Review Pull Studio preview, lalu Confirm atau Cancel.", false)
+	end
+end)
+
+confirmPullButton.MouseButton1Click:Connect(function()
+	if not client.confirmPullStudioToLocal then
+		updateStatus("Pull Studio confirm tidak tersedia di API ini", true)
+		return
+	end
+
+	local ok, err = client:confirmPullStudioToLocal()
+	hidePullPreview()
 	if not ok then
 		updateStatus("Pull Studio gagal: " .. tostring(err), true)
 	else
 		refreshRevisionHistory(true)
 	end
+end)
+
+cancelPullButton.MouseButton1Click:Connect(function()
+	if client.cancelPullStudioToLocal then
+		client:cancelPullStudioToLocal()
+	end
+	hidePullPreview()
+	updateStatus("Pull Studio dibatalkan. Local files tidak berubah.", false)
 end)
 
 debugToggleButton.MouseButton1Click:Connect(function()

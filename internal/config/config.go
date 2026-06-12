@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -14,6 +15,7 @@ type Config struct {
 	Port                        int                 `json:"port"`
 	SyncRoot                    string              `json:"sync_root"`
 	SyncRootAbs                 string              `json:"-"`
+	ConfigPathAbs               string              `json:"-"`
 	ScanIntervalSec             float64             `json:"scan_interval_sec"`
 	PollTimeoutSec              int                 `json:"poll_timeout_sec"`
 	ChangeRetention             int                 `json:"change_retention"`
@@ -34,6 +36,7 @@ type Config struct {
 const MetadataDir = ".rblxsync"
 const GuidebookDir = ".guidebook"
 const GuidebookExecLauncher = "riftsync-exec.ps1"
+const GuidebookStatus = "status.json"
 
 var BootstrapServiceDirs = []string{
 	"ServerScriptService",
@@ -45,8 +48,46 @@ var BootstrapServiceDirs = []string{
 }
 
 type ScaffoldOptions struct {
-	ConfigPath     string
-	ExecutablePath string
+	ConfigPath        string
+	ExecutablePath    string
+	Version           string
+	LastKnownRevision int
+	GeneratedAt       time.Time
+	WriteStatusJSON   bool
+}
+
+type GuidebookStatusPayload struct {
+	SyncRoot             string    `json:"sync_root"`
+	ConfigPath           string    `json:"config_path"`
+	Host                 string    `json:"host"`
+	Port                 int       `json:"port"`
+	Version              string    `json:"version"`
+	RemoteExecEnabled    bool      `json:"remote_exec_enabled"`
+	RemoteExecConfigured bool      `json:"remote_exec_configured"`
+	RemoteExecAvailable  bool      `json:"remote_exec_available"`
+	SupportedFileFormats []string  `json:"supported_file_formats"`
+	LastKnownRevision    int       `json:"last_known_revision"`
+	GeneratedAt          time.Time `json:"generated_at"`
+}
+
+func SupportedFileFormats() []string {
+	return []string{
+		".server.luau",
+		".client.luau",
+		".module.luau",
+		".server.lua",
+		".client.lua",
+		".module.lua",
+		"source.server.luau",
+		"source.client.luau",
+		"source.module.luau",
+		"source.server.lua",
+		"source.client.lua",
+		"source.module.lua",
+		"properties.init.json",
+		"init.meta.json",
+		"*.model.json",
+	}
 }
 
 const guidebookReadme = `# RiftSync Guidebook
@@ -136,7 +177,7 @@ Example UI tree:
 3. Edit files under the sync root.
 4. RiftSync detects create/update/delete/rename/move changes and applies them to Studio.
 5. Use Resync if Studio needs a fresh local-to-Studio snapshot.
-6. Use Pull Studio when Studio should overwrite/merge back into the local folder.
+6. Use Pull Studio when Studio should mirror back into the local folder.
 
 Important rules:
 
@@ -144,6 +185,9 @@ Important rules:
 - Do not edit .git, .rblxsync, or .guidebook as Roblox content.
 - Do not place generated build artifacts inside service folders unless they should sync to Studio.
 - If a folder path does not exist in Studio, RiftSync may create missing parents as Folder instances.
+- Pull Studio first shows a preview of files to add, update, delete, and keep unchanged.
+- Confirm starts the replace. Cancel leaves local files untouched.
+- After Confirm, Pull Studio replace creates a timestamped backup under .rblxsync/backups before deleting replaced local content.
 
 ## Remote Exec: Studio Command Bar From Local Terminal
 
@@ -180,14 +224,23 @@ Command from file:
 ~~~powershell
 .\.guidebook\riftsync-exec.ps1 .\studio-command.lua --timeout 30
 .\.guidebook\riftsync-exec.ps1 --file .\studio-command.luau --timeout 30
+.\.guidebook\riftsync-exec.ps1 --last
 ~~~
 
 The .guidebook/riftsync-exec.ps1 launcher is generated for this machine. It points to the local RiftSync binary and config path so AI assistants can run Remote Exec while working from the sync root.
+
+Remote Exec history:
+
+- CLI and app console commands are stored in .rblxsync/exec-history.json.
+- History is local-only and stores full source so rerun works even for inline/stdin/app commands.
+- The latest command can be rerun with .\.guidebook\riftsync-exec.ps1 --last.
+- The desktop app has an Exec tab for paste/run output and recent reruns.
 
 Direct fallback:
 
 ~~~powershell
 .\riftsync-server.exe --config <path-to-sync_config.json> exec "print(workspace.Name)"
+.\riftsync-server.exe --config <path-to-sync_config.json> exec --last
 ~~~
 
 Remote Exec returns these to the local terminal:
@@ -233,6 +286,8 @@ Common commands:
 .\riftsync.exe
 .\riftsync-server.exe --headless
 .\riftsync-server.exe --headless --port 8766
+.\riftsync-server.exe validate
+.\riftsync-server.exe validate --json
 ~~~
 
 Important sync_config.json fields:
@@ -245,6 +300,11 @@ Important sync_config.json fields:
 - remote_exec_enabled: enable Remote Exec HTTP API.
 - remote_exec_token: bearer token used by CLI and Studio plugin.
 
+Generated machine context:
+
+- .guidebook/status.json is overwritten by RiftSync with the current sync root, config path, server host/port, version, Remote Exec availability, supported file formats, and last known revision.
+- validate checks config, metadata JSON, duplicate stable IDs, unsupported paths, and sync root safety without modifying project files.
+
 ## Metadata Folders
 
 These folders are local-only:
@@ -254,6 +314,21 @@ These folders are local-only:
 - .guidebook: AI/human playbook.
 
 RiftSync preserves and ignores these folders during scan, watch, and bootstrap replace. Do not create Roblox scripts or UI content inside them.
+
+Backups from Pull Studio replace live in .rblxsync/backups/<timestamp> and accumulate until you remove them. Backups are created after the Studio plugin preview is confirmed, before local files are deleted.
+
+## Studio Plugin Health
+
+The Studio widget debug checklist tracks:
+
+- HTTP/server reachable.
+- connected to server.
+- token valid.
+- sync active.
+- exec active.
+- edit mode.
+
+Keep Studio in Edit mode for Remote Exec. Play mode intentionally blocks command execution.
 
 ## Troubleshooting
 
@@ -293,8 +368,71 @@ func EnsureSyncRootScaffold(cfg Config, options ...ScaffoldOptions) error {
 		if err := writeGuidebookExecLauncher(cfg, options[0]); err != nil {
 			return err
 		}
+		if options[0].WriteStatusJSON {
+			if err := WriteGuidebookStatus(cfg, options[0]); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+func WriteGuidebookStatus(cfg Config, options ScaffoldOptions) error {
+	if strings.TrimSpace(cfg.SyncRootAbs) == "" {
+		return errors.New("sync_root_abs is not configured")
+	}
+	configAbs, err := resolveStatusConfigPath(cfg, options.ConfigPath)
+	if err != nil {
+		return err
+	}
+	generatedAt := options.GeneratedAt
+	if generatedAt.IsZero() {
+		generatedAt = time.Now().UTC()
+	} else {
+		generatedAt = generatedAt.UTC()
+	}
+	remoteExecConfigured := strings.TrimSpace(cfg.RemoteExecToken) != ""
+	payload := GuidebookStatusPayload{
+		SyncRoot:             cfg.SyncRootAbs,
+		ConfigPath:           configAbs,
+		Host:                 cfg.Host,
+		Port:                 cfg.Port,
+		Version:              strings.TrimSpace(options.Version),
+		RemoteExecEnabled:    cfg.RemoteExecEnabled,
+		RemoteExecConfigured: remoteExecConfigured,
+		RemoteExecAvailable:  cfg.RemoteExecEnabled && remoteExecConfigured,
+		SupportedFileFormats: SupportedFileFormats(),
+		LastKnownRevision:    options.LastKnownRevision,
+		GeneratedAt:          generatedAt,
+	}
+	body, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal guidebook status: %w", err)
+	}
+	body = append(body, '\n')
+	target := filepath.Join(cfg.SyncRootAbs, GuidebookDir, GuidebookStatus)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("create guidebook status dir: %w", err)
+	}
+	if err := os.WriteFile(target, body, 0o644); err != nil {
+		return fmt.Errorf("write guidebook status: %w", err)
+	}
+	return nil
+}
+
+func resolveStatusConfigPath(cfg Config, configPath string) (string, error) {
+	candidate := strings.TrimSpace(configPath)
+	if candidate == "" {
+		candidate = strings.TrimSpace(cfg.ConfigPathAbs)
+	}
+	if candidate == "" {
+		candidate = "sync_config.json"
+	}
+	configAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", fmt.Errorf("resolve config path for guidebook status: %w", err)
+	}
+	return filepath.Clean(configAbs), nil
 }
 
 func writeGuidebookExecLauncher(cfg Config, options ScaffoldOptions) error {
@@ -412,6 +550,9 @@ func Default() Config {
 
 func Load(path string) (Config, error) {
 	cfg := Default()
+	if abs, err := filepath.Abs(path); err == nil {
+		cfg.ConfigPathAbs = filepath.Clean(abs)
+	}
 
 	body, err := os.ReadFile(path)
 	if err != nil {

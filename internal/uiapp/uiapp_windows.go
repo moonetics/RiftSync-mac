@@ -1,10 +1,12 @@
 package uiapp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"unsafe"
 
 	"riftsync/internal/config"
+	"riftsync/internal/exechistory"
 	"riftsync/internal/serverapp"
 	"riftsync/internal/state"
 
@@ -172,6 +175,46 @@ type restartRequest struct {
 	LegacyScan bool   `json:"legacy_scan"`
 }
 
+type execRunRequest struct {
+	Source     string `json:"source"`
+	TimeoutSec int    `json:"timeout_sec"`
+}
+
+type execRerunRequest struct {
+	ID         string `json:"id"`
+	TimeoutSec int    `json:"timeout_sec"`
+}
+
+type appExecPrint struct {
+	Level string  `json:"level"`
+	Text  string  `json:"text"`
+	AtMS  float64 `json:"at_ms"`
+}
+
+type appExecResult struct {
+	ID         string         `json:"id"`
+	State      string         `json:"state"`
+	OK         bool           `json:"ok"`
+	DurationMS float64        `json:"duration_ms"`
+	Prints     []appExecPrint `json:"prints"`
+	Returns    []any          `json:"returns"`
+	Error      string         `json:"error"`
+	Traceback  string         `json:"traceback"`
+	LateResult bool           `json:"late_result"`
+}
+
+type appExecSubmitResponse struct {
+	Status    string `json:"status"`
+	CommandID string `json:"command_id"`
+	Message   string `json:"message"`
+}
+
+type appExecDetailResponse struct {
+	Status  string        `json:"status"`
+	Command appExecResult `json:"command"`
+	Message string        `json:"message"`
+}
+
 // Run starts a tiny loopback control UI and displays it in an embedded WebView2 window.
 // The sync server itself remains stopped until the user clicks Start.
 func Run(ctx context.Context, options serverapp.Options) error {
@@ -269,6 +312,9 @@ func (a *appController) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/app/open-folder", a.handleOpenFolder)
 	mux.HandleFunc("/app/pick-folder", a.handlePickFolder)
 	mux.HandleFunc("/app/history", a.handleHistory)
+	mux.HandleFunc("/app/exec/history", a.handleExecHistory)
+	mux.HandleFunc("/app/exec/run", a.handleExecRun)
+	mux.HandleFunc("/app/exec/rerun", a.handleExecRerun)
 	mux.HandleFunc("/app/logs", a.handleLogs)
 	mux.HandleFunc("/app/window/minimize", a.handleWindowMinimize)
 	mux.HandleFunc("/app/window/close", a.handleWindowClose)
@@ -494,6 +540,299 @@ func (a *appController) handleHistory(w http.ResponseWriter, r *http.Request) {
 		"git":        gitState,
 		"revisions":  revisions,
 	})
+}
+
+func (a *appController) handleExecHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	file, warning, err := exechistory.Load(syncRoot)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"warning": warning,
+		"entries": file.Entries,
+	})
+}
+
+func (a *appController) handleExecRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var request execRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(request.Source) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "source is required"})
+		return
+	}
+	a.runExecAndWrite(w, request.Source, request.TimeoutSec, "")
+}
+
+func (a *appController) handleExecRerun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var request execRerunRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	file, warning, err := exechistory.Load(syncRoot)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	var entry exechistory.Entry
+	found := false
+	if strings.TrimSpace(request.ID) != "" {
+		for _, candidate := range file.Entries {
+			if candidate.ID == request.ID && strings.TrimSpace(candidate.Source) != "" {
+				entry = candidate
+				found = true
+				break
+			}
+		}
+	} else {
+		entry, found = exechistory.LatestUsable(file)
+	}
+	if !found {
+		message := "no usable Remote Exec history"
+		if warning != "" {
+			message = warning
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": message})
+		return
+	}
+	timeoutSec := request.TimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = entry.TimeoutSec
+	}
+	a.runExecAndWrite(w, entry.Source, timeoutSec, entry.ID)
+}
+
+func (a *appController) runExecAndWrite(w http.ResponseWriter, source string, timeoutSec int, rerunOfID string) {
+	status := a.runner.Status(5)
+	if !status.Running {
+		writeJSON(w, http.StatusConflict, map[string]any{"status": "error", "error": "Start RiftSync first"})
+		return
+	}
+	cfg, err := config.Load(fallback(status.ConfigPath, a.options.ConfigPath))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = cfg.RemoteExecDefaultTimeoutSec
+	}
+	if timeoutSec < 1 {
+		timeoutSec = 1
+	}
+	if timeoutSec > cfg.RemoteExecMaxTimeoutSec {
+		timeoutSec = cfg.RemoteExecMaxTimeoutSec
+	}
+
+	result, commandID, runErr := runAppRemoteExec(a.ctx, status.Host, status.Port, cfg.RemoteExecToken, source, timeoutSec)
+	if runErr != nil {
+		result = appExecResult{
+			ID:    commandID,
+			State: "submit_failed",
+			OK:    false,
+			Error: runErr.Error(),
+		}
+	}
+	entry, warning, historyErr := exechistory.Append(status.SyncRoot, exechistory.Entry{
+		SubmittedBy: "app",
+		SourceKind:  "app",
+		Source:      source,
+		TimeoutSec:  timeoutSec,
+		ResultState: result.State,
+		OK:          result.OK,
+		Error:       result.Error,
+		DurationMS:  result.DurationMS,
+		CommandID:   fallback(commandID, result.ID),
+		RerunOfID:   rerunOfID,
+	}, exechistory.DefaultLimit)
+	if historyErr != nil && runErr == nil {
+		runErr = historyErr
+	}
+	payload := map[string]any{
+		"status":          "ok",
+		"result":          result,
+		"output":          formatAppExecOutput(result),
+		"entry":           entry,
+		"history_warning": warning,
+	}
+	if runErr != nil {
+		payload["status"] = "error"
+		payload["error"] = runErr.Error()
+		writeJSON(w, http.StatusBadRequest, payload)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func runAppRemoteExec(ctx context.Context, host string, port int, token, source string, timeoutSec int) (appExecResult, string, error) {
+	baseURL := fmt.Sprintf("http://%s:%d", host, port)
+	commandID, err := submitAppRemoteExec(ctx, baseURL, token, source, timeoutSec)
+	if err != nil {
+		return appExecResult{}, "", err
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec+5)*time.Second)
+	defer cancel()
+	result, err := waitAppRemoteExec(waitCtx, baseURL, token, commandID)
+	return result, commandID, err
+}
+
+func submitAppRemoteExec(ctx context.Context, baseURL, token, source string, timeoutSec int) (string, error) {
+	payload := map[string]any{
+		"source":      source,
+		"timeout_sec": timeoutSec,
+		"client":      "riftsync-app",
+		"mode":        "edit",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/exec/commands", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	applyAppExecAuth(req, token)
+	var response appExecSubmitResponse
+	if err := doAppExecJSON(req, &response); err != nil {
+		return "", err
+	}
+	if response.CommandID == "" {
+		return "", errors.New("server returned empty command_id")
+	}
+	return response.CommandID, nil
+}
+
+func waitAppRemoteExec(ctx context.Context, baseURL, token, commandID string) (appExecResult, error) {
+	for {
+		result, err := detailAppRemoteExec(ctx, baseURL, token, commandID)
+		if err != nil {
+			return appExecResult{}, err
+		}
+		if isAppExecTerminalState(result.State) {
+			return result, nil
+		}
+		timer := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return appExecResult{ID: commandID, State: "timeout", OK: false, Error: ctx.Err().Error()}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func detailAppRemoteExec(ctx context.Context, baseURL, token, commandID string) (appExecResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/exec/commands/"+commandID, nil)
+	if err != nil {
+		return appExecResult{}, err
+	}
+	applyAppExecAuth(req, token)
+	var response appExecDetailResponse
+	if err := doAppExecJSON(req, &response); err != nil {
+		return appExecResult{}, err
+	}
+	if response.Command.ID == "" {
+		response.Command.ID = commandID
+	}
+	return response.Command, nil
+}
+
+func doAppExecJSON(req *http.Request, target any) error {
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		message := strings.TrimSpace(string(body))
+		var payload map[string]any
+		if json.Unmarshal(body, &payload) == nil {
+			if value, ok := payload["message"].(string); ok && value != "" {
+				message = value
+			}
+		}
+		return fmt.Errorf("HTTP %d: %s", response.StatusCode, message)
+	}
+	if err := json.Unmarshal(body, target); err != nil {
+		return fmt.Errorf("invalid JSON response: %w", err)
+	}
+	return nil
+}
+
+func applyAppExecAuth(req *http.Request, token string) {
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	}
+}
+
+func isAppExecTerminalState(state string) bool {
+	switch state {
+	case "done", "error", "timeout", "expired", "cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
+func formatAppExecOutput(result appExecResult) string {
+	lines := []string{}
+	for _, entry := range result.Prints {
+		level := strings.TrimSpace(entry.Level)
+		if level == "" {
+			level = "print"
+		}
+		lines = append(lines, "["+level+"] "+entry.Text)
+	}
+	if len(result.Returns) > 0 {
+		values := make([]string, 0, len(result.Returns))
+		for _, value := range result.Returns {
+			values = append(values, fmt.Sprint(value))
+		}
+		lines = append(lines, "[return] "+strings.Join(values, ", "))
+	}
+	if result.Error != "" {
+		lines = append(lines, "[error] "+result.Error)
+	}
+	if result.Traceback != "" {
+		lines = append(lines, "[traceback] "+result.Traceback)
+	}
+	if result.State == "done" && result.OK {
+		lines = append(lines, "[ok] "+formatAppMillis(result.DurationMS)+"ms")
+	}
+	if len(lines) == 0 {
+		lines = append(lines, "[state] "+fallback(result.State, "unknown"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatAppMillis(value float64) string {
+	if value == float64(int64(value)) {
+		return fmt.Sprintf("%d", int64(value))
+	}
+	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", value), "0"), ".")
 }
 
 func (a *appController) handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -1142,7 +1481,7 @@ body {
   color: var(--ink);
   font: 14px/1.35 "Segoe UI", Inter, system-ui, sans-serif;
 }
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 button {
   border: 1px solid var(--line);
   color: var(--ink);
@@ -1158,7 +1497,7 @@ button.icon { min-width: 34px; width: 34px; height: 30px; padding: 0; }
 button.ghost { background: rgba(22,27,45,.52); }
 button:hover { border-color: var(--accent-2); }
 button:disabled { opacity: .45; cursor: not-allowed; }
-button:focus-visible, input:focus-visible, .toggle-switch input:focus-visible + .switch-track, .custom-select-button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, .toggle-switch input:focus-visible + .switch-track, .custom-select-button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
 .app { display: grid; grid-template-rows: 64px 44px 1fr; }
 .app-header {
   display: grid;
@@ -1171,7 +1510,9 @@ button:focus-visible, input:focus-visible, .toggle-switch input:focus-visible + 
   backdrop-filter: blur(18px);
   user-select: none;
 }
-.brand h1 { margin: 0; font-size: 22px; letter-spacing: 0; }
+.brand-title { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.brand-icon { width: 24px; height: 24px; flex: 0 0 24px; display: block; filter: drop-shadow(0 5px 12px rgba(49,147,255,.28)); }
+.brand h1 { margin: 0; font-size: 22px; letter-spacing: 0; line-height: 1; }
 .brand .sub { color: var(--muted); font-size: 12px; margin-top: 1px; }
 .header-status { display: flex; align-items: center; justify-content: center; gap: 11px; color: var(--muted); white-space: nowrap; }
 .pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--ink); font-weight: 750; }
@@ -1223,7 +1564,8 @@ button:focus-visible, input:focus-visible, .toggle-switch input:focus-visible + 
 .history-shell { display: grid; grid-template-rows: auto 1fr; gap: 12px; height: 100%; min-height: 0; }
 .history-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .field label { display: block; color: var(--muted); font-size: 11px; font-weight: 760; text-transform: uppercase; margin-bottom: 6px; }
-input { width: 100%; border: 1px solid var(--line); border-radius: 10px; background: rgba(4, 8, 20, .62); color: var(--ink); padding: 9px 11px; min-height: 39px; }
+input, textarea { width: 100%; border: 1px solid var(--line); border-radius: 10px; background: rgba(4, 8, 20, .62); color: var(--ink); padding: 9px 11px; min-height: 39px; }
+textarea { resize: none; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; line-height: 1.45; }
 .input-row { display: grid; grid-template-columns: 1fr auto; gap: 9px; align-items: end; }
 .custom-select { position: relative; }
 .custom-select-button { width: 100%; min-height: 39px; text-align: left; display: flex; align-items: center; justify-content: space-between; gap: 10px; background: rgba(4,8,20,.62); }
@@ -1247,6 +1589,16 @@ input { width: 100%; border: 1px solid var(--line); border-radius: 10px; backgro
 .change-row:last-child { border-bottom: 0; }
 .change-row strong { font-size: 13px; }
 .change-meta { color: var(--muted); font-size: 12px; word-break: break-word; margin-top: 3px; }
+.exec-shell { display: grid; grid-template-columns: minmax(320px, .9fr) minmax(360px, 1.1fr); gap: 12px; height: 100%; min-height: 0; }
+.exec-editor-card, .exec-output-card { display: grid; grid-template-rows: auto 1fr auto; gap: 10px; min-height: 0; }
+.exec-source { min-height: 0; height: 100%; }
+.exec-toolbar { display: grid; grid-template-columns: 120px 1fr auto auto; gap: 9px; align-items: end; }
+.exec-output { min-height: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 12px; background: rgba(2,5,14,.82); color: #d7ffef; padding: 12px; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+.exec-history { min-height: 120px; max-height: 210px; overflow: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); padding: 8px; }
+.exec-history-item { width: 100%; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; text-align: left; border: 0; border-radius: 10px; background: transparent; padding: 9px; margin-bottom: 6px; }
+.exec-history-item:hover { background: rgba(126,231,214,.12); }
+.exec-history-title { font-weight: 760; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exec-history-meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .empty { min-height: 150px; display: grid; place-items: center; color: var(--muted); text-align: center; }
 .config-shell { display: grid; grid-template-rows: 1fr auto; gap: 12px; height: 100%; min-height: 0; }
 .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; min-height: 0; }
@@ -1269,21 +1621,21 @@ input { width: 100%; border: 1px solid var(--line); border-radius: 10px; backgro
   .app-header { grid-template-columns: 1fr auto; }
   .header-status { justify-content: flex-start; }
   .header-actions { grid-column: 1 / -1; justify-content: flex-start; }
-  .metric-strip, .overview-middle, .health-grid, .revision-summary, .config-grid, .form-grid, .history-layout { grid-template-columns: 1fr; }
+  .metric-strip, .overview-middle, .health-grid, .revision-summary, .config-grid, .form-grid, .history-layout, .exec-shell, .exec-toolbar { grid-template-columns: 1fr; }
 }
 </style>
 </head>
 <body>
 <main class="app">
   <header id="appHeader" class="app-header">
-    <div class="brand"><h1>RiftSync</h1><div class="sub">Live sync for Roblox Studio</div></div>
+    <div class="brand"><div class="brand-title"><svg class="brand-icon" viewBox="0 0 512 512" aria-hidden="true" focusable="false"><defs><linearGradient id="brandIconGradient" x1="76" y1="96" x2="432" y2="430" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#22d3ee"/><stop offset=".55" stop-color="#3b82f6"/><stop offset="1" stop-color="#7c3aed"/></linearGradient></defs><path fill="url(#brandIconGradient)" d="M73 172c0-53 43-96 96-96h76c70 0 127 57 127 127 0 47-26 89-66 111l78 91h-84l-97-113h43c49 0 89-40 89-89s-40-89-89-89h-77c-32 0-58 26-58 58H73Zm32 83h139c31 0 56-25 56-56h-52c0 2-2 4-4 4H105c-18 0-32 14-32 32s14 32 32 32Zm235-146c28-21 63-33 100-33 22 0 40 18 40 40v100c0 21-25 32-41 18l-50-44c-21-18-53-20-76-4-6-29-20-55-40-77h67Zm-22 229c24 17 57 14 78-7l18-18c14-14 37-14 51 0s14 37 0 51l-18 18c-52 52-136 52-188 0l-25-25 84-19Z"/></svg><h1>RiftSync</h1></div><div class="sub">Live sync for Roblox Studio</div></div>
     <div class="header-status"><span id="statusPill" class="pill" role="status" aria-live="polite"><span class="dot"></span><span id="statusText">Stopped</span></span><span id="addressText">127.0.0.1:8765</span></div>
     <div class="header-actions">
       <button id="logsBtn" class="ghost">Logs</button><button id="startBtn" class="primary">Start</button><button id="stopBtn">Stop</button>
       <span class="window-actions"><button id="minimizeBtn" class="icon" title="Minimize">_</button><button id="closeBtn" class="icon danger" title="Close">x</button></span>
     </div>
   </header>
-  <nav class="tabbar"><button id="overviewTab" class="tab active" data-tab="overviewPanel">Overview</button><button id="historyTab" class="tab" data-tab="historyPanel">History</button><button id="configTab" class="tab" data-tab="configPanel">Config</button></nav>
+  <nav class="tabbar"><button id="overviewTab" class="tab active" data-tab="overviewPanel">Overview</button><button id="historyTab" class="tab" data-tab="historyPanel">History</button><button id="execTab" class="tab" data-tab="execPanel">Exec</button><button id="configTab" class="tab" data-tab="configPanel">Config</button></nav>
   <section class="content">
     <section id="overviewPanel" class="tab-panel active">
       <div class="stack">
@@ -1327,6 +1679,28 @@ input { width: 100%; border: 1px solid var(--line); border-radius: 10px; backgro
             <div id="historyDetail" class="history-detail"><div class="empty">Choose a revision.</div></div>
           </article>
         </div>
+      </div>
+    </section>
+    <section id="execPanel" class="tab-panel">
+      <div class="exec-shell">
+        <article class="panel exec-editor-card">
+          <div><h2>Remote Exec</h2><div class="hint">Runs trusted Luau in Studio when sync and Exec ON are active.</div></div>
+          <textarea id="execSourceInput" class="exec-source" spellcheck="false" placeholder="print(workspace.Name)"></textarea>
+          <div class="exec-toolbar">
+            <div class="field"><label for="execTimeoutInput">Timeout</label><input id="execTimeoutInput" type="number" min="1" max="120" value="10"></div>
+            <div id="execStatusText" class="hint">Start RiftSync, connect Studio, then enable Exec ON.</div>
+            <button id="execLatestBtn" type="button">Latest</button>
+            <button id="execRunBtn" class="primary" type="button">Run</button>
+          </div>
+        </article>
+        <article class="panel exec-output-card">
+          <div><h2>Result</h2><div id="execResultHint" class="hint">Output will appear after a command finishes.</div></div>
+          <pre id="execOutputText" class="exec-output">Ready.</pre>
+          <div>
+            <div class="history-toolbar"><div><div class="label">Recent commands</div><div id="execHistoryHint" class="hint">Stored in .rblxsync/exec-history.json</div></div><button id="execHistoryRefreshBtn" type="button">Refresh</button></div>
+            <div id="execHistoryList" class="exec-history"><div class="empty">No Remote Exec history yet.</div></div>
+          </div>
+        </article>
       </div>
     </section>
     <section id="configPanel" class="tab-panel">
@@ -1375,11 +1749,12 @@ let lastFullError = "";
 let refreshTimer = null;
 let logsOpen = false;
 let logsTimer = null;
+let execHistory = [];
 const configControlIds = ["configInput","syncRootInput","hostInput","portInput","syncRootPickerBtn","debugInput"];
 function setBusy(value) { busy = value; ["startBtn","stopBtn","openBtn","configOpenBtn"].forEach(id => $(id).disabled = value); setConfigLocked(value || (latest && (latest.running || latest.starting))); }
 function setConfigLocked(value) { configControlIds.forEach(id => { const node = $(id); if (node) node.disabled = !!value; }); }
 async function api(path, options) { const response = await fetch(path, options || {}); const body = await response.json(); if (!response.ok || body.status === "error") throw new Error(body.error || "request failed"); return body; }
-function setTab(panelId) { document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === panelId)); document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === panelId)); if (panelId === "historyPanel") loadHistoryList(false); }
+function setTab(panelId) { document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === panelId)); document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === panelId)); if (panelId === "historyPanel") loadHistoryList(false); if (panelId === "execPanel") loadExecHistory(); }
 function folderName(path) { const clean = String(path || "src/game").replace(/[\\/]+$/, ""); const parts = clean.split(/[\\/]/).filter(Boolean); return parts[parts.length - 1] || clean || "game"; }
 function updateSwitchText() { [["debugInput","debugStateText"]].forEach(([input,text]) => { $(text).textContent = $(input).checked ? "On" : "Off"; }); }
 function errorSummary(value) {
@@ -1482,6 +1857,70 @@ async function loadHistoryDetail(revision) {
     }).join("");
     renderHistoryTimeline();
   } catch (err) { $("historyDetail").innerHTML = '<div class="empty">' + escapeHtml(err.message) + '</div>'; }
+}
+function formatExecEntry(entry) {
+  const summary = entry.source_summary || {};
+  const title = summary.first_line || String(entry.source || "").split(/\r?\n/).find(Boolean) || "(empty)";
+  const status = (entry.ok ? "ok" : (entry.result_state || "error")) + " · " + (entry.timeout_sec || 0) + "s";
+  return { title, status };
+}
+function renderExecHistory() {
+  const list = $("execHistoryList");
+  if (!execHistory.length) { list.innerHTML = '<div class="empty">No Remote Exec history yet.</div>'; return; }
+  list.innerHTML = execHistory.slice(0, 20).map((entry) => {
+    const item = formatExecEntry(entry);
+    return '<div class="exec-history-item"><div><div class="exec-history-title">' + escapeHtml(item.title) + '</div><div class="exec-history-meta">' + escapeHtml(entry.submitted_by || "-") + ' · ' + escapeHtml(item.status) + '</div></div><button type="button" data-exec-id="' + escapeHtml(entry.id || "") + '">Run</button></div>';
+  }).join("");
+  list.querySelectorAll("[data-exec-id]").forEach((button) => button.onclick = () => rerunExec(button.dataset.execId));
+}
+async function loadExecHistory() {
+  try {
+    const body = await api("/app/exec/history");
+    execHistory = body.entries || [];
+    $("execHistoryHint").textContent = body.warning || "Stored in .rblxsync/exec-history.json";
+    renderExecHistory();
+  } catch (err) {
+    execHistory = [];
+    $("execHistoryList").innerHTML = '<div class="empty">' + escapeHtml(err.message) + '</div>';
+  }
+}
+function setExecBusy(value) {
+  ["execRunBtn","execLatestBtn","execHistoryRefreshBtn"].forEach(id => { const node = $(id); if (node) node.disabled = !!value; });
+  $("execStatusText").textContent = value ? "Running command..." : "Start RiftSync, connect Studio, then enable Exec ON.";
+}
+function renderExecResult(body) {
+  $("execOutputText").textContent = body.output || "";
+  const result = body.result || {};
+  $("execResultHint").textContent = "state=" + (result.state || "-") + " ok=" + (!!result.ok) + (result.duration_ms ? " duration=" + result.duration_ms + "ms" : "");
+}
+async function runExec() {
+  const source = $("execSourceInput").value;
+  if (!source.trim()) { $("execOutputText").textContent = "Source is required."; return; }
+  setExecBusy(true);
+  try {
+    const body = await api("/app/exec/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source, timeout_sec: Number($("execTimeoutInput").value) || 0 }) });
+    renderExecResult(body);
+    await loadExecHistory();
+  } catch (err) {
+    $("execOutputText").textContent = err.message;
+    $("execResultHint").textContent = "Remote Exec failed";
+  } finally {
+    setExecBusy(false);
+  }
+}
+async function rerunExec(id) {
+  setExecBusy(true);
+  try {
+    const body = await api("/app/exec/rerun", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: id || "", timeout_sec: Number($("execTimeoutInput").value) || 0 }) });
+    if (body.entry && body.entry.source) $("execSourceInput").value = body.entry.source;
+    renderExecResult(body);
+    await loadExecHistory();
+  } catch (err) {
+    $("execOutputText").textContent = err.message;
+    $("execResultHint").textContent = "Remote Exec failed";
+  } finally {
+    setExecBusy(false);
+  }
 }
 function showStartPending() {
   const app = latest || {};
@@ -1610,6 +2049,9 @@ $("startBtn").onclick = () => action("/app/start"); $("stopBtn").onclick = () =>
 $("changePathBtn").onclick = () => { setTab("configPanel"); $("syncRootInput").focus(); };
 $("syncRootPickerBtn").onclick = pickFolder;
 $("historyRefreshBtn").onclick = () => loadHistoryList(false);
+$("execRunBtn").onclick = runExec;
+$("execLatestBtn").onclick = () => rerunExec("");
+$("execHistoryRefreshBtn").onclick = loadExecHistory;
 $("logsBtn").onclick = openLogs;
 $("refreshLogsBtn").onclick = loadLogs;
 $("closeLogsBtn").onclick = closeLogs;
