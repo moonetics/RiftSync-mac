@@ -880,6 +880,44 @@ func TestBootstrapMergeUnchangedAndTraversal(t *testing.T) {
 	}
 }
 
+func TestBootstrapReplaceRemovesStaleAndWritesIncoming(t *testing.T) {
+	cfg := config.Default()
+	root := t.TempDir()
+	cfg.SyncRoot = root
+	handler, _ := newTestHandlerWithConfig(t, cfg)
+
+	stalePath := filepath.Join(root, "ServerScriptService", "Old.server.luau")
+	if err := os.MkdirAll(filepath.Dir(stalePath), 0o755); err != nil {
+		t.Fatalf("mkdir stale parent: %v", err)
+	}
+	if err := os.WriteFile(stalePath, []byte("print('old')"), 0o644); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+
+	body := `{"mode":"replace","files":[{"local_path":"ServerScriptService/New.server.luau","source":"print('new')"}]}`
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap", bytes.NewBufferString(body)))
+	payload := decodeResponse(t, recorder)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d payload=%#v", recorder.Code, payload)
+	}
+	if payload["written_count"] != float64(1) || payload["new_count"] != float64(1) {
+		t.Fatalf("payload = %#v, want written/new 1", payload)
+	}
+	if payload["deleted_count"] != float64(1) {
+		t.Fatalf("deleted_count = %v, want 1", payload["deleted_count"])
+	}
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Fatalf("stale file still exists or unexpected err: %v", err)
+	}
+	incomingPath := filepath.Join(root, "ServerScriptService", "New.server.luau")
+	if body, err := os.ReadFile(incomingPath); err != nil {
+		t.Fatalf("incoming file missing: %v", err)
+	} else if string(body) != "print('new')" {
+		t.Fatalf("incoming body = %q, want new source", string(body))
+	}
+}
+
 func TestBootstrapReplacePreservesGitAndDeletesOthers(t *testing.T) {
 	cfg := config.Default()
 	root := t.TempDir()

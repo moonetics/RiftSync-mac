@@ -2,6 +2,13 @@
 
 Semua perubahan fitur, fix, penghapusan fitur, atau perubahan perilaku harus menaikkan versi dan dicatat di file ini.
 
+## 3.3.0 - 2026-06-12
+
+- Fixed `Pull Studio` to use replace semantics so local files deleted in Studio are removed locally.
+- Kept `.git`, `.rblxsync`, and `.guidebook` preserved during Pull Studio replacement.
+- Pull Studio status/debug summaries now include deleted file counts.
+- Bumped RiftSync server and Studio plugin version from `3.2.0` to `3.3.0`.
+
 ## 3.2.0 - 2026-06-12
 
 - Added script `properties.init.json` support for folder-style scripts.

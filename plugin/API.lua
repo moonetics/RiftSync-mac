@@ -2250,7 +2250,7 @@ function SyncAPI:pullStudioToLocal()
 	end
 
 	self.updateStatus("Pulling Studio snapshot to local... (25%)", false)
-	local success, responseOrError = self:pushStudioSnapshot("merge")
+	local success, responseOrError = self:pushStudioSnapshot("replace", "Pull Studio")
 	if not success then
 		self.updateStatus("Not synced - pull Studio failed: " .. tostring(responseOrError), true)
 		return false, responseOrError
@@ -2268,12 +2268,14 @@ function SyncAPI:pullStudioToLocal()
 	local newCount = typeof(response) == "table" and tonumber(response.new_count) or 0
 	local updatedCount = typeof(response) == "table" and tonumber(response.updated_count) or 0
 	local unchangedCount = typeof(response) == "table" and tonumber(response.unchanged_count) or 0
+	local deletedCount = typeof(response) == "table" and tonumber(response.deleted_count) or 0
 	local errorCount = typeof(response) == "table" and tonumber(response.error_count) or 0
 	local statusKind = errorCount > 0 and "conflict" or "summary"
 	local summaryParts = {
 		tostring(newCount) .. " new",
 		tostring(updatedCount) .. " updated",
 		tostring(unchangedCount) .. " unchanged",
+		tostring(deletedCount) .. " deleted",
 	}
 	if errorCount > 0 then
 		table.insert(summaryParts, tostring(errorCount) .. " errors")
@@ -3513,7 +3515,7 @@ function SyncAPI:collectStudioSnapshot()
 	}
 end
 
-function SyncAPI:pushStudioSnapshot(bootstrapMode : string?)
+function SyncAPI:pushStudioSnapshot(bootstrapMode : string?, displayLabel : string?)
 	local files, skippedCount, sourceReadFailedCount, skipInfo = self:collectStudioSnapshot()
 	local mode = bootstrapMode == "merge" and "merge" or "replace"
 
@@ -3553,17 +3555,16 @@ function SyncAPI:pushStudioSnapshot(bootstrapMode : string?)
 	end
 
 	local pushedCount = tonumber(response.written_count) or #files
-	local actionLabel = mode == "merge" and "Pull Studio" or "Bootstrap"
-	local mergeSummaryText = ""
-	if mode == "merge" then
-		mergeSummaryText = " [new="
-			.. tostring(tonumber(response.new_count) or 0)
-			.. ", updated="
-			.. tostring(tonumber(response.updated_count) or 0)
-			.. ", unchanged="
-			.. tostring(tonumber(response.unchanged_count) or 0)
-			.. "]"
-	end
+	local actionLabel = if typeof(displayLabel) == "string" and displayLabel ~= "" then displayLabel else (mode == "merge" and "Pull Studio" or "Bootstrap")
+	local changeSummaryText = " [new="
+		.. tostring(tonumber(response.new_count) or 0)
+		.. ", updated="
+		.. tostring(tonumber(response.updated_count) or 0)
+		.. ", unchanged="
+		.. tostring(tonumber(response.unchanged_count) or 0)
+		.. ", deleted="
+		.. tostring(tonumber(response.deleted_count) or 0)
+		.. "]"
 	self.updateStatus(
 		actionLabel
 			.. ": "
@@ -3573,7 +3574,7 @@ function SyncAPI:pushStudioSnapshot(bootstrapMode : string?)
 			.. " dilewati (readFail="
 			.. tostring(sourceReadFailedCount)
 			.. ")"
-			.. mergeSummaryText
+			.. changeSummaryText
 			.. skipSummaryText,
 		false
 	)
@@ -3583,7 +3584,7 @@ function SyncAPI:pushStudioSnapshot(bootstrapMode : string?)
 			.. tostring(tonumber(response.written_count) or #files)
 			.. ", skipped="
 			.. tostring(skippedCount)
-			.. mergeSummaryText
+			.. changeSummaryText
 			.. skipSummaryText,
 		false
 	)
