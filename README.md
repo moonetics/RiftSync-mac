@@ -1,6 +1,6 @@
 # RiftSync Plugin (One-Way + Properties Tree)
 
-Versi: `3.7.0`
+Versi: `3.9.0`
 Protocol sync: `rbxsync/2.0.0`
 
 One-way sync untuk Roblox Studio:
@@ -320,7 +320,7 @@ return part.Name
 .\.guidebook\riftsync-exec.ps1 --file .\studio-command.luau --timeout 30
 ```
 
-Remote Exec membutuhkan `"remote_exec_enabled": true` dan `"remote_exec_token": "..."` di config lokal. CLI membaca token itu dan mengirim `Authorization: Bearer <token>` ke server. Launcher `.guidebook/riftsync-exec.ps1` auto-generated per mesin dan meneruskan argumen ke `riftsync-server.exe --config <config> exec`. Jika argumen pertama berakhiran `.lua` atau `.luau`, launcher/CLI membacanya sebagai file source sehingga script command bar bisa disimpan dan dirawat seperti file biasa. Subcommand `exec` hanya menghubungi server yang sudah berjalan; ia tidak menyalakan server baru. Gunakan `--json` untuk output terstruktur atau `--raw` untuk output plain tanpa label.
+Remote Exec membutuhkan `"remote_exec_enabled": true` dan `"remote_exec_token": "..."` di config lokal. App akan generate token 32 karakter jika token belum ada, lalu menampilkannya sebagai readonly field di tab `Exec` supaya bisa dicopy ke field `Exec Token` di Studio plugin. CLI membaca token itu dan mengirim `Authorization: Bearer <token>` ke server. Launcher `.guidebook/riftsync-exec.ps1` auto-generated per mesin dan meneruskan argumen ke `riftsync-server.exe --config <config> exec`. Jika argumen pertama berakhiran `.lua` atau `.luau`, launcher/CLI membacanya sebagai file source sehingga script command bar bisa disimpan dan dirawat seperti file biasa. Subcommand `exec` hanya menghubungi server yang sudah berjalan; ia tidak menyalakan server baru. Gunakan `--json` untuk output terstruktur atau `--raw` untuk output plain tanpa label.
 
 Setiap command Remote Exec dari CLI dan tab Exec app dicatat ke `.rblxsync/exec-history.json`. History ini local-only, menyimpan source penuh untuk rerun, dan otomatis dibatasi ke 100 entry terbaru. Jalankan ulang command terakhir dengan:
 
@@ -343,8 +343,8 @@ Fallback langsung jika tidak berada di `sync_root`:
 
 Manual test Studio Remote Exec:
 
-1. Set config lokal dengan `"remote_exec_enabled": true` dan token yang sama di `"remote_exec_token"`.
-2. Jalankan `.\riftsync.exe` atau `.\riftsync-server.exe --headless`.
+1. Jalankan `.\riftsync.exe`; token akan muncul di tab `Exec` sebagai readonly `Exec Token`.
+2. Copy token dari app.
 3. Di widget RiftSync Studio, paste token ke field `Exec Token`.
 4. Klik `Start Sync`, lalu toggle `Exec ON`. Fresh session selalu mulai dari `Exec OFF`.
 5. Jalankan inline command:

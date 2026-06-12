@@ -108,6 +108,50 @@ func TestLoadMissingConfigUsesDefaults(t *testing.T) {
 	}
 }
 
+func TestGenerateRemoteExecToken(t *testing.T) {
+	token, err := GenerateRemoteExecToken()
+	if err != nil {
+		t.Fatalf("GenerateRemoteExecToken returned error: %v", err)
+	}
+	if len(token) != RemoteExecTokenLength {
+		t.Fatalf("token length = %d, want %d", len(token), RemoteExecTokenLength)
+	}
+	for _, char := range token {
+		if !strings.ContainsRune(remoteExecTokenAlphabet, char) {
+			t.Fatalf("token contains unsupported char %q in %q", char, token)
+		}
+	}
+}
+
+func TestEnsureRemoteExecTokenPreservesExisting(t *testing.T) {
+	cfg := Default()
+	cfg.RemoteExecToken = "existing-token"
+	generated, err := EnsureRemoteExecToken(&cfg)
+	if err != nil {
+		t.Fatalf("EnsureRemoteExecToken returned error: %v", err)
+	}
+	if generated {
+		t.Fatal("EnsureRemoteExecToken generated new token for existing token")
+	}
+	if cfg.RemoteExecToken != "existing-token" {
+		t.Fatalf("RemoteExecToken = %q, want existing-token", cfg.RemoteExecToken)
+	}
+}
+
+func TestEnsureRemoteExecTokenGeneratesMissing(t *testing.T) {
+	cfg := Default()
+	generated, err := EnsureRemoteExecToken(&cfg)
+	if err != nil {
+		t.Fatalf("EnsureRemoteExecToken returned error: %v", err)
+	}
+	if !generated {
+		t.Fatal("EnsureRemoteExecToken generated=false, want true")
+	}
+	if len(cfg.RemoteExecToken) != RemoteExecTokenLength {
+		t.Fatalf("RemoteExecToken length = %d, want %d", len(cfg.RemoteExecToken), RemoteExecTokenLength)
+	}
+}
+
 func TestInvalidPortFails(t *testing.T) {
 	cfg := Default()
 	cfg.Port = 70000

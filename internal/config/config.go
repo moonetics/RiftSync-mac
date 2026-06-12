@@ -1,9 +1,11 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +39,9 @@ const MetadataDir = ".rblxsync"
 const GuidebookDir = ".guidebook"
 const GuidebookExecLauncher = "riftsync-exec.ps1"
 const GuidebookStatus = "status.json"
+const RemoteExecTokenLength = 32
+
+const remoteExecTokenAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 var BootstrapServiceDirs = []string{
 	"ServerScriptService",
@@ -88,6 +93,33 @@ func SupportedFileFormats() []string {
 		"init.meta.json",
 		"*.model.json",
 	}
+}
+
+func GenerateRemoteExecToken() (string, error) {
+	var builder strings.Builder
+	builder.Grow(RemoteExecTokenLength)
+	limit := big.NewInt(int64(len(remoteExecTokenAlphabet)))
+	for builder.Len() < RemoteExecTokenLength {
+		index, err := rand.Int(rand.Reader, limit)
+		if err != nil {
+			return "", fmt.Errorf("generate remote exec token: %w", err)
+		}
+		builder.WriteByte(remoteExecTokenAlphabet[index.Int64()])
+	}
+	return builder.String(), nil
+}
+
+func EnsureRemoteExecToken(cfg *Config) (bool, error) {
+	cfg.RemoteExecToken = strings.TrimSpace(cfg.RemoteExecToken)
+	if cfg.RemoteExecToken != "" {
+		return false, nil
+	}
+	token, err := GenerateRemoteExecToken()
+	if err != nil {
+		return false, err
+	}
+	cfg.RemoteExecToken = token
+	return true, nil
 }
 
 const guidebookReadme = `# RiftSync Guidebook
@@ -197,9 +229,9 @@ Requirements:
 
 - RiftSync server/app is running.
 - sync_config.json has remote_exec_enabled set to true.
-- sync_config.json has remote_exec_token set.
+- sync_config.json has remote_exec_token set. The desktop app generates a token if one is missing.
 - Studio plugin sync is started.
-- Exec Token in the plugin matches remote_exec_token.
+- Exec Token in the plugin matches remote_exec_token. Copy it from the app Exec tab.
 - Exec ON is enabled in the Studio widget.
 - Studio is in Edit mode, not Play mode.
 
@@ -234,7 +266,7 @@ Remote Exec history:
 - CLI and app console commands are stored in .rblxsync/exec-history.json.
 - History is local-only and stores full source so rerun works even for inline/stdin/app commands.
 - The latest command can be rerun with .\.guidebook\riftsync-exec.ps1 --last.
-- The desktop app has an Exec tab for paste/run output and recent reruns.
+- The desktop app has an Exec tab for paste/run output, recent reruns, and a readonly token field to copy into the Studio plugin.
 
 Direct fallback:
 

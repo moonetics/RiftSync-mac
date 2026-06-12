@@ -135,34 +135,38 @@ type windowController struct {
 }
 
 type statusPayload struct {
-	Running          bool    `json:"running"`
-	Starting         bool    `json:"starting"`
-	Status           string  `json:"status"`
-	Address          string  `json:"address"`
-	Host             string  `json:"host"`
-	Port             int     `json:"port"`
-	ConfigPath       string  `json:"config_path"`
-	SyncRoot         string  `json:"sync_root"`
-	Mode             string  `json:"mode"`
-	Debug            bool    `json:"debug"`
-	LegacyScan       bool    `json:"legacy_scan"`
-	Revision         int     `json:"revision"`
-	Indexed          int     `json:"indexed"`
-	Scripts          int     `json:"scripts"`
-	UI               int     `json:"ui"`
-	RequestCount     int     `json:"request_count"`
-	Polls            int     `json:"polls"`
-	GitEnabled       bool    `json:"git_enabled"`
-	GitStatus        string  `json:"git_status"`
-	ActivityText     string  `json:"activity_text"`
-	ActivityOp       string  `json:"activity_operation"`
-	ActivityError    bool    `json:"activity_error"`
-	ActivityProgress int     `json:"activity_progress"`
-	ActivityClientID string  `json:"activity_client_id"`
-	ActivityRevision int     `json:"activity_revision"`
-	ActivityAt       float64 `json:"activity_at"`
-	LastError        string  `json:"last_error"`
-	Uptime           string  `json:"uptime"`
+	Running              bool    `json:"running"`
+	Starting             bool    `json:"starting"`
+	Status               string  `json:"status"`
+	Address              string  `json:"address"`
+	Host                 string  `json:"host"`
+	Port                 int     `json:"port"`
+	ConfigPath           string  `json:"config_path"`
+	SyncRoot             string  `json:"sync_root"`
+	Mode                 string  `json:"mode"`
+	Debug                bool    `json:"debug"`
+	LegacyScan           bool    `json:"legacy_scan"`
+	Revision             int     `json:"revision"`
+	Indexed              int     `json:"indexed"`
+	Scripts              int     `json:"scripts"`
+	UI                   int     `json:"ui"`
+	RequestCount         int     `json:"request_count"`
+	Polls                int     `json:"polls"`
+	GitEnabled           bool    `json:"git_enabled"`
+	GitStatus            string  `json:"git_status"`
+	ActivityText         string  `json:"activity_text"`
+	ActivityOp           string  `json:"activity_operation"`
+	ActivityError        bool    `json:"activity_error"`
+	ActivityProgress     int     `json:"activity_progress"`
+	ActivityClientID     string  `json:"activity_client_id"`
+	ActivityRevision     int     `json:"activity_revision"`
+	ActivityAt           float64 `json:"activity_at"`
+	LastError            string  `json:"last_error"`
+	Uptime               string  `json:"uptime"`
+	RemoteExecEnabled    bool    `json:"remote_exec_enabled"`
+	RemoteExecConfigured bool    `json:"remote_exec_configured"`
+	RemoteExecAvailable  bool    `json:"remote_exec_available"`
+	RemoteExecToken      string  `json:"remote_exec_token"`
 }
 
 type restartRequest struct {
@@ -341,6 +345,10 @@ func (a *appController) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (a *appController) handleStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	if err := ensureRemoteExecConfig(a.options); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
 		return
 	}
 	if err := a.start(a.ctx); err != nil {
@@ -988,6 +996,8 @@ func hydrateStoppedStatus(status serverapp.Status, options serverapp.Options) se
 		if options.GitVersioningOverride != nil {
 			cfg.GitVersioningEnabled = *options.GitVersioningOverride
 		}
+		status.RemoteExecEnabled = cfg.RemoteExecEnabled
+		status.RemoteExecToken = cfg.RemoteExecToken
 		if !status.Running {
 			status.Host = cfg.Host
 			status.Port = cfg.Port
@@ -1058,33 +1068,37 @@ func makeStatusPayload(status serverapp.Status, starting bool, lastError string)
 		uptime = time.Since(status.StartedAt).Round(time.Second).String()
 	}
 	payload := statusPayload{
-		Running:          status.Running,
-		Starting:         starting,
-		Address:          address,
-		Host:             host,
-		Port:             port,
-		ConfigPath:       fallback(status.ConfigPath, "sync_config.json"),
-		SyncRoot:         status.SyncRoot,
-		Mode:             mode,
-		Debug:            status.Debug,
-		LegacyScan:       status.LegacyScan,
-		Revision:         status.Revision,
-		Indexed:          status.Counts.Entry,
-		Scripts:          status.Counts.Script,
-		UI:               status.Counts.UI,
-		RequestCount:     status.Metrics.RequestCount,
-		Polls:            status.Metrics.ChangesRequests,
-		GitEnabled:       status.Git.Enabled,
-		GitStatus:        gitStatus,
-		ActivityText:     fallback(status.Activity.Text, "No Studio activity yet."),
-		ActivityOp:       status.Activity.Operation,
-		ActivityError:    status.Activity.Error,
-		ActivityProgress: status.Activity.Progress,
-		ActivityClientID: status.Activity.ClientID,
-		ActivityRevision: status.Activity.Revision,
-		ActivityAt:       status.Activity.At,
-		LastError:        fallback(lastError, "Clear"),
-		Uptime:           uptime,
+		Running:              status.Running,
+		Starting:             starting,
+		Address:              address,
+		Host:                 host,
+		Port:                 port,
+		ConfigPath:           fallback(status.ConfigPath, "sync_config.json"),
+		SyncRoot:             status.SyncRoot,
+		Mode:                 mode,
+		Debug:                status.Debug,
+		LegacyScan:           status.LegacyScan,
+		Revision:             status.Revision,
+		Indexed:              status.Counts.Entry,
+		Scripts:              status.Counts.Script,
+		UI:                   status.Counts.UI,
+		RequestCount:         status.Metrics.RequestCount,
+		Polls:                status.Metrics.ChangesRequests,
+		GitEnabled:           status.Git.Enabled,
+		GitStatus:            gitStatus,
+		ActivityText:         fallback(status.Activity.Text, "No Studio activity yet."),
+		ActivityOp:           status.Activity.Operation,
+		ActivityError:        status.Activity.Error,
+		ActivityProgress:     status.Activity.Progress,
+		ActivityClientID:     status.Activity.ClientID,
+		ActivityRevision:     status.Activity.Revision,
+		ActivityAt:           status.Activity.At,
+		LastError:            fallback(lastError, "Clear"),
+		Uptime:               uptime,
+		RemoteExecEnabled:    status.RemoteExecEnabled,
+		RemoteExecConfigured: strings.TrimSpace(status.RemoteExecToken) != "",
+		RemoteExecAvailable:  status.RemoteExecEnabled && strings.TrimSpace(status.RemoteExecToken) != "",
+		RemoteExecToken:      status.RemoteExecToken,
 	}
 	payload.Status = statusText(payload)
 	return payload
@@ -1186,6 +1200,26 @@ func saveConfigFromOptions(options serverapp.Options) error {
 		cfg.SyncRoot = options.SyncRootOverride
 	}
 	cfg.GitVersioningEnabled = true
+	cfg.RemoteExecEnabled = true
+	if _, err := config.EnsureRemoteExecToken(&cfg); err != nil {
+		return err
+	}
+	return config.Save(path, cfg)
+}
+
+func ensureRemoteExecConfig(options serverapp.Options) error {
+	path := fallback(options.ConfigPath, "sync_config.json")
+	cfg, err := config.Load(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		cfg = config.Default()
+	}
+	cfg.RemoteExecEnabled = true
+	if _, err := config.EnsureRemoteExecToken(&cfg); err != nil {
+		return err
+	}
 	return config.Save(path, cfg)
 }
 
@@ -1590,8 +1624,10 @@ textarea { resize: none; font-family: Consolas, "Cascadia Mono", monospace; font
 .change-row strong { font-size: 13px; }
 .change-meta { color: var(--muted); font-size: 12px; word-break: break-word; margin-top: 3px; }
 .exec-shell { display: grid; grid-template-columns: minmax(320px, .9fr) minmax(360px, 1.1fr); gap: 12px; height: 100%; min-height: 0; }
-.exec-editor-card, .exec-output-card { display: grid; grid-template-rows: auto 1fr auto; gap: 10px; min-height: 0; }
+.exec-editor-card { display: grid; grid-template-rows: auto auto 1fr auto; gap: 10px; min-height: 0; }
+.exec-output-card { display: grid; grid-template-rows: auto 1fr auto; gap: 10px; min-height: 0; }
 .exec-source { min-height: 0; height: 100%; }
+.exec-token-row { display: grid; grid-template-columns: 1fr auto; gap: 9px; align-items: end; }
 .exec-toolbar { display: grid; grid-template-columns: 120px 1fr auto auto; gap: 9px; align-items: end; }
 .exec-output { min-height: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 12px; background: rgba(2,5,14,.82); color: #d7ffef; padding: 12px; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
 .exec-history { min-height: 120px; max-height: 210px; overflow: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); padding: 8px; }
@@ -1685,6 +1721,7 @@ textarea { resize: none; font-family: Consolas, "Cascadia Mono", monospace; font
       <div class="exec-shell">
         <article class="panel exec-editor-card">
           <div><h2>Remote Exec</h2><div class="hint">Runs trusted Luau in Studio when sync and Exec ON are active.</div></div>
+          <div class="field"><label for="execTokenDisplay">Exec Token</label><div class="exec-token-row"><input id="execTokenDisplay" spellcheck="false" readonly value=""><button id="execTokenCopyBtn" type="button">Copy</button></div><div id="execTokenHint" class="hint">Token is generated from sync_config.json.</div></div>
           <textarea id="execSourceInput" class="exec-source" spellcheck="false" placeholder="print(workspace.Name)"></textarea>
           <div class="exec-toolbar">
             <div class="field"><label for="execTimeoutInput">Timeout</label><input id="execTimeoutInput" type="number" min="1" max="120" value="10"></div>
@@ -1803,6 +1840,11 @@ function render(app) {
     $("debugInput").checked = !!app.debug; updateSwitchText();
   }
   $("requestsText").textContent = app.request_count || 0; $("pollsText").textContent = app.polls || 0; $("gitText").textContent = app.git_status || "Pending"; $("lastScanText").textContent = app.indexed ? app.indexed + " items" : "Ready"; showError(app.last_error || "Clear");
+  $("execTokenDisplay").value = app.remote_exec_token || "";
+  $("execTokenCopyBtn").disabled = !(app.remote_exec_token || "").trim();
+  if (app.remote_exec_available) $("execTokenHint").textContent = "Copy this token into the Studio plugin Exec Token field.";
+  else if (app.remote_exec_configured) $("execTokenHint").textContent = "Token configured, but Remote Exec is disabled.";
+  else $("execTokenHint").textContent = "Token will appear after config is prepared.";
   $("activityText").textContent = app.starting ? "Starting server and scanning project files..." : (app.activity_text || "No Studio activity yet."); $("activityText").style.color = app.activity_error ? "var(--bad)" : "var(--ink)";
   const activityBits = []; if (app.activity_operation) activityBits.push(app.activity_operation); if (app.activity_progress) activityBits.push(app.activity_progress + "%"); if (app.activity_revision) activityBits.push("rev " + app.activity_revision);
   $("activityHint").textContent = app.starting ? "Preparing watcher, Git, and local index" : activityBits.join(" · ");
@@ -1887,6 +1929,22 @@ async function loadExecHistory() {
 function setExecBusy(value) {
   ["execRunBtn","execLatestBtn","execHistoryRefreshBtn"].forEach(id => { const node = $(id); if (node) node.disabled = !!value; });
   $("execStatusText").textContent = value ? "Running command..." : "Start RiftSync, connect Studio, then enable Exec ON.";
+}
+async function copyTextToClipboard(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (_) {}
+  const area = document.createElement("textarea");
+  area.value = text; area.style.position = "fixed"; area.style.left = "-9999px";
+  document.body.appendChild(area); area.focus(); area.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (_) {}
+  area.remove();
+  return ok;
+}
+async function copyExecToken() {
+  const token = $("execTokenDisplay").value || "";
+  if (!token.trim()) { $("execTokenHint").textContent = "Remote Exec token is not configured yet."; return; }
+  const ok = await copyTextToClipboard(token);
+  $("execTokenHint").textContent = ok ? "Token copied. Paste it into the Studio plugin." : "Copy failed. Select and copy the token manually.";
 }
 function renderExecResult(body) {
   $("execOutputText").textContent = body.output || "";
@@ -2052,6 +2110,7 @@ $("historyRefreshBtn").onclick = () => loadHistoryList(false);
 $("execRunBtn").onclick = runExec;
 $("execLatestBtn").onclick = () => rerunExec("");
 $("execHistoryRefreshBtn").onclick = loadExecHistory;
+$("execTokenCopyBtn").onclick = copyExecToken;
 $("logsBtn").onclick = openLogs;
 $("refreshLogsBtn").onclick = loadLogs;
 $("closeLogsBtn").onclick = closeLogs;
@@ -2061,12 +2120,7 @@ $("closeErrorBtn").onclick = hideErrorModal;
 $("errorModal").onclick = (event) => { if (event.target.id === "errorModal") hideErrorModal(); };
 $("copyErrorBtn").onclick = async () => {
   const text = lastFullError || "";
-  try { await navigator.clipboard.writeText(text); return; } catch (_) {}
-  const area = document.createElement("textarea");
-  area.value = text; area.style.position = "fixed"; area.style.left = "-9999px";
-  document.body.appendChild(area); area.focus(); area.select();
-  try { document.execCommand("copy"); } catch (_) {}
-  area.remove();
+  await copyTextToClipboard(text);
 };
 refreshLoop(); loadHistoryList(false);
 </script>

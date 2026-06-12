@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"riftsync/internal/config"
 	"riftsync/internal/exechistory"
 	"riftsync/internal/serverapp"
 	"riftsync/internal/state"
@@ -159,6 +160,10 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`execTimeoutInput`,
 		`execRunBtn`,
 		`execLatestBtn`,
+		`execTokenDisplay`,
+		`execTokenCopyBtn`,
+		`readonly`,
+		`copyExecToken`,
 		`execOutputText`,
 		`execHistoryList`,
 		`/app/exec/run`,
@@ -410,6 +415,58 @@ func TestConfigApplyStoppedSavesWithoutStarting(t *testing.T) {
 	}
 	if !strings.Contains(string(cfg), `"git_versioning_enabled": true`) {
 		t.Fatalf("saved config did not force git on: %s", string(cfg))
+	}
+	if !strings.Contains(string(cfg), `"remote_exec_enabled": true`) {
+		t.Fatalf("saved config did not enable remote exec: %s", string(cfg))
+	}
+	var saved config.Config
+	if err := json.Unmarshal(cfg, &saved); err != nil {
+		t.Fatalf("decode saved config: %v", err)
+	}
+	if len(saved.RemoteExecToken) != config.RemoteExecTokenLength {
+		t.Fatalf("RemoteExecToken length = %d, want %d", len(saved.RemoteExecToken), config.RemoteExecTokenLength)
+	}
+}
+
+func TestAppStatusIncludesRemoteExecToken(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sync_config.json")
+	syncRoot := filepath.Join(root, "game")
+	configBody, err := json.Marshal(map[string]any{
+		"host":                "127.0.0.1",
+		"port":                8765,
+		"sync_root":           syncRoot,
+		"remote_exec_enabled": true,
+		"remote_exec_token":   "displaytoken123456",
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, configBody, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	controller := &appController{
+		runner:  serverapp.New(serverapp.Options{ConfigPath: configPath, PortOverride: -1}),
+		options: serverapp.Options{ConfigPath: configPath, PortOverride: -1},
+		quit:    make(chan struct{}),
+	}
+	mux := http.NewServeMux()
+	controller.registerRoutes(mux)
+
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/app/status", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("/app/status code=%d body=%q", response.Code, response.Body.String())
+	}
+	for _, needle := range []string{
+		`"remote_exec_enabled":true`,
+		`"remote_exec_configured":true`,
+		`"remote_exec_available":true`,
+		`"remote_exec_token":"displaytoken123456"`,
+	} {
+		if !strings.Contains(response.Body.String(), needle) {
+			t.Fatalf("/app/status missing %q in %s", needle, response.Body.String())
+		}
 	}
 }
 
@@ -684,7 +741,7 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 	typeListDocument := string(typeListBody)
 	for _, needle := range []string{
 		`BootstrapPreview = "/bootstrap/preview"`,
-		`TypeList.VERSION = "3.7.0"`,
+		`TypeList.VERSION = "3.9.0"`,
 	} {
 		if !strings.Contains(typeListDocument, needle) {
 			t.Fatalf("TypeList missing %q", needle)

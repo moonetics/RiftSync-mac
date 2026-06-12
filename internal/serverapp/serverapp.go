@@ -18,7 +18,7 @@ import (
 	"riftsync/internal/watcher"
 )
 
-const Version = "3.7.0"
+const Version = "3.9.0"
 
 type Options struct {
 	ConfigPath            string
@@ -48,23 +48,25 @@ type Runner struct {
 }
 
 type Status struct {
-	Running    bool
-	StartedAt  time.Time
-	Host       string
-	Port       int
-	ConfigPath string
-	SyncRoot   string
-	LegacyScan bool
-	Debug      bool
-	Revision   int
-	Counts     state.IndexedCounts
-	Metrics    state.Metrics
-	Git        state.GitState
-	Activity   state.Activity
-	Warnings   []string
-	Events     []debuglog.Event
-	History    []state.RevisionSummary
-	LastError  string
+	Running           bool
+	StartedAt         time.Time
+	Host              string
+	Port              int
+	ConfigPath        string
+	SyncRoot          string
+	LegacyScan        bool
+	Debug             bool
+	Revision          int
+	Counts            state.IndexedCounts
+	Metrics           state.Metrics
+	Git               state.GitState
+	Activity          state.Activity
+	Warnings          []string
+	Events            []debuglog.Event
+	History           []state.RevisionSummary
+	LastError         string
+	RemoteExecEnabled bool
+	RemoteExecToken   string
 }
 
 func New(options Options) *Runner {
@@ -274,14 +276,16 @@ func (r *Runner) Status(limit int) Status {
 	r.mu.Unlock()
 
 	status := Status{
-		Running:    running,
-		StartedAt:  startedAt,
-		Host:       cfg.Host,
-		Port:       cfg.Port,
-		ConfigPath: options.ConfigPath,
-		SyncRoot:   cfg.SyncRootAbs,
-		LegacyScan: false,
-		Debug:      options.Debug,
+		Running:           running,
+		StartedAt:         startedAt,
+		Host:              cfg.Host,
+		Port:              cfg.Port,
+		ConfigPath:        options.ConfigPath,
+		SyncRoot:          cfg.SyncRootAbs,
+		LegacyScan:        false,
+		Debug:             options.Debug,
+		RemoteExecEnabled: cfg.RemoteExecEnabled,
+		RemoteExecToken:   cfg.RemoteExecToken,
 	}
 	if status.Host == "" {
 		status.Host = options.HostOverride

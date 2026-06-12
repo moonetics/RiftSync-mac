@@ -2,6 +2,17 @@
 
 Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
+## 3.9.0 - 2026-06-12
+
+- Increased generated Remote Exec tokens from 18 to 32 random alphanumeric characters.
+- Regenerated the active config Remote Exec token.
+
+## 3.8.0 - 2026-06-12
+
+- Added Remote Exec token auto-generation for configs that do not have a token yet.
+- Enabled Remote Exec for the active config and saved the generated token to `sync_config.json`.
+- Added readonly Exec Token display and copy action in the desktop app Exec tab.
+
 ## 3.7.0 - 2026-06-12
 
 Rilis development terkini. Entry ini menggabungkan iterasi internal `3.1.0` sampai `3.7.0` agar changelog tetap enak dibaca walaupun beberapa perubahan dibuat di hari yang sama.
