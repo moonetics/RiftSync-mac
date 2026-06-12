@@ -2,8 +2,10 @@ package httpapi
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -70,6 +72,10 @@ func (a *API) routes() {
 	a.mux.HandleFunc("/bootstrap", a.method(http.MethodPost, a.bootstrap))
 	a.mux.HandleFunc("/ack", a.method(http.MethodPost, a.ack))
 	a.mux.HandleFunc("/activity", a.method(http.MethodPost, a.activity))
+	a.mux.HandleFunc("/exec/commands", a.method(http.MethodPost, a.execCreate))
+	a.mux.HandleFunc("/exec/commands/next", a.method(http.MethodGet, a.execNext))
+	a.mux.HandleFunc("/exec/commands/result", a.method(http.MethodPost, a.execResult))
+	a.mux.HandleFunc("/exec/commands/", a.method(http.MethodGet, a.execDetailPath))
 	a.mux.HandleFunc("/debug/state", a.method(http.MethodGet, a.debugState))
 }
 
@@ -187,6 +193,142 @@ func (a *API) activity(w http.ResponseWriter, r *http.Request) {
 		Revision:  intValue(payload["revision"], 0),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "activity": activity})
+}
+
+func (a *API) execCreate(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizeRemoteExec(w, r) {
+		return
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	source, _ := payload["source"].(string)
+	if strings.TrimSpace(source) == "" {
+		writeError(w, http.StatusBadRequest, "source is required")
+		return
+	}
+
+	cfg := a.state.Config()
+	if len([]byte(source)) > cfg.RemoteExecMaxSourceBytes {
+		writeError(w, http.StatusBadRequest, "source exceeds remote_exec_max_source_bytes")
+		return
+	}
+
+	timeoutSec := intValue(payload["timeout_sec"], cfg.RemoteExecDefaultTimeoutSec)
+	timeoutSec = clampInt(timeoutSec, 1, cfg.RemoteExecMaxTimeoutSec)
+	command, err := a.state.EnqueueRemoteExecCommand(
+		source,
+		stringValue(payload["client"]),
+		stringValue(payload["mode"]),
+		timeoutSec,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "unable to create command id")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "ok",
+		"command_id": command.ID,
+		"queued_at":  command.CreatedAt,
+	})
+}
+
+func (a *API) execNext(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizeRemoteExec(w, r) {
+		return
+	}
+
+	clientID := firstNonEmpty(strings.TrimSpace(r.URL.Query().Get("client_id")), "unknown")
+	timeoutSec := 25
+	if raw := r.URL.Query().Get("timeout"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			timeoutSec = parsed
+		}
+	}
+	timeoutSec = clampInt(timeoutSec, 1, 60)
+
+	command, ok := a.state.ClaimRemoteExecCommand(r.Context(), clientID, time.Duration(timeoutSec)*time.Second)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "ok",
+			"command": nil,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"command": map[string]any{
+			"id":          command.ID,
+			"source":      command.Source,
+			"timeout_sec": command.TimeoutSec,
+			"created_at":  command.CreatedAt,
+		},
+	})
+}
+
+func (a *API) execResult(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizeRemoteExec(w, r) {
+		return
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	commandID := strings.TrimSpace(stringValue(payload["command_id"]))
+	if commandID == "" {
+		writeError(w, http.StatusBadRequest, "command_id is required")
+		return
+	}
+
+	command, err := a.state.RecordRemoteExecResult(state.RemoteExecResult{
+		CommandID:  commandID,
+		ClientID:   stringValue(payload["client_id"]),
+		OK:         boolValue(payload["ok"]),
+		DurationMS: floatValue(payload["duration_ms"], 0),
+		Prints:     sanitizeRemoteExecPrints(payload["prints"]),
+		Returns:    sliceValue(payload["returns"]),
+		Error:      stringValue(payload["error"]),
+		Traceback:  stringValue(payload["traceback"]),
+	})
+	if err != nil && errors.Is(err, state.ErrRemoteExecCommandNotFound) {
+		writeError(w, http.StatusNotFound, "command not found")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"command_id":  command.ID,
+		"state":       command.State,
+		"late_result": command.LateResult,
+	})
+}
+
+func (a *API) execDetailPath(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizeRemoteExec(w, r) {
+		return
+	}
+
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/exec/commands/"))
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusBadRequest, "command id is required")
+		return
+	}
+	command, ok := a.state.RemoteExecCommand(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "command not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"command": remoteExecCommandPayload(command, false),
+	})
 }
 
 func (a *API) snapshot(w http.ResponseWriter, r *http.Request) {
@@ -403,6 +545,11 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 			newCount++
 		}
 	}
+	if err := config.EnsureSyncRootScaffold(cfg); err != nil {
+		a.state.UnlockReconciliation()
+		writeError(w, http.StatusInternalServerError, "Unable to setup sync_root: "+err.Error())
+		return
+	}
 	a.state.UnlockReconciliation()
 
 	if a.refreshWatches != nil {
@@ -452,25 +599,58 @@ func (a *API) debugState(w http.ResponseWriter, r *http.Request) {
 
 	cfg := a.state.Config()
 	counts := a.state.IndexedCounts()
+	execDebug := a.state.RemoteExecDebug()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":                    "ok",
-		"server_rev":                a.state.Revision(),
-		"indexed_entry_count":       counts.Entry,
-		"indexed_script_count":      counts.Script,
-		"indexed_ui_count":          counts.UI,
-		"indexed_props_count":       counts.UI,
-		"sessions_active":           a.state.SessionsActive(),
-		"sync_root":                 cfg.SyncRootAbs,
-		"scan_interval_sec":         cfg.ScanIntervalSec,
-		"strict_property_whitelist": cfg.StrictPropertyWhitelist,
-		"extra_allowed_properties":  cfg.ExtraAllowedProperties,
-		"extra_allowed_class_count": len(cfg.ExtraAllowedProperties),
-		"git":                       a.state.GitState(),
-		"metrics":                   a.state.Metrics(),
-		"activity":                  a.state.Activity(),
-		"events":                    a.state.Events(limit),
-		"scan_warnings":             a.state.ScanWarnings(limit),
+		"status":                         "ok",
+		"server_rev":                     a.state.Revision(),
+		"indexed_entry_count":            counts.Entry,
+		"indexed_script_count":           counts.Script,
+		"indexed_ui_count":               counts.UI,
+		"indexed_props_count":            counts.UI,
+		"sessions_active":                a.state.SessionsActive(),
+		"sync_root":                      cfg.SyncRootAbs,
+		"scan_interval_sec":              cfg.ScanIntervalSec,
+		"strict_property_whitelist":      cfg.StrictPropertyWhitelist,
+		"extra_allowed_properties":       cfg.ExtraAllowedProperties,
+		"extra_allowed_class_count":      len(cfg.ExtraAllowedProperties),
+		"git":                            a.state.GitState(),
+		"metrics":                        a.state.Metrics(),
+		"activity":                       a.state.Activity(),
+		"events":                         a.state.Events(limit),
+		"scan_warnings":                  a.state.ScanWarnings(limit),
+		"remote_exec_enabled":            execDebug.Enabled,
+		"remote_exec_queue_count":        execDebug.QueueCount,
+		"remote_exec_running_count":      execDebug.RunningCount,
+		"remote_exec_completed_count":    execDebug.CompletedCount,
+		"remote_exec_error_count":        execDebug.ErrorCount,
+		"remote_exec_last_command_at":    execDebug.LastCommandAt,
+		"remote_exec_last_result_status": execDebug.LastResultStatus,
 	})
+}
+
+func (a *API) authorizeRemoteExec(w http.ResponseWriter, r *http.Request) bool {
+	cfg := a.state.Config()
+	if !cfg.RemoteExecEnabled {
+		writeError(w, http.StatusForbidden, "remote exec is disabled")
+		return false
+	}
+	if strings.TrimSpace(cfg.RemoteExecToken) == "" {
+		writeError(w, http.StatusForbidden, "remote exec token is not configured")
+		return false
+	}
+
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, prefix) {
+		writeError(w, http.StatusUnauthorized, "remote exec token is required")
+		return false
+	}
+	got := strings.TrimSpace(strings.TrimPrefix(auth, prefix))
+	if subtle.ConstantTimeCompare([]byte(got), []byte(cfg.RemoteExecToken)) != 1 {
+		writeError(w, http.StatusUnauthorized, "remote exec token is invalid")
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
@@ -554,7 +734,7 @@ func clearSyncRootContents(syncRoot string) (int, error) {
 	}
 	deleted := 0
 	for _, entry := range entries {
-		if entry.Name() == ".git" || entry.Name() == config.MetadataDir {
+		if entry.Name() == ".git" || entry.Name() == config.MetadataDir || entry.Name() == config.GuidebookDir {
 			continue
 		}
 		target := filepath.Join(syncRoot, entry.Name())
@@ -618,4 +798,86 @@ func intValue(value any, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func floatValue(value any, fallback float64) float64 {
+	switch typed := value.(type) {
+	case float64:
+		return typed
+	case int:
+		return float64(typed)
+	case string:
+		parsed, err := strconv.ParseFloat(typed, 64)
+		if err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func sliceValue(value any) []any {
+	raw, ok := value.([]any)
+	if !ok {
+		return []any{}
+	}
+	return append([]any(nil), raw...)
+}
+
+func sanitizeRemoteExecPrints(value any) []state.RemoteExecPrint {
+	raw, ok := value.([]any)
+	if !ok {
+		return []state.RemoteExecPrint{}
+	}
+	result := make([]state.RemoteExecPrint, 0, len(raw))
+	for _, item := range raw {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		level := strings.TrimSpace(stringValue(entry["level"]))
+		if level == "" {
+			level = "print"
+		}
+		result = append(result, state.RemoteExecPrint{
+			Level: level,
+			Text:  stringValue(entry["text"]),
+			AtMS:  floatValue(entry["at_ms"], 0),
+		})
+	}
+	return result
+}
+
+func remoteExecCommandPayload(command state.RemoteExecCommand, includeSource bool) map[string]any {
+	payload := map[string]any{
+		"id":           command.ID,
+		"state":        command.State,
+		"timeout_sec":  command.TimeoutSec,
+		"client":       command.Client,
+		"mode":         command.Mode,
+		"created_at":   command.CreatedAt,
+		"claimed_at":   command.ClaimedAt,
+		"completed_at": command.CompletedAt,
+		"claimed_by":   command.ClaimedBy,
+		"ok":           command.OK,
+		"duration_ms":  command.DurationMS,
+		"prints":       command.Prints,
+		"returns":      command.Returns,
+		"error":        command.Error,
+		"traceback":    command.Traceback,
+		"late_result":  command.LateResult,
+	}
+	if includeSource {
+		payload["source"] = command.Source
+	}
+	return payload
+}
+
+func clampInt(value, minimum, maximum int) int {
+	if value < minimum {
+		return minimum
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
 }

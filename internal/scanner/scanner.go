@@ -36,9 +36,17 @@ type Cache struct {
 }
 
 type cacheEntry struct {
+	size         int64
+	mtimeUnixNS  int64
+	dependencies []dependencyStat
+	result       FileResult
+}
+
+type dependencyStat struct {
+	path        string
+	exists      bool
 	size        int64
 	mtimeUnixNS int64
-	result      FileResult
 }
 
 func NewCache() *Cache {
@@ -89,9 +97,10 @@ func (c *Cache) ParseRelativeFile(cfg config.Config, relativePath string) FileRe
 	}
 	size := info.Size()
 	mtimeUnixNS := info.ModTime().UnixNano()
+	dependencies := dependencyStats(cfg, relPosix)
 
 	c.mu.Lock()
-	if entry, ok := c.entries[relPosix]; ok && entry.size == size && entry.mtimeUnixNS == mtimeUnixNS {
+	if entry, ok := c.entries[relPosix]; ok && entry.size == size && entry.mtimeUnixNS == mtimeUnixNS && sameDependencies(entry.dependencies, dependencies) {
 		result := cloneFileResult(entry.result)
 		result.CacheHit = true
 		c.mu.Unlock()
@@ -108,7 +117,7 @@ func (c *Cache) ParseRelativeFile(cfg config.Config, relativePath string) FileRe
 	if !utf8.Valid(body) {
 		result = FileResult{Warning: fmt.Sprintf("Skip %s: non-utf8 file", relPosix)}
 	} else {
-		record, err := parseRecord(relPosix, string(body), managedServiceSet(cfg.ManagedRoots), cfg.IgnoredRbxPaths)
+		record, err := parseRecord(cfg, relPosix, string(body), managedServiceSet(cfg.ManagedRoots), cfg.IgnoredRbxPaths)
 		if err != nil && isJSONFile(relPosix) {
 			result = FileResult{
 				InvalidPath: relPosix,
@@ -123,9 +132,10 @@ func (c *Cache) ParseRelativeFile(cfg config.Config, relativePath string) FileRe
 
 	c.mu.Lock()
 	c.entries[relPosix] = cacheEntry{
-		size:        size,
-		mtimeUnixNS: mtimeUnixNS,
-		result:      cloneFileResult(result),
+		size:         size,
+		mtimeUnixNS:  mtimeUnixNS,
+		dependencies: dependencies,
+		result:       cloneFileResult(result),
 	}
 	c.mu.Unlock()
 
@@ -196,7 +206,7 @@ func (c *Cache) scanTree(cfg config.Config, walkRoot string) (Snapshot, error) {
 			return nil
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" || entry.Name() == config.MetadataDir {
+			if entry.Name() == ".git" || entry.Name() == config.MetadataDir || entry.Name() == config.GuidebookDir {
 				return filepath.SkipDir
 			}
 			return nil
@@ -264,9 +274,12 @@ func (c *Cache) scanTree(cfg config.Config, walkRoot string) (Snapshot, error) {
 	return snapshot, nil
 }
 
-func parseRecord(relPosix, source string, managedServices map[string]bool, ignored []string) (*records.SyncRecord, error) {
+func parseRecord(cfg config.Config, relPosix, source string, managedServices map[string]bool, ignored []string) (*records.SyncRecord, error) {
 	filename := pathBase(relPosix)
 	if filename == records.UIPropertiesFilename {
+		if record, ok, err := parseScriptPropertiesRecord(cfg, relPosix, source, managedServices, ignored); ok || err != nil {
+			return record, err
+		}
 		return records.NewUIRecord(relPosix, source, managedServices, ignored)
 	}
 	if filename == records.UIInitMetaFilename {
@@ -275,12 +288,25 @@ func parseRecord(relPosix, source string, managedServices map[string]bool, ignor
 	if strings.HasSuffix(filename, records.UIModelJSONSuffix) {
 		return records.NewRojoModelRecord(relPosix, source, managedServices, ignored)
 	}
-	return records.NewScriptRecord(relPosix, source, managedServices, ignored)
+	record, err := records.NewScriptRecord(relPosix, source, managedServices, ignored)
+	if err != nil || record == nil {
+		return record, err
+	}
+	if err := attachScriptProperties(cfg, record, managedServices, ignored); err != nil {
+		return nil, err
+	}
+	return record, nil
 }
 
 func addRecord(snapshot *Snapshot, identityToLocalPath map[string]string, record records.SyncRecord) {
-	if _, exists := snapshot.Records[record.LocalPath]; exists {
-		snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Duplicate local_path ignored: %s", record.LocalPath))
+	if existing, exists := snapshot.Records[record.LocalPath]; exists {
+		shouldReplace, reason := records.ChoosePreferredRecord(existing, record)
+		if shouldReplace {
+			snapshot.Records[record.LocalPath] = record
+			snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Duplicate local_path replaced: %s (%s)", record.LocalPath, reason))
+		} else {
+			snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Duplicate local_path ignored: %s (%s)", record.LocalPath, reason))
+		}
 		return
 	}
 
@@ -311,6 +337,72 @@ func addRecord(snapshot *Snapshot, identityToLocalPath map[string]string, record
 	snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Merged duplicate identity %s: skipped %s, kept %s (%s)", identityKey, record.LocalPath, existingPath, reason))
 }
 
+func parseScriptPropertiesRecord(cfg config.Config, relPosix, source string, managedServices map[string]bool, ignored []string) (*records.SyncRecord, bool, error) {
+	sourcePath, ok, err := records.ScriptSourcePathForPropertiesPath(relPosix)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	sourceAbs, err := cfg.ResolveInsideSyncRoot(sourcePath)
+	if err != nil {
+		return nil, true, err
+	}
+	sourceBody, err := os.ReadFile(sourceAbs)
+	if os.IsNotExist(err) {
+		return nil, true, nil
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	if !utf8.Valid(sourceBody) {
+		return nil, true, fmt.Errorf("script source %s is non-utf8", sourcePath)
+	}
+
+	scriptRecord, err := records.NewScriptRecord(sourcePath, string(sourceBody), managedServices, ignored)
+	if err != nil || scriptRecord == nil {
+		return scriptRecord, true, err
+	}
+	propertiesRecord, err := records.NewUIRecord(relPosix, source, managedServices, ignored)
+	if err != nil || propertiesRecord == nil {
+		return scriptRecord, true, err
+	}
+	if propertiesRecord.RbxPath != scriptRecord.RbxPath || propertiesRecord.ClassName != scriptRecord.ClassName {
+		return nil, true, fmt.Errorf("script properties %s target mismatch with %s", relPosix, sourcePath)
+	}
+	if err := scriptRecord.ApplyScriptPayload(propertiesRecord.Payload); err != nil {
+		return nil, true, err
+	}
+	return scriptRecord, true, nil
+}
+
+func attachScriptProperties(cfg config.Config, record *records.SyncRecord, managedServices map[string]bool, ignored []string) error {
+	propertiesPath, ok, err := records.ScriptPropertiesPathForSourcePath(record.LocalPath)
+	if err != nil || !ok {
+		return err
+	}
+	propertiesAbs, err := cfg.ResolveInsideSyncRoot(propertiesPath)
+	if err != nil {
+		return err
+	}
+	body, err := os.ReadFile(propertiesAbs)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !utf8.Valid(body) {
+		return fmt.Errorf("script properties %s is non-utf8", propertiesPath)
+	}
+	propertiesRecord, err := records.NewUIRecord(propertiesPath, string(body), managedServices, ignored)
+	if err != nil || propertiesRecord == nil {
+		return err
+	}
+	if propertiesRecord.RbxPath != record.RbxPath || propertiesRecord.ClassName != record.ClassName {
+		return fmt.Errorf("script properties %s target mismatch with %s", propertiesPath, record.LocalPath)
+	}
+	return record.ApplyScriptPayload(propertiesRecord.Payload)
+}
+
 func countRecords(snapshot *Snapshot) {
 	snapshot.ScriptCount = 0
 	snapshot.UICount = 0
@@ -339,6 +431,46 @@ func managedServiceSet(managedRoots []string) map[string]bool {
 	return result
 }
 
+func dependencyStats(cfg config.Config, relPosix string) []dependencyStat {
+	dependencyPaths := []string{}
+	if propertiesPath, ok, err := records.ScriptPropertiesPathForSourcePath(relPosix); err == nil && ok {
+		dependencyPaths = append(dependencyPaths, propertiesPath)
+	}
+	if sourcePath, ok, err := records.ScriptSourcePathForPropertiesPath(relPosix); err == nil && ok {
+		dependencyPaths = append(dependencyPaths, sourcePath)
+	}
+	if len(dependencyPaths) == 0 {
+		return nil
+	}
+
+	result := make([]dependencyStat, 0, len(dependencyPaths))
+	for _, dependencyPath := range dependencyPaths {
+		stat := dependencyStat{path: dependencyPath}
+		target, err := cfg.ResolveInsideSyncRoot(dependencyPath)
+		if err == nil {
+			if info, statErr := os.Stat(target); statErr == nil && !info.IsDir() {
+				stat.exists = true
+				stat.size = info.Size()
+				stat.mtimeUnixNS = info.ModTime().UnixNano()
+			}
+		}
+		result = append(result, stat)
+	}
+	return result
+}
+
+func sameDependencies(left, right []dependencyStat) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func isJSONFile(relPosix string) bool {
 	filename := pathBase(relPosix)
 	return filename == records.UIPropertiesFilename || filename == records.UIInitMetaFilename || strings.HasSuffix(filename, records.UIModelJSONSuffix)
@@ -357,7 +489,9 @@ func isIgnoredMetadataPath(relPosix string) bool {
 	return relPosix == ".git" ||
 		strings.HasPrefix(relPosix, ".git/") ||
 		relPosix == config.MetadataDir ||
-		strings.HasPrefix(relPosix, config.MetadataDir+"/")
+		strings.HasPrefix(relPosix, config.MetadataDir+"/") ||
+		relPosix == config.GuidebookDir ||
+		strings.HasPrefix(relPosix, config.GuidebookDir+"/")
 }
 
 func cloneFileResult(source FileResult) FileResult {

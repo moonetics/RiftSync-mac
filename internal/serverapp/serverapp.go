@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 	"riftsync/internal/watcher"
 )
 
-const Version = "3.0.0"
+const Version = "3.2.0"
 
 type Options struct {
 	ConfigPath            string
@@ -104,6 +105,16 @@ func (r *Runner) Start(parent context.Context) error {
 	cfg.GitVersioningEnabled = true
 	if err := cfg.NormalizeAndValidate(); err != nil {
 		return fmt.Errorf("config error: %w", err)
+	}
+	executablePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("executable path error: %w", err)
+	}
+	if err := config.EnsureSyncRootScaffold(cfg, config.ScaffoldOptions{
+		ConfigPath:     options.ConfigPath,
+		ExecutablePath: executablePath,
+	}); err != nil {
+		return fmt.Errorf("sync root setup error: %w", err)
 	}
 
 	appState := state.New(cfg)

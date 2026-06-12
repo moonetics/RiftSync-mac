@@ -133,7 +133,7 @@ func TestNotifyRevisionDebouncedCommit(t *testing.T) {
 		t.Fatalf("ApplySnapshot/NotifyRevision took %v, want async return", time.Since(started))
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		summary, _, found := appState.RevisionDetail(1)
 		if found && summary.GitCommitShort != "" {

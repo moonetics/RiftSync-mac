@@ -1,7 +1,11 @@
 package state
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -97,6 +101,72 @@ type Activity struct {
 	At        float64 `json:"at"`
 }
 
+type RemoteExecState string
+
+const (
+	RemoteExecQueued    RemoteExecState = "queued"
+	RemoteExecRunning   RemoteExecState = "running"
+	RemoteExecDone      RemoteExecState = "done"
+	RemoteExecError     RemoteExecState = "error"
+	RemoteExecTimeout   RemoteExecState = "timeout"
+	RemoteExecExpired   RemoteExecState = "expired"
+	RemoteExecCancelled RemoteExecState = "cancelled"
+)
+
+const RemoteExecRunningGrace = 5 * time.Second
+
+var (
+	ErrRemoteExecCommandNotFound = errors.New("remote exec command not found")
+	ErrRemoteExecTerminalState   = errors.New("remote exec command is already terminal")
+)
+
+type RemoteExecPrint struct {
+	Level string  `json:"level"`
+	Text  string  `json:"text"`
+	AtMS  float64 `json:"at_ms"`
+}
+
+type RemoteExecCommand struct {
+	ID          string            `json:"id"`
+	Source      string            `json:"source,omitempty"`
+	TimeoutSec  int               `json:"timeout_sec"`
+	Client      string            `json:"client"`
+	Mode        string            `json:"mode"`
+	State       RemoteExecState   `json:"state"`
+	CreatedAt   float64           `json:"created_at"`
+	ClaimedAt   float64           `json:"claimed_at,omitempty"`
+	CompletedAt float64           `json:"completed_at,omitempty"`
+	ClaimedBy   string            `json:"claimed_by,omitempty"`
+	OK          bool              `json:"ok"`
+	DurationMS  float64           `json:"duration_ms,omitempty"`
+	Prints      []RemoteExecPrint `json:"prints,omitempty"`
+	Returns     []any             `json:"returns,omitempty"`
+	Error       string            `json:"error,omitempty"`
+	Traceback   string            `json:"traceback,omitempty"`
+	LateResult  bool              `json:"late_result,omitempty"`
+}
+
+type RemoteExecResult struct {
+	CommandID  string
+	ClientID   string
+	OK         bool
+	DurationMS float64
+	Prints     []RemoteExecPrint
+	Returns    []any
+	Error      string
+	Traceback  string
+}
+
+type RemoteExecDebug struct {
+	Enabled          bool    `json:"remote_exec_enabled"`
+	QueueCount       int     `json:"remote_exec_queue_count"`
+	RunningCount     int     `json:"remote_exec_running_count"`
+	CompletedCount   int     `json:"remote_exec_completed_count"`
+	ErrorCount       int     `json:"remote_exec_error_count"`
+	LastCommandAt    float64 `json:"remote_exec_last_command_at"`
+	LastResultStatus string  `json:"remote_exec_last_result_status"`
+}
+
 type RevisionEvent struct {
 	Rev          int              `json:"rev"`
 	TS           float64          `json:"ts"`
@@ -125,24 +195,31 @@ type Session struct {
 }
 
 type AppState struct {
-	mu              sync.Mutex
-	reconcileMu     sync.Mutex
-	cfg             config.Config
-	bootTime        time.Time
-	revision        int
-	counts          IndexedCounts
-	records         map[string]records.SyncRecord
-	snapshot        []map[string]any
-	compactSnapshot []map[string]any
-	warnings        []string
-	changeLog       []RevisionEvent
-	sessions        map[string]Session
-	metrics         Metrics
-	git             GitState
-	activity        Activity
-	events          *debuglog.Ring
-	changed         chan struct{}
-	listeners       []func(RevisionEvent)
+	mu                   sync.Mutex
+	reconcileMu          sync.Mutex
+	cfg                  config.Config
+	bootTime             time.Time
+	revision             int
+	counts               IndexedCounts
+	records              map[string]records.SyncRecord
+	snapshot             []map[string]any
+	compactSnapshot      []map[string]any
+	warnings             []string
+	changeLog            []RevisionEvent
+	sessions             map[string]Session
+	metrics              Metrics
+	git                  GitState
+	activity             Activity
+	events               *debuglog.Ring
+	changed              chan struct{}
+	execCommands         map[string]*RemoteExecCommand
+	execOrder            []string
+	execChanged          chan struct{}
+	execCompletedCount   int
+	execErrorCount       int
+	execLastCommandAt    float64
+	execLastResultStatus string
+	listeners            []func(RevisionEvent)
 }
 
 type persistentHistory struct {
@@ -155,11 +232,13 @@ func New(cfg config.Config) *AppState {
 	events := debuglog.New(cfg.DebugEventRetention)
 	events.Add("boot", "server booted")
 	return &AppState{
-		cfg:      cfg,
-		bootTime: time.Now(),
-		records:  map[string]records.SyncRecord{},
-		sessions: map[string]Session{},
-		changed:  make(chan struct{}),
+		cfg:          cfg,
+		bootTime:     time.Now(),
+		records:      map[string]records.SyncRecord{},
+		sessions:     map[string]Session{},
+		changed:      make(chan struct{}),
+		execCommands: map[string]*RemoteExecCommand{},
+		execChanged:  make(chan struct{}),
 		metrics: Metrics{
 			LastChanges: map[string]any{},
 		},
@@ -286,6 +365,164 @@ func (s *AppState) RecordsCopy() map[string]records.SyncRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneRecords(s.records)
+}
+
+func (s *AppState) EnqueueRemoteExecCommand(source, client, mode string, timeoutSec int) (RemoteExecCommand, error) {
+	id, err := newRemoteExecID()
+	if err != nil {
+		return RemoteExecCommand{}, err
+	}
+	now := nowSeconds()
+	command := &RemoteExecCommand{
+		ID:         id,
+		Source:     source,
+		TimeoutSec: timeoutSec,
+		Client:     strings.TrimSpace(client),
+		Mode:       strings.TrimSpace(mode),
+		State:      RemoteExecQueued,
+		CreatedAt:  now,
+	}
+	if command.Client == "" {
+		command.Client = "unknown"
+	}
+	if command.Mode == "" {
+		command.Mode = "edit"
+	}
+
+	s.mu.Lock()
+	s.expireRemoteExecLocked(time.Now())
+	s.execCommands[command.ID] = command
+	s.execOrder = append(s.execOrder, command.ID)
+	s.execLastCommandAt = now
+	s.broadcastExecLocked()
+	copy := cloneRemoteExecCommand(command)
+	s.mu.Unlock()
+
+	s.events.Add("exec", fmt.Sprintf("exec queued id=%s bytes=%d timeout=%d", command.ID, len(source), timeoutSec))
+	return copy, nil
+}
+
+func (s *AppState) ClaimRemoteExecCommand(ctx context.Context, clientID string, timeout time.Duration) (RemoteExecCommand, bool) {
+	deadline := time.Now().Add(timeout)
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" {
+		clientID = "unknown"
+	}
+
+	for {
+		s.mu.Lock()
+		s.expireRemoteExecLocked(time.Now())
+		if command := s.claimQueuedRemoteExecLocked(clientID); command != nil {
+			copy := cloneRemoteExecCommand(command)
+			s.mu.Unlock()
+			s.events.Add("exec", "exec claimed id="+copy.ID+" client="+clientID)
+			return copy, true
+		}
+		changed := s.execChanged
+		s.mu.Unlock()
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return RemoteExecCommand{}, false
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return RemoteExecCommand{}, false
+		case <-changed:
+			timer.Stop()
+		case <-timer.C:
+			return RemoteExecCommand{}, false
+		}
+	}
+}
+
+func (s *AppState) RecordRemoteExecResult(result RemoteExecResult) (RemoteExecCommand, error) {
+	commandID := strings.TrimSpace(result.CommandID)
+	if commandID == "" {
+		return RemoteExecCommand{}, ErrRemoteExecCommandNotFound
+	}
+
+	now := nowSeconds()
+	var eventMessage string
+	s.mu.Lock()
+	s.expireRemoteExecLocked(time.Now())
+	command := s.execCommands[commandID]
+	if command == nil {
+		s.mu.Unlock()
+		return RemoteExecCommand{}, ErrRemoteExecCommandNotFound
+	}
+
+	if isRemoteExecTerminal(command.State) {
+		command.LateResult = true
+		command.CompletedAt = now
+		s.execLastResultStatus = "late"
+		copy := cloneRemoteExecCommand(command)
+		s.mu.Unlock()
+		s.events.Add("exec", "exec late result id="+commandID+" state="+string(copy.State))
+		return copy, ErrRemoteExecTerminalState
+	}
+
+	command.OK = result.OK
+	if result.OK {
+		command.State = RemoteExecDone
+		s.execCompletedCount++
+		eventMessage = "exec done id=" + command.ID + " ok=true"
+	} else {
+		command.State = RemoteExecError
+		s.execErrorCount++
+		eventMessage = "exec error id=" + command.ID
+	}
+	command.CompletedAt = now
+	command.DurationMS = result.DurationMS
+	command.Prints = append([]RemoteExecPrint(nil), result.Prints...)
+	command.Returns = append([]any(nil), result.Returns...)
+	command.Error = strings.TrimSpace(result.Error)
+	command.Traceback = strings.TrimSpace(result.Traceback)
+	if strings.TrimSpace(result.ClientID) != "" {
+		command.ClaimedBy = strings.TrimSpace(result.ClientID)
+	}
+	s.execLastResultStatus = string(command.State)
+	copy := cloneRemoteExecCommand(command)
+	s.mu.Unlock()
+
+	s.events.Add("exec", eventMessage)
+	return copy, nil
+}
+
+func (s *AppState) RemoteExecCommand(id string) (RemoteExecCommand, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.expireRemoteExecLocked(time.Now())
+	command := s.execCommands[strings.TrimSpace(id)]
+	if command == nil {
+		return RemoteExecCommand{}, false
+	}
+	return cloneRemoteExecCommand(command), true
+}
+
+func (s *AppState) RemoteExecDebug() RemoteExecDebug {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.expireRemoteExecLocked(time.Now())
+
+	debug := RemoteExecDebug{
+		Enabled:          s.cfg.RemoteExecEnabled,
+		CompletedCount:   s.execCompletedCount,
+		ErrorCount:       s.execErrorCount,
+		LastCommandAt:    s.execLastCommandAt,
+		LastResultStatus: s.execLastResultStatus,
+	}
+	for _, command := range s.execCommands {
+		switch command.State {
+		case RemoteExecQueued:
+			debug.QueueCount++
+		case RemoteExecRunning:
+			debug.RunningCount++
+		}
+	}
+	return debug
 }
 
 func (s *AppState) AddRevisionListener(listener func(RevisionEvent)) {
@@ -841,4 +1078,89 @@ func cloneChange(source map[string]any) map[string]any {
 		result[key] = value
 	}
 	return result
+}
+
+func (s *AppState) claimQueuedRemoteExecLocked(clientID string) *RemoteExecCommand {
+	for _, id := range s.execOrder {
+		command := s.execCommands[id]
+		if command == nil || command.State != RemoteExecQueued {
+			continue
+		}
+		command.State = RemoteExecRunning
+		command.ClaimedBy = clientID
+		command.ClaimedAt = nowSeconds()
+		return command
+	}
+	return nil
+}
+
+func (s *AppState) expireRemoteExecLocked(now time.Time) {
+	nowSec := float64(now.UnixMilli()) / 1000
+	for _, command := range s.execCommands {
+		if command == nil {
+			continue
+		}
+		timeout := time.Duration(command.TimeoutSec)*time.Second + RemoteExecRunningGrace
+		if timeout <= RemoteExecRunningGrace {
+			timeout = RemoteExecRunningGrace
+		}
+
+		switch command.State {
+		case RemoteExecRunning:
+			claimedAt := secondsToTime(command.ClaimedAt)
+			if !claimedAt.IsZero() && now.Sub(claimedAt) >= timeout {
+				command.State = RemoteExecExpired
+				command.CompletedAt = nowSec
+				s.execErrorCount++
+				s.execLastResultStatus = string(RemoteExecExpired)
+			}
+		case RemoteExecQueued:
+			createdAt := secondsToTime(command.CreatedAt)
+			if !createdAt.IsZero() && now.Sub(createdAt) >= timeout {
+				command.State = RemoteExecExpired
+				command.CompletedAt = nowSec
+				s.execErrorCount++
+				s.execLastResultStatus = string(RemoteExecExpired)
+			}
+		}
+	}
+}
+
+func (s *AppState) broadcastExecLocked() {
+	close(s.execChanged)
+	s.execChanged = make(chan struct{})
+}
+
+func isRemoteExecTerminal(state RemoteExecState) bool {
+	switch state {
+	case RemoteExecDone, RemoteExecError, RemoteExecTimeout, RemoteExecExpired, RemoteExecCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneRemoteExecCommand(command *RemoteExecCommand) RemoteExecCommand {
+	if command == nil {
+		return RemoteExecCommand{}
+	}
+	copy := *command
+	copy.Prints = append([]RemoteExecPrint(nil), command.Prints...)
+	copy.Returns = append([]any(nil), command.Returns...)
+	return copy
+}
+
+func newRemoteExecID() (string, error) {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+	return "cmd_" + hex.EncodeToString(bytes[:]), nil
+}
+
+func secondsToTime(seconds float64) time.Time {
+	if seconds <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(int64(seconds * 1000))
 }

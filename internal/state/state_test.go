@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -140,6 +141,34 @@ func TestRecordPerformance(t *testing.T) {
 	}
 	if metrics.LastParseDurationMS <= 0 || metrics.LastPublishDurationMS <= 0 {
 		t.Fatalf("duration metrics = parse %v publish %v", metrics.LastParseDurationMS, metrics.LastPublishDurationMS)
+	}
+}
+
+func TestRemoteExecRunningCommandExpires(t *testing.T) {
+	appState := testState(t, 10)
+	command, err := appState.EnqueueRemoteExecCommand("print(1)", "cli", "edit", 1)
+	if err != nil {
+		t.Fatalf("EnqueueRemoteExecCommand returned error: %v", err)
+	}
+	claimed, ok := appState.ClaimRemoteExecCommand(context.Background(), "studio", time.Millisecond)
+	if !ok || claimed.ID != command.ID {
+		t.Fatalf("claimed = %#v ok=%t, want command %s", claimed, ok, command.ID)
+	}
+
+	appState.mu.Lock()
+	appState.execCommands[command.ID].ClaimedAt = nowSeconds() - 7
+	appState.mu.Unlock()
+
+	expired, found := appState.RemoteExecCommand(command.ID)
+	if !found {
+		t.Fatal("RemoteExecCommand not found")
+	}
+	if expired.State != RemoteExecExpired {
+		t.Fatalf("state = %s, want expired", expired.State)
+	}
+	debug := appState.RemoteExecDebug()
+	if debug.RunningCount != 0 || debug.ErrorCount != 1 || debug.LastResultStatus != string(RemoteExecExpired) {
+		t.Fatalf("debug = %#v, want expired error metrics", debug)
 	}
 }
 

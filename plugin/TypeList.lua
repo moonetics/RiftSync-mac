@@ -1,7 +1,8 @@
 local TypeList = {}
 
-TypeList.VERSION = "3.0.0"
+TypeList.VERSION = "3.2.0"
 TypeList.PROTOCOL = "rbxsync/2.0.0"
+TypeList.PLUGIN_ICON = "rbxassetid://72034413544662"
 TypeList.CHANGE_ENCODINGS = {
 	Compact = "compact-json-v1",
 	Verbose = "verbose-json-v1",
@@ -12,6 +13,8 @@ TypeList.DEFAULT_PORT = 8765
 TypeList.POLL_TIMEOUT_SECONDS = 25
 TypeList.POLL_INTERVAL_SECONDS = 0.15
 TypeList.RECONNECT_INTERVAL_SECONDS = 3
+TypeList.EXEC_POLL_TIMEOUT_SECONDS = 1
+TypeList.EXEC_IDLE_WAIT_SECONDS = 0.2
 TypeList.ACTIVITY_SUMMARY_THRESHOLD = 8
 TypeList.START_MODES = {
 	StudioToFolder = "studio_to_folder",
@@ -30,6 +33,8 @@ TypeList.ENDPOINTS = {
 	Bootstrap = "/bootstrap",
 	DebugState = "/debug/state",
 	History = "/history",
+	ExecNext = "/exec/commands/next",
+	ExecResult = "/exec/commands/result",
 }
 
 TypeList.MANAGED_ATTRIBUTES = {

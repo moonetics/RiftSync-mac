@@ -785,6 +785,7 @@ local SETTING_KEYS = {
 	ClientId = "riftsync_client_id",
 	LastRevision = "riftsync_last_revision",
 	DebugEnabled = "riftsync_debug_enabled",
+	RemoteExecToken = "riftsync_remote_exec_token",
 }
 
 local LEGACY_SETTING_KEYS = {
@@ -794,6 +795,7 @@ local LEGACY_SETTING_KEYS = {
 	ClientId = "rbxlsync_client_id",
 	LastRevision = "rbxlsync_last_revision",
 	DebugEnabled = "rbxlsync_debug_enabled",
+	RemoteExecToken = "rbxlsync_remote_exec_token",
 }
 
 local function getPluginSetting(pluginInstance, keyName)
@@ -841,6 +843,11 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 self.serverIndexedCount = 0
 	self.changeEncoding = TypeList.CHANGE_ENCODINGS and TypeList.CHANGE_ENCODINGS.Compact or "compact-json-v1"
 	self.debugEnabled = getPluginSetting(pluginInstance, "DebugEnabled") == true
+	self.remoteExecEnabled = false
+	self.remoteExecToken = tostring(getPluginSetting(pluginInstance, "RemoteExecToken") or "")
+	self.remoteExecBusy = false
+	self.remoteExecLoopRunning = false
+	self.lastExecStatus = "Exec disabled"
 	self.debugEvents = {}
 	self.serverDebugState = {}
 	self.debugState = {
@@ -905,6 +912,50 @@ function SyncAPI:setDebugEnabled(enabled : boolean)
 	self:pushDebugUpdate()
 end
 
+function SyncAPI:isRemoteExecEnabled()
+	return self.remoteExecEnabled == true
+end
+
+function SyncAPI:setRemoteExecEnabled(enabled : boolean)
+	self.remoteExecEnabled = enabled == true
+	if self.remoteExecEnabled then
+		if tostring(self.remoteExecToken or "") == "" then
+			self.lastExecStatus = "Exec error: token required"
+		elseif self.running ~= true then
+			self.lastExecStatus = "Exec disabled"
+		else
+			self.lastExecStatus = "Exec ready"
+		end
+		self:appendDebugEvent("Remote Exec aktif", false)
+	else
+		self.lastExecStatus = "Exec disabled"
+		self.remoteExecBusy = false
+		self:appendDebugEvent("Remote Exec nonaktif", false)
+	end
+	self:pushDebugUpdate()
+end
+
+function SyncAPI:getRemoteExecToken()
+	return self.remoteExecToken or ""
+end
+
+function SyncAPI:setRemoteExecToken(token : string)
+	self.remoteExecToken = tostring(token or "")
+	self.plugin:SetSetting(SETTING_KEYS.RemoteExecToken, self.remoteExecToken)
+	if self.remoteExecEnabled and self.remoteExecToken == "" then
+		self.lastExecStatus = "Exec error: token required"
+	elseif self.remoteExecEnabled and self.running == true then
+		self.lastExecStatus = "Exec ready"
+	elseif self.remoteExecEnabled then
+		self.lastExecStatus = "Exec disabled"
+	end
+	self:pushDebugUpdate()
+end
+
+function SyncAPI:getRemoteExecStatus()
+	return self.lastExecStatus or "Exec disabled"
+end
+
 function SyncAPI:resetDebugState()
 	self.debugState.handshake = false
 	self.debugState.snapshot = false
@@ -948,6 +999,9 @@ function SyncAPI:buildDebugPayload()
 			last_change_count = self.debugState.lastPollChangeCount,
 			poll_error_count = self.debugState.pollErrorCount,
 			last_error = self.debugState.lastError,
+			remote_exec_enabled = self.remoteExecEnabled == true,
+			remote_exec_busy = self.remoteExecBusy == true,
+			remote_exec_status = self.lastExecStatus or "Exec disabled",
 		},
 		server = serverState,
 		events = events,
@@ -1126,17 +1180,28 @@ function SyncAPI:reportActivity(text : any, isError : boolean?, meta : any?)
 end
 
 function SyncAPI:requestJson(method : string, endpoint : string, payload : {[string]: any}?, queryParams : {[string]: string | number}?)
+	return self:requestJsonWithHeaders(method, endpoint, payload, queryParams, nil)
+end
+
+function SyncAPI:requestJsonWithHeaders(method : string, endpoint : string, payload : {[string]: any}?, queryParams : {[string]: string | number}?, extraHeaders : {[string]: string}?)
 	local url = self.baseUrl .. endpoint
 	if queryParams then
 		url ..= "?" .. buildQuery(queryParams)
 	end
 
+	local headers = {
+		["Content-Type"] = "application/json"
+	}
+	if typeof(extraHeaders) == "table" then
+		for key, value in pairs(extraHeaders) do
+			headers[tostring(key)] = tostring(value)
+		end
+	end
+
 	local requestOptions = {
 		Url = url,
 		Method = method,
-		Headers = {
-			["Content-Type"] = "application/json"
-		}
+		Headers = headers
 	}
 
 	local body = createBody(payload)
@@ -1781,6 +1846,256 @@ function SyncAPI:pollChanges()
 	return false, buildErrorSummary("Delta apply gagal", errors, 3), "apply"
 end
 
+local function serializeExecValue(value : any)
+	local valueType = typeof(value)
+	if valueType == "nil" then
+		return "nil"
+	end
+	if valueType == "string" or valueType == "number" or valueType == "boolean" then
+		return value
+	end
+	if valueType == "Instance" then
+		local ok, fullName = pcall(function()
+			return value:GetFullName()
+		end)
+		if ok then
+			return tostring(fullName)
+		end
+	end
+	return tostring(value)
+end
+
+local function packExecValues(...)
+	local packed = { ... }
+	packed.n = select("#", ...)
+	return packed
+end
+
+local function serializeExecReturns(packed)
+	local result = {}
+	local count = tonumber(packed.n) or #packed
+	for index = 1, count do
+		table.insert(result, serializeExecValue(packed[index]))
+	end
+	return result
+end
+
+local function appendExecPrint(prints : {any}, level : string, startedAt : number, values)
+	local parts = {}
+	local count = tonumber(values.n) or #values
+	for index = 1, count do
+		parts[index] = tostring(values[index])
+	end
+	table.insert(prints, {
+		level = level,
+		text = table.concat(parts, "\t"),
+		at_ms = math.floor((os.clock() - startedAt) * 1000 + 0.5),
+	})
+end
+
+function SyncAPI:remoteExecHeaders()
+	local token = tostring(self.remoteExecToken or "")
+	if token == "" then
+		return nil
+	end
+	return {
+		Authorization = "Bearer " .. token,
+	}
+end
+
+function SyncAPI:startRemoteExecLoop(runToken : number)
+	if self.remoteExecLoopRunning then
+		return
+	end
+	self.remoteExecLoopRunning = true
+	task.spawn(function()
+		while self.running and self.runToken == runToken do
+			if self.remoteExecEnabled ~= true or self.debugState.handshake ~= true then
+				task.wait(TypeList.EXEC_IDLE_WAIT_SECONDS or 0.2)
+			elseif tostring(self.remoteExecToken or "") == "" then
+				self.lastExecStatus = "Exec error: token required"
+				self:pushDebugUpdate()
+				task.wait(TypeList.EXEC_IDLE_WAIT_SECONDS or 0.2)
+			elseif runService:IsRunning() then
+				self.lastExecStatus = "Exec error: Play mode"
+				self:pushDebugUpdate()
+				self:pollRemoteExecCommand()
+				if self.running and self.runToken == runToken then
+					self.lastExecStatus = "Exec error: Play mode"
+					self:pushDebugUpdate()
+				end
+				task.wait(TypeList.EXEC_IDLE_WAIT_SECONDS or 0.2)
+			else
+				self:pollRemoteExecCommand()
+				task.wait(TypeList.EXEC_IDLE_WAIT_SECONDS or 0.2)
+			end
+		end
+		self.remoteExecLoopRunning = false
+	end)
+end
+
+function SyncAPI:pollRemoteExecCommand()
+	if self.remoteExecBusy then
+		return
+	end
+	self.remoteExecBusy = true
+	local response, requestError = self:requestJsonWithHeaders("GET", TypeList.ENDPOINTS.ExecNext, nil, {
+		client_id = self.clientId,
+		timeout = TypeList.EXEC_POLL_TIMEOUT_SECONDS or 1,
+	}, self:remoteExecHeaders())
+	if not response then
+		self.lastExecStatus = "Exec error: " .. tostring(requestError)
+		self.remoteExecBusy = false
+		self:appendDebugEvent("Remote Exec poll gagal: " .. tostring(requestError), true)
+		self:pushDebugUpdate()
+		return
+	end
+	if response.status ~= "ok" then
+		self.lastExecStatus = "Exec error: " .. tostring(response.status)
+		self.remoteExecBusy = false
+		self:pushDebugUpdate()
+		return
+	end
+	if typeof(response.command) ~= "table" then
+		self.lastExecStatus = "Exec ready"
+		self.remoteExecBusy = false
+		self:pushDebugUpdate()
+		return
+	end
+
+	local command = response.command
+	self.lastExecStatus = "Exec running"
+	self:pushDebugUpdate()
+	if self.remoteExecEnabled ~= true then
+		local disabledResult = {
+			command_id = tostring(command.id or ""),
+			client_id = self.clientId,
+			ok = false,
+			duration_ms = 0,
+			prints = {},
+			returns = {},
+			error = "Remote Exec was disabled before execution",
+			traceback = "",
+		}
+		self:postRemoteExecResult(disabledResult)
+		self.remoteExecBusy = false
+		self.lastExecStatus = "Exec disabled"
+		self:pushDebugUpdate()
+		return
+	end
+	local result = self:executeRemoteCommand(command)
+	self:postRemoteExecResult(result)
+	self.remoteExecBusy = false
+	self.lastExecStatus = result.ok and "Exec ready" or "Exec error"
+	self:pushDebugUpdate()
+end
+
+function SyncAPI:executeRemoteCommand(command : {[string]: any})
+	local startedAt = os.clock()
+	local commandId = tostring(command.id or "")
+	local prints = {}
+	local result = {
+		command_id = commandId,
+		client_id = self.clientId,
+		ok = false,
+		duration_ms = 0,
+		prints = prints,
+		returns = {},
+		error = "",
+		traceback = "",
+	}
+
+	local function finish(ok : boolean, errorMessage : any?, tracebackText : any?, returns : {any}?)
+		result.ok = ok == true
+		result.duration_ms = math.floor((os.clock() - startedAt) * 1000 + 0.5)
+		result.error = tostring(errorMessage or "")
+		result.traceback = tostring(tracebackText or "")
+		result.returns = returns or {}
+		return result
+	end
+
+	if commandId == "" then
+		return finish(false, "Remote Exec command id is missing", "")
+	end
+	if runService:IsRunning() then
+		return finish(false, "Remote Exec is disabled during Play mode", "")
+	end
+	if typeof(loadstring) ~= "function" then
+		return finish(false, "Remote Exec loadstring is unavailable in this Studio/plugin context", "")
+	end
+	if typeof(setfenv) ~= "function" or typeof(getfenv) ~= "function" then
+		return finish(false, "Remote Exec environment functions are unavailable in this Studio/plugin context", "")
+	end
+
+	local source = tostring(command.source or "")
+	local wrappedSource = "return function()\n" .. source .. "\nend"
+	local compiled, compileError = loadstring(wrappedSource)
+	if not compiled then
+		return finish(false, "Compile error: " .. tostring(compileError), tostring(compileError))
+	end
+
+	local baseEnvironment = getfenv(0)
+	local environment = setmetatable({
+		game = game,
+		workspace = workspace,
+		plugin = self.plugin,
+		script = script,
+		Instance = Instance,
+		Enum = Enum,
+		Color3 = Color3,
+		Vector3 = Vector3,
+		UDim2 = UDim2,
+		task = task,
+		print = function(...)
+			appendExecPrint(prints, "print", startedAt, packExecValues(...))
+		end,
+		warn = function(...)
+			appendExecPrint(prints, "warn", startedAt, packExecValues(...))
+		end,
+	}, {
+		__index = baseEnvironment,
+	})
+	setfenv(compiled, environment)
+
+	local commandFactoryOk, commandFunctionOrError = xpcall(function()
+		return compiled()
+	end, debug.traceback)
+	if not commandFactoryOk then
+		return finish(false, commandFunctionOrError, commandFunctionOrError)
+	end
+	if typeof(commandFunctionOrError) ~= "function" then
+		return finish(false, "Compiled Remote Exec source did not return a function", "")
+	end
+	pcall(function()
+		setfenv(commandFunctionOrError, environment)
+	end)
+
+	local ok, packedOrError = xpcall(function()
+		return packExecValues(commandFunctionOrError())
+	end, debug.traceback)
+	if not ok then
+		return finish(false, packedOrError, packedOrError)
+	end
+	return finish(true, "", "", serializeExecReturns(packedOrError))
+end
+
+function SyncAPI:postRemoteExecResult(result : {[string]: any})
+	local response, requestError = self:requestJsonWithHeaders("POST", TypeList.ENDPOINTS.ExecResult, result, nil, self:remoteExecHeaders())
+	if not response then
+		self:appendDebugEvent("Remote Exec result gagal: " .. tostring(requestError), true)
+		self.lastExecStatus = "Exec error: result post failed"
+		return false, requestError
+	end
+	if response.status ~= "ok" then
+		local message = "Remote Exec result rejected: " .. tostring(response.status)
+		self:appendDebugEvent(message, true)
+		self.lastExecStatus = "Exec error: result rejected"
+		return false, message
+	end
+	self:appendDebugEvent("Remote Exec result terkirim id=" .. tostring(result.command_id), result.ok ~= true)
+	return true
+end
+
 function SyncAPI:waitBeforeReconnect(runToken : number, reason : any)
 	self.initialSyncInProgress = false
 	self.debugState.handshake = false
@@ -1849,6 +2164,7 @@ function SyncAPI:runLoop(runToken : number)
 		end
 
 		self.updateStatus("Idle - synced rev " .. tostring(self.lastAppliedRevision), false)
+		self:startRemoteExecLoop(runToken)
 
 		while self.running and self.runToken == runToken do
 			local ok, pollResult, failureKind = self:pollChanges()
@@ -1882,6 +2198,13 @@ function SyncAPI:start()
 	self.running = true
 	self.runToken += 1
 	self.initialSyncInProgress = false
+	if self.remoteExecEnabled then
+		if tostring(self.remoteExecToken or "") == "" then
+			self.lastExecStatus = "Exec error: token required"
+		else
+			self.lastExecStatus = "Exec ready"
+		end
+	end
 	local currentToken = self.runToken
 	self.updateStatus("Connecting to " .. self.baseUrl .. "... (5%)", false)
 	self.debugState.lastError = ""
@@ -1898,6 +2221,8 @@ end
 function SyncAPI:stop()
 	self.running = false
 	self.initialSyncInProgress = false
+	self.remoteExecBusy = false
+	self.lastExecStatus = "Exec disabled"
 	self.updateStatus("Idle - sync stopped", false)
 	self:appendDebugEvent("Sync berhenti", false)
 	self:pushDebugUpdate()
@@ -3900,6 +4225,42 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 	}
 end
 
+local function applyScriptPayload(self, scriptInstance : Instance, className : string, targetName : string, rawPayload : any)
+	if typeof(rawPayload) ~= "table" then
+		return true
+	end
+	local payload = {
+		className = className,
+		name = targetName,
+		properties = typeof(rawPayload.properties) == "table" and rawPayload.properties or {},
+		attributes = typeof(rawPayload.attributes) == "table" and rawPayload.attributes or {},
+		tags = typeof(rawPayload.tags) == "table" and rawPayload.tags or {},
+	}
+	local propertyErrors, propertyNotices = applyUiProperties(self, scriptInstance, payload)
+	local metadataErrors, metadataNotices = applyUiAttributesAndTags(scriptInstance, payload)
+	if #propertyErrors > 0 or #metadataErrors > 0 then
+		local merged = {}
+		for _, message in ipairs(propertyErrors) do
+			table.insert(merged, message)
+		end
+		for _, message in ipairs(metadataErrors) do
+			table.insert(merged, message)
+		end
+		return false, table.concat(merged, " | ")
+	end
+	local notices = {}
+	for _, message in ipairs(propertyNotices) do
+		table.insert(notices, message)
+	end
+	for _, message in ipairs(metadataNotices) do
+		table.insert(notices, message)
+	end
+	if #notices > 0 then
+		return true, table.concat(notices, " | ")
+	end
+	return true
+end
+
 local function applyScriptUpsert(self, change : {[string]: any}, revision : number)
 	local rbxPath = change.rbx_path
 	local className = change.class_name
@@ -3937,7 +4298,7 @@ local function applyScriptUpsert(self, change : {[string]: any}, revision : numb
 	end
 
 	markManagedInstance(scriptInstance, localPath, revision, nil, INSTANCE_KINDS.Script)
-	return true
+	return applyScriptPayload(self, scriptInstance, className, targetName, change.payload)
 end
 
 local function applyScriptRename(self, change : {[string]: any}, revision : number)
@@ -3977,8 +4338,14 @@ local function applyScriptRename(self, change : {[string]: any}, revision : numb
 
 	existing.Name = newName
 	existing.Parent = newParent
+	if typeof(change.source) == "string" then
+		local didUpdate = setScriptSource(existing, change.source)
+		if not didUpdate then
+			return false, "Failed to update source for " .. existing:GetFullName()
+		end
+	end
 	markManagedInstance(existing, change.local_path, revision, nil, INSTANCE_KINDS.Script)
-	return true
+	return applyScriptPayload(self, existing, existing.ClassName, newName, change.payload)
 end
 
 function SyncAPI:applyDelete(change : {[string]: any})

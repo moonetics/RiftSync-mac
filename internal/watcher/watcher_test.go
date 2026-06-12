@@ -178,6 +178,12 @@ func TestProcessBatchNewFolderAndGitIgnored(t *testing.T) {
 		t.Fatalf("revision after metadata event = %d, want unchanged 1", appState.Revision())
 	}
 
+	guidebookTarget := writeFile(t, root, ".guidebook/README.md", "# guide")
+	service.processBatch(map[string]fsnotify.Op{guidebookTarget: fsnotify.Write})
+	if appState.Revision() != 1 {
+		t.Fatalf("revision after guidebook event = %d, want unchanged 1", appState.Revision())
+	}
+
 	if _, err := os.Stat(target); err != nil {
 		t.Fatalf("expected scanned child to exist: %v", err)
 	}

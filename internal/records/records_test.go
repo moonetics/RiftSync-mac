@@ -76,10 +76,16 @@ func TestPayloadHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewScriptRecord returned error: %v", err)
 	}
+	if err := record.ApplyScriptPayload(map[string]any{"properties": map[string]any{"Disabled": true}}); err != nil {
+		t.Fatalf("ApplyScriptPayload returned error: %v", err)
+	}
 
 	upsert := record.ToUpsert()
 	if upsert["op"] != "upsert" || upsert["source"] != "print('hi')" {
 		t.Fatalf("upsert payload = %#v", upsert)
+	}
+	if upsert["payload"] == nil {
+		t.Fatalf("upsert payload missing script properties: %#v", upsert)
 	}
 	if !strings.HasPrefix(upsert["content_hash"].(string), "sha256:") {
 		t.Fatalf("content_hash = %q, want sha256 prefix", upsert["content_hash"])
@@ -96,6 +102,24 @@ func TestPayloadHelpers(t *testing.T) {
 	renamePayload := BuildRenameChange(*record, renamed)
 	if renamePayload["op"] != "rename" || renamePayload["old_rbx_path"] != "game.ServerScriptService.Foo" || renamePayload["new_rbx_path"] != "game.ServerScriptService.Bar" {
 		t.Fatalf("rename payload = %#v", renamePayload)
+	}
+}
+
+func TestScriptPropertiesPathHelpers(t *testing.T) {
+	sourcePath, ok, err := ScriptSourcePathForPropertiesPath("ServerScriptService/Foo.Script/properties.init.json")
+	if err != nil {
+		t.Fatalf("ScriptSourcePathForPropertiesPath returned error: %v", err)
+	}
+	if !ok || sourcePath != "ServerScriptService/Foo.Script/Foo.server.luau" {
+		t.Fatalf("sourcePath=%q ok=%t, want Foo.server.luau true", sourcePath, ok)
+	}
+
+	propertiesPath, ok, err := ScriptPropertiesPathForSourcePath("ServerScriptService/Foo.Script/Foo.server.luau")
+	if err != nil {
+		t.Fatalf("ScriptPropertiesPathForSourcePath returned error: %v", err)
+	}
+	if !ok || propertiesPath != "ServerScriptService/Foo.Script/properties.init.json" {
+		t.Fatalf("propertiesPath=%q ok=%t, want properties.init.json true", propertiesPath, ok)
 	}
 }
 

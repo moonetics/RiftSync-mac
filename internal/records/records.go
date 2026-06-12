@@ -37,6 +37,12 @@ var canonicalSourceFilenameToClass = map[string]string{
 	"source.module.lua":  "ModuleScript",
 }
 
+var scriptClassToSourceSuffix = map[string]string{
+	"Script":       ".server.luau",
+	"LocalScript":  ".client.luau",
+	"ModuleScript": ".module.luau",
+}
+
 var scriptClasses = map[string]bool{
 	"Script":       true,
 	"LocalScript":  true,
@@ -80,6 +86,9 @@ func (r SyncRecord) ToUpsert() map[string]any {
 	}
 	if r.Entity == EntityScript {
 		data["source"] = r.Source
+		if r.Payload != nil {
+			data["payload"] = r.Payload
+		}
 	} else if r.Payload != nil {
 		data["payload"] = r.Payload
 	}
@@ -196,6 +205,9 @@ func BuildRenameChange(oldRecord, newRecord SyncRecord) map[string]any {
 	}
 	if newRecord.Entity == EntityScript {
 		payload["source"] = newRecord.Source
+		if newRecord.Payload != nil {
+			payload["payload"] = newRecord.Payload
+		}
 	} else if newRecord.Payload != nil {
 		payload["payload"] = newRecord.Payload
 	}
@@ -220,6 +232,9 @@ func PreferenceScore(record SyncRecord) int {
 			score += 120
 		} else if IsCanonicalScriptLocalPath(record.LocalPath) {
 			score += 100
+		}
+		if record.Payload != nil {
+			score += 10
 		}
 		if strings.HasSuffix(strings.ToLower(record.LocalPath), ".luau") {
 			score += 3
@@ -295,6 +310,63 @@ func IsCanonicalScriptLocalPath(localPath string) bool {
 	}
 	_, canonical := canonicalSourceFilenameToClass[strings.ToLower(parts[len(parts)-1])]
 	return canonical || IsNamedScriptSourceLocalPath(localPath)
+}
+
+func ScriptSourcePathForPropertiesPath(localPath string) (string, bool, error) {
+	parts := splitPath(localPath)
+	if len(parts) < 3 || parts[len(parts)-1] != UIPropertiesFilename {
+		return "", false, nil
+	}
+	folderParts := parts[1 : len(parts)-1]
+	if len(folderParts) == 0 {
+		return "", false, nil
+	}
+	lastFolder := folderParts[len(folderParts)-1]
+	splitIndex := strings.LastIndex(lastFolder, ".")
+	if splitIndex <= 0 || splitIndex >= len(lastFolder)-1 {
+		return "", false, nil
+	}
+	className := lastFolder[splitIndex+1:]
+	suffix := scriptClassToSourceSuffix[className]
+	if suffix == "" {
+		return "", false, nil
+	}
+	decodedNames, classStack, err := decodeInstanceFolderParts(folderParts)
+	if err != nil {
+		return "", false, err
+	}
+	if len(decodedNames) == 0 || classStack[len(classStack)-1] != className {
+		return "", false, nil
+	}
+	sourceFilename := lastFolder[:splitIndex] + suffix
+	return path.Join(path.Dir(normalizeSlash(localPath)), sourceFilename), true, nil
+}
+
+func ScriptPropertiesPathForSourcePath(localPath string) (string, bool, error) {
+	parts := splitPath(localPath)
+	if len(parts) < 3 {
+		return "", false, nil
+	}
+	filename := parts[len(parts)-1]
+	stem, className, _, ok := splitScriptSourceFilename(filename)
+	if !ok {
+		return "", false, nil
+	}
+	folderParts := parts[1 : len(parts)-1]
+	if len(folderParts) == 0 {
+		return "", false, nil
+	}
+	decodedNames, classStack, err := decodeInstanceFolderParts(folderParts)
+	if err != nil {
+		return "", false, err
+	}
+	if len(decodedNames) == 0 || classStack[len(classStack)-1] != className {
+		return "", false, nil
+	}
+	if decodeLocalSegment(stem) != decodedNames[len(decodedNames)-1] {
+		return "", false, nil
+	}
+	return path.Join(path.Dir(normalizeSlash(localPath)), UIPropertiesFilename), true, nil
 }
 
 func IsCanonicalUILocalPath(localPath string) bool {
@@ -664,6 +736,19 @@ func buildScriptRecord(localPath, rbxPath, className, source string) *SyncRecord
 		Source:      source,
 		ContentHash: ContentDigest(source),
 	}
+}
+
+func (r *SyncRecord) ApplyScriptPayload(payload map[string]any) error {
+	if r == nil || r.Entity != EntityScript || payload == nil {
+		return nil
+	}
+	canonical, err := canonicalJSON(payload)
+	if err != nil {
+		return err
+	}
+	r.Payload = payload
+	r.ContentHash = ContentDigest(r.Source + "\x00" + canonical)
+	return nil
 }
 
 func IsIgnoredRbxPath(rbxPath string, ignored []string) bool {

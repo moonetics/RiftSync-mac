@@ -1,6 +1,6 @@
 # RiftSync Plugin (One-Way + Properties Tree)
 
-Versi: `3.0.0`
+Versi: `3.2.0`
 Protocol sync: `rbxsync/2.0.0`
 
 One-way sync untuk Roblox Studio:
@@ -51,7 +51,7 @@ Dokumen itu menjelaskan format `init.meta.json`, `*.model.json`, typed values se
   - `<Name>.server.luau` -> `Script`
   - `<Name>.client.luau` -> `LocalScript`
   - `<Name>.module.luau` -> `ModuleScript`
-- `properties.init.json` -> metadata + properti instance (folder-per-instance)
+- `properties.init.json` -> metadata + properti instance (folder-per-instance), termasuk `Disabled` untuk `Script` dan `LocalScript`
 - Legacy script format (`source.*.luau`, `*.server.lua`, `*.client.lua`, `*.module.lua`) masih dibaca untuk kompatibilitas migrasi.
 
 Aturan penamaan:
@@ -66,6 +66,25 @@ Contoh:
 - `<sync_root>/StarterGui/MainScreen.ScreenGui/Loader.LocalScript/properties.init.json`
 - `<sync_root>/StarterGui/MainScreen.ScreenGui/Loader.LocalScript/Loader.client.luau`
 - `<sync_root>/StarterGui/MainScreen.ScreenGui/TopBar.Frame/properties.init.json`
+
+Contoh script dengan properti:
+
+```text
+ServerScriptService/
+└─ Bootstrap.Script/
+   ├─ properties.init.json
+   └─ Bootstrap.server.luau
+```
+
+```json
+{
+  "properties": {
+    "Disabled": true
+  }
+}
+```
+
+Saat `Disabled` diubah ke `false`, RiftSync mengirim delta untuk meng-enable script di Studio. `Source` tetap ditulis di file `.server.luau`/`.client.luau`/`.module.luau`, bukan di `properties.init.json`.
 
 ### Format Folder UI
 
@@ -201,10 +220,26 @@ Catatan:
 
 Watcher default membaca dari `sync_root` di `sync_config.json`. Pada repo ini default-nya masih `src/game`, tetapi folder `src/` bukan bagian plugin dan boleh tidak ada sampai kamu menaruh project lokal sendiri.
 
+Saat server/app start, RiftSync otomatis memastikan folder service dasar tersedia untuk experience baru yang masih kosong:
+
+- `ServerScriptService`
+- `ServerStorage`
+- `ReplicatedStorage`
+- `StarterGui`
+- `StarterPack`
+- `StarterPlayer`
+
+RiftSync juga membuat `.guidebook/README.md` di dalam `sync_root` jika belum ada. File ini adalah playbook lokal untuk manusia/AI: struktur folder, workflow sync, Remote Exec, metadata yang tidak boleh disync, dan cara cek Git. RiftSync juga menulis `.guidebook/riftsync-exec.ps1` sebagai launcher lokal auto-generated untuk menjalankan Remote Exec dari folder game. Folder metadata `.git`, `.rblxsync`, dan `.guidebook` tidak dikirim ke Studio.
+
 Contoh minimal:
 
 ```text
 <sync_root>/
+├─ .git/
+├─ .rblxsync/
+├─ .guidebook/
+│  ├─ README.md
+│  └─ riftsync-exec.ps1
 ├─ ServerScriptService/
 │  └─ Bootstrap.Script/
 │     └─ Bootstrap.server.luau
@@ -232,6 +267,21 @@ go build -ldflags="-H=windowsgui" -o riftsync.exe ./cmd/riftsync-app
 go build -o riftsync-server.exe ./cmd/riftsync-server
 ```
 
+Build dengan icon Windows:
+
+```powershell
+.\scripts\build-windows.ps1
+```
+
+Script ini membuat asset dari `assets/brand/riftsync-logo.png`, menghasilkan:
+
+- `assets/brand/riftsync-icon-512.png`
+- `assets/brand/riftsync.ico`
+- `cmd/riftsync-app/rsrc_windows_amd64.syso`
+- `cmd/riftsync-server/rsrc_windows_amd64.syso`
+
+File `.syso` otomatis dipakai Go linker saat `go build`, jadi `riftsync.exe` dan `riftsync-server.exe` punya icon Windows.
+
 Untuk pemakaian normal, jalankan:
 
 ```powershell
@@ -245,6 +295,66 @@ Untuk debug/automation dari terminal:
 ```powershell
 .\riftsync-server.exe --headless
 ```
+
+Untuk mengirim command Luau ke Studio melalui Remote Exec CLI dari `sync_root`, jalankan server/app terlebih dahulu lalu gunakan launcher lokal:
+
+```powershell
+.\.guidebook\riftsync-exec.ps1 "print(workspace.Name)"
+.\.guidebook\riftsync-exec.ps1 .\studio-command.lua --timeout 30
+@'
+local part = workspace:WaitForChild("MyPart", 10)
+print(part:GetFullName())
+return part.Name
+'@ | .\.guidebook\riftsync-exec.ps1 --stdin --timeout 15
+.\.guidebook\riftsync-exec.ps1 --file .\studio-command.luau --timeout 30
+```
+
+Remote Exec membutuhkan `"remote_exec_enabled": true` dan `"remote_exec_token": "..."` di config lokal. CLI membaca token itu dan mengirim `Authorization: Bearer <token>` ke server. Launcher `.guidebook/riftsync-exec.ps1` auto-generated per mesin dan meneruskan argumen ke `riftsync-server.exe --config <config> exec`. Jika argumen pertama berakhiran `.lua` atau `.luau`, launcher/CLI membacanya sebagai file source sehingga script command bar bisa disimpan dan dirawat seperti file biasa. Subcommand `exec` hanya menghubungi server yang sudah berjalan; ia tidak menyalakan server baru. Gunakan `--json` untuk output terstruktur atau `--raw` untuk output plain tanpa label.
+
+Fallback langsung jika tidak berada di `sync_root`:
+
+```powershell
+.\riftsync-server.exe --config .\sync_config.json exec "print(workspace.Name)"
+.\riftsync-server.exe --config .\sync_config.json exec .\studio-command.lua --timeout 30
+```
+
+Manual test Studio Remote Exec:
+
+1. Set config lokal dengan `"remote_exec_enabled": true` dan token yang sama di `"remote_exec_token"`.
+2. Jalankan `.\riftsync.exe` atau `.\riftsync-server.exe --headless`.
+3. Di widget RiftSync Studio, paste token ke field `Exec Token`.
+4. Klik `Start Sync`, lalu toggle `Exec ON`. Fresh session selalu mulai dari `Exec OFF`.
+5. Jalankan inline command:
+
+```powershell
+.\.guidebook\riftsync-exec.ps1 "print(workspace.Name)"
+```
+
+6. Jalankan multi-line command:
+
+```powershell
+@'
+local part = workspace:WaitForChild("MyPart", 10)
+warn("checking", part)
+return workspace.Name, part and part.Name
+'@ | .\.guidebook\riftsync-exec.ps1 --stdin --timeout 15
+```
+
+7. Jalankan command dari file:
+
+```powershell
+.\.guidebook\riftsync-exec.ps1 .\studio-command.lua --timeout 30
+```
+
+8. Coba error path:
+
+```powershell
+.\.guidebook\riftsync-exec.ps1 "error('boom from Studio')"
+```
+
+9. Masuk Play mode lalu jalankan command lagi; Studio harus mengirim error `Remote Exec is disabled during Play mode`.
+
+Jika Studio/plugin context tidak menyediakan `loadstring`, CLI akan menerima error eksplisit bahwa Remote Exec loadstring tidak tersedia. Dalam kondisi itu arbitrary Luau dari terminal belum bisa dieksekusi oleh plugin sampai environment Studio mengizinkannya.
 
 Flag opsional:
 
@@ -281,6 +391,17 @@ Header app custom menggantikan title bar Windows bila frameless mode berhasil. J
 - Endpoint `GET /history?limit=50` menampilkan daftar revision terbaru, dan `GET /history?rev=<rev>` menampilkan detail perubahan khusus revision itu.
 - Viewer history utama ada di `riftsync.exe`. Widget Studio dibuat ringan dan hanya menampilkan hint bahwa history tersedia di app.
 
+Untuk mengecek perubahan file game, jalankan Git dari folder `sync_root`, bukan dari repo tool RiftSyncPlugin kecuali memang sedang mengecek source tool ini:
+
+```powershell
+cd <sync_root>
+git status
+git diff
+git diff --check
+```
+
+`git status` menampilkan file modified/untracked tanpa perlu `git add`. `git add` hanya memasukkan perubahan ke staging area. `git diff` menampilkan isi perubahan, sedangkan `git diff --check` hanya mengecek whitespace/patch issue dan bukan pengganti `git status`.
+
 ## Gunakan di Roblox Studio
 
 1. Enable HTTP requests di Studio (Game Settings -> Security -> Allow HTTP Requests).
@@ -301,6 +422,16 @@ Header app custom menggantikan title bar Windows bila frameless mode berhasil. J
    - ACK Sent
    - ACK OK
    plus tail event log dan ringkasan status server (`/debug/state`).
+
+### Icon Plugin Studio
+
+Toolbar button Studio memakai icon Roblox asset dari `plugin/TypeList.lua`:
+
+```lua
+TypeList.PLUGIN_ICON = "rbxassetid://72034413544662"
+```
+
+Jika ingin mengganti logo lagi, upload PNG baru ke Roblox lalu ganti asset id tersebut. Jika kosong, plugin tetap berjalan normal tapi toolbar button memakai icon default/no icon.
 
 ### Better Error Guidance
 

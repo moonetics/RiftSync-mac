@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +45,21 @@ func TestRunnerStartStopAndHealth(t *testing.T) {
 	status := runner.Status(5)
 	if !status.Running || status.Host != "127.0.0.1" || status.Port != port || status.SyncRoot == "" {
 		t.Fatalf("status = %#v", status)
+	}
+	for _, dir := range config.BootstrapServiceDirs {
+		if info, err := os.Stat(filepath.Join(syncRoot, dir)); err != nil || !info.IsDir() {
+			t.Fatalf("service dir %s missing or not dir after start: info=%#v err=%v", dir, info, err)
+		}
+	}
+	if body, err := os.ReadFile(filepath.Join(syncRoot, config.GuidebookDir, "README.md")); err != nil {
+		t.Fatalf("guidebook missing after start: %v", err)
+	} else if !strings.Contains(string(body), "RiftSync Guidebook") {
+		t.Fatalf("guidebook content = %q, want RiftSync Guidebook", string(body))
+	}
+	if body, err := os.ReadFile(filepath.Join(syncRoot, config.GuidebookDir, config.GuidebookExecLauncher)); err != nil {
+		t.Fatalf("guidebook exec launcher missing after start: %v", err)
+	} else if !strings.Contains(string(body), "--config") || !strings.Contains(string(body), " exec @execArgs") {
+		t.Fatalf("guidebook exec launcher content = %q", string(body))
 	}
 
 	resp, err := http.Get("http://" + status.Host + ":" + strconv.Itoa(status.Port) + "/health")

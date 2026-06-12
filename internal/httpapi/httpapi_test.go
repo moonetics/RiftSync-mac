@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,24 @@ func newTestHandlerWithConfig(t *testing.T, cfg config.Config) (http.Handler, *s
 	}
 	appState := state.New(cfg)
 	return New(appState, "3.0.0"), appState
+}
+
+func newRemoteExecTestHandler(t *testing.T, enabled bool, token string) (http.Handler, *state.AppState) {
+	t.Helper()
+	cfg := config.Default()
+	cfg.SyncRoot = t.TempDir()
+	cfg.RemoteExecEnabled = enabled
+	cfg.RemoteExecToken = token
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		t.Fatalf("NormalizeAndValidate returned error: %v", err)
+	}
+	appState := state.New(cfg)
+	return New(appState, "3.0.0"), appState
+}
+
+func addExecAuth(request *http.Request, token string) *http.Request {
+	request.Header.Set("Authorization", "Bearer "+token)
+	return request
 }
 
 func decodeResponse(t *testing.T, recorder *httptest.ResponseRecorder) map[string]any {
@@ -196,6 +215,203 @@ func TestActivityRejectsMissingText(t *testing.T) {
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/activity", bytes.NewBufferString(`{"operation":"sync"}`)))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("activity status = %d body=%q, want 400", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestRemoteExecRejectsDisabled(t *testing.T) {
+	handler, _ := newRemoteExecTestHandler(t, false, "secret")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/exec/commands", bytes.NewBufferString(`{"source":"print(1)"}`)))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body=%q, want 403", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestRemoteExecRejectsEnabledWithEmptyToken(t *testing.T) {
+	handler, _ := newRemoteExecTestHandler(t, true, "")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/exec/commands", bytes.NewBufferString(`{"source":"print(1)"}`)))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body=%q, want 403", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestRemoteExecRejectsMissingAndInvalidBearerToken(t *testing.T) {
+	handler, _ := newRemoteExecTestHandler(t, true, "secret")
+
+	missingRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(missingRecorder, httptest.NewRequest(http.MethodPost, "/exec/commands", bytes.NewBufferString(`{"source":"print(1)"}`)))
+	if missingRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("missing token status = %d body=%q, want 401", missingRecorder.Code, missingRecorder.Body.String())
+	}
+
+	invalidRecorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/exec/commands", bytes.NewBufferString(`{"source":"print(1)"}`))
+	request.Header.Set("Authorization", "Bearer wrong")
+	handler.ServeHTTP(invalidRecorder, request)
+	if invalidRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid token status = %d body=%q, want 401", invalidRecorder.Code, invalidRecorder.Body.String())
+	}
+}
+
+func TestRemoteExecSubmitValidation(t *testing.T) {
+	handler, _ := newRemoteExecTestHandler(t, true, "secret")
+
+	emptyRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(emptyRecorder, addExecAuth(httptest.NewRequest(http.MethodPost, "/exec/commands", bytes.NewBufferString(`{"source":"   "}`)), "secret"))
+	if emptyRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("empty status = %d body=%q, want 400", emptyRecorder.Code, emptyRecorder.Body.String())
+	}
+
+	cfg := config.Default()
+	cfg.SyncRoot = t.TempDir()
+	cfg.RemoteExecEnabled = true
+	cfg.RemoteExecToken = "secret"
+	cfg.RemoteExecMaxSourceBytes = 4
+	limitedHandler, _ := newTestHandlerWithConfig(t, cfg)
+	largeRecorder := httptest.NewRecorder()
+	limitedHandler.ServeHTTP(largeRecorder, addExecAuth(httptest.NewRequest(http.MethodPost, "/exec/commands", bytes.NewBufferString(`{"source":"print(1)"}`)), "secret"))
+	if largeRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("large status = %d body=%q, want 400", largeRecorder.Code, largeRecorder.Body.String())
+	}
+}
+
+func TestRemoteExecSubmitClaimAndDetail(t *testing.T) {
+	handler, _ := newRemoteExecTestHandler(t, true, "secret")
+	submitRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(submitRecorder, addExecAuth(httptest.NewRequest(http.MethodPost, "/exec/commands", bytes.NewBufferString(`{"source":"print(workspace.Name)","client":"cli","mode":"edit","timeout_sec":15}`)), "secret"))
+	if submitRecorder.Code != http.StatusOK {
+		t.Fatalf("submit status = %d body=%q, want 200", submitRecorder.Code, submitRecorder.Body.String())
+	}
+	submitPayload := decodeResponse(t, submitRecorder)
+	commandID, ok := submitPayload["command_id"].(string)
+	if !ok || !strings.HasPrefix(commandID, "cmd_") {
+		t.Fatalf("command_id = %#v, want cmd_ prefix", submitPayload["command_id"])
+	}
+
+	nextRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(nextRecorder, addExecAuth(httptest.NewRequest(http.MethodGet, "/exec/commands/next?client_id=studio&timeout=1", nil), "secret"))
+	if nextRecorder.Code != http.StatusOK {
+		t.Fatalf("next status = %d body=%q, want 200", nextRecorder.Code, nextRecorder.Body.String())
+	}
+	nextPayload := decodeResponse(t, nextRecorder)
+	command := nextPayload["command"].(map[string]any)
+	if command["id"] != commandID || command["source"] != "print(workspace.Name)" || command["timeout_sec"] != float64(15) {
+		t.Fatalf("claimed command = %#v", command)
+	}
+
+	cancelledContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	secondRecorder := httptest.NewRecorder()
+	secondRequest := addExecAuth(httptest.NewRequest(http.MethodGet, "/exec/commands/next?client_id=studio&timeout=60", nil).WithContext(cancelledContext), "secret")
+	handler.ServeHTTP(secondRecorder, secondRequest)
+	secondPayload := decodeResponse(t, secondRecorder)
+	if secondRecorder.Code != http.StatusOK || secondPayload["command"] != nil {
+		t.Fatalf("second claim status=%d payload=%#v, want command nil", secondRecorder.Code, secondPayload)
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(detailRecorder, addExecAuth(httptest.NewRequest(http.MethodGet, "/exec/commands/"+commandID, nil), "secret"))
+	if detailRecorder.Code != http.StatusOK {
+		t.Fatalf("detail status = %d body=%q, want 200", detailRecorder.Code, detailRecorder.Body.String())
+	}
+	detailPayload := decodeResponse(t, detailRecorder)
+	detail := detailPayload["command"].(map[string]any)
+	if detail["state"] != string(state.RemoteExecRunning) || detail["source"] != nil {
+		t.Fatalf("detail command = %#v, want running without source", detail)
+	}
+}
+
+func TestRemoteExecLongPollTimeoutReturnsNullCommand(t *testing.T) {
+	handler, _ := newRemoteExecTestHandler(t, true, "secret")
+	recorder := httptest.NewRecorder()
+	started := time.Now()
+	handler.ServeHTTP(recorder, addExecAuth(httptest.NewRequest(http.MethodGet, "/exec/commands/next?client_id=studio&timeout=1", nil), "secret"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%q, want 200", recorder.Code, recorder.Body.String())
+	}
+	if time.Since(started) < 900*time.Millisecond {
+		t.Fatalf("long poll returned too quickly: %v", time.Since(started))
+	}
+	payload := decodeResponse(t, recorder)
+	if payload["command"] != nil {
+		t.Fatalf("command = %#v, want nil", payload["command"])
+	}
+}
+
+func TestRemoteExecPostResultDoneAndError(t *testing.T) {
+	handler, _ := newRemoteExecTestHandler(t, true, "secret")
+
+	submit := func(source string) string {
+		t.Helper()
+		submitRecorder := httptest.NewRecorder()
+		handler.ServeHTTP(submitRecorder, addExecAuth(httptest.NewRequest(http.MethodPost, "/exec/commands", bytes.NewBufferString(`{"source":`+strconv.Quote(source)+`}`)), "secret"))
+		if submitRecorder.Code != http.StatusOK {
+			t.Fatalf("submit status = %d body=%q", submitRecorder.Code, submitRecorder.Body.String())
+		}
+		return decodeResponse(t, submitRecorder)["command_id"].(string)
+	}
+	claim := func() {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, addExecAuth(httptest.NewRequest(http.MethodGet, "/exec/commands/next?client_id=studio&timeout=1", nil), "secret"))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("claim status = %d body=%q", recorder.Code, recorder.Body.String())
+		}
+	}
+
+	okID := submit("print('ok')")
+	claim()
+	okBody := `{"command_id":"` + okID + `","client_id":"studio","ok":true,"duration_ms":12,"prints":[{"level":"print","text":"hello","at_ms":1}],"returns":["Workspace"],"error":"","traceback":""}`
+	okRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(okRecorder, addExecAuth(httptest.NewRequest(http.MethodPost, "/exec/commands/result", bytes.NewBufferString(okBody)), "secret"))
+	if okRecorder.Code != http.StatusOK {
+		t.Fatalf("ok result status = %d body=%q", okRecorder.Code, okRecorder.Body.String())
+	}
+
+	okDetailRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(okDetailRecorder, addExecAuth(httptest.NewRequest(http.MethodGet, "/exec/commands/"+okID, nil), "secret"))
+	okDetail := decodeResponse(t, okDetailRecorder)["command"].(map[string]any)
+	if okDetail["state"] != string(state.RemoteExecDone) || okDetail["ok"] != true || len(okDetail["prints"].([]any)) != 1 || okDetail["duration_ms"] != float64(12) {
+		t.Fatalf("ok detail = %#v", okDetail)
+	}
+
+	errID := submit("error('boom')")
+	claim()
+	errBody := `{"command_id":"` + errID + `","client_id":"studio","ok":false,"duration_ms":4,"prints":[],"returns":[],"error":"boom","traceback":"trace"}`
+	errRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(errRecorder, addExecAuth(httptest.NewRequest(http.MethodPost, "/exec/commands/result", bytes.NewBufferString(errBody)), "secret"))
+	if errRecorder.Code != http.StatusOK {
+		t.Fatalf("error result status = %d body=%q", errRecorder.Code, errRecorder.Body.String())
+	}
+	errDetailRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(errDetailRecorder, addExecAuth(httptest.NewRequest(http.MethodGet, "/exec/commands/"+errID, nil), "secret"))
+	errDetail := decodeResponse(t, errDetailRecorder)["command"].(map[string]any)
+	if errDetail["state"] != string(state.RemoteExecError) || errDetail["error"] != "boom" || errDetail["traceback"] != "trace" {
+		t.Fatalf("error detail = %#v", errDetail)
+	}
+
+	debugRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(debugRecorder, httptest.NewRequest(http.MethodGet, "/debug/state", nil))
+	debugPayload := decodeResponse(t, debugRecorder)
+	if debugPayload["remote_exec_completed_count"] != float64(1) || debugPayload["remote_exec_error_count"] != float64(1) || debugPayload["remote_exec_last_result_status"] != string(state.RemoteExecError) {
+		t.Fatalf("debug payload = %#v", debugPayload)
+	}
+}
+
+func TestRemoteExecMissingResultAndDetailReturn404(t *testing.T) {
+	handler, _ := newRemoteExecTestHandler(t, true, "secret")
+
+	resultRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(resultRecorder, addExecAuth(httptest.NewRequest(http.MethodPost, "/exec/commands/result", bytes.NewBufferString(`{"command_id":"cmd_missing","ok":true}`)), "secret"))
+	if resultRecorder.Code != http.StatusNotFound {
+		t.Fatalf("result status = %d body=%q, want 404", resultRecorder.Code, resultRecorder.Body.String())
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(detailRecorder, addExecAuth(httptest.NewRequest(http.MethodGet, "/exec/commands/cmd_missing", nil), "secret"))
+	if detailRecorder.Code != http.StatusNotFound {
+		t.Fatalf("detail status = %d body=%q, want 404", detailRecorder.Code, detailRecorder.Body.String())
 	}
 }
 
@@ -675,6 +891,17 @@ func TestBootstrapReplacePreservesGitAndDeletesOthers(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, config.MetadataDir), 0o755); err != nil {
 		t.Fatalf("mkdir metadata: %v", err)
 	}
+	guidebookPath := filepath.Join(root, config.GuidebookDir, "README.md")
+	if err := os.MkdirAll(filepath.Dir(guidebookPath), 0o755); err != nil {
+		t.Fatalf("mkdir guidebook: %v", err)
+	}
+	if err := os.WriteFile(guidebookPath, []byte("custom guide"), 0o644); err != nil {
+		t.Fatalf("write guidebook: %v", err)
+	}
+	launcherPath := filepath.Join(root, config.GuidebookDir, config.GuidebookExecLauncher)
+	if err := os.WriteFile(launcherPath, []byte("custom launcher"), 0o644); err != nil {
+		t.Fatalf("write launcher: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(root, "old.txt"), []byte("old"), 0o644); err != nil {
 		t.Fatalf("write old: %v", err)
 	}
@@ -691,6 +918,21 @@ func TestBootstrapReplacePreservesGitAndDeletesOthers(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, config.MetadataDir)); err != nil {
 		t.Fatalf("metadata missing after replace: %v", err)
+	}
+	if body, err := os.ReadFile(guidebookPath); err != nil {
+		t.Fatalf("guidebook missing after replace: %v", err)
+	} else if string(body) != "custom guide" {
+		t.Fatalf("guidebook overwritten = %q", string(body))
+	}
+	if body, err := os.ReadFile(launcherPath); err != nil {
+		t.Fatalf("launcher missing after replace: %v", err)
+	} else if string(body) != "custom launcher" {
+		t.Fatalf("launcher overwritten = %q", string(body))
+	}
+	for _, dir := range config.BootstrapServiceDirs {
+		if info, err := os.Stat(filepath.Join(root, dir)); err != nil || !info.IsDir() {
+			t.Fatalf("service dir %s missing or not dir: info=%#v err=%v", dir, info, err)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(root, "old.txt")); !os.IsNotExist(err) {
 		t.Fatalf("old.txt still exists or unexpected err: %v", err)

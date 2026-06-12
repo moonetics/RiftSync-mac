@@ -36,6 +36,7 @@ func TestScanScriptsAndUITree(t *testing.T) {
 	writeFile(t, root, "StarterGui/Main.ScreenGui/properties.init.json", `{"properties":{"ResetOnSpawn":false}}`)
 	writeFile(t, root, ".git/ignored.server.luau", "print('ignore')")
 	writeFile(t, root, ".rblxsync/history.server.luau", "print('ignore')")
+	writeFile(t, root, ".guidebook/ignored.server.luau", "print('ignore')")
 
 	snapshot, err := Scan(testConfig(t, root))
 	if err != nil {
@@ -46,6 +47,63 @@ func TestScanScriptsAndUITree(t *testing.T) {
 	}
 	if snapshot.ScriptCount != 1 || snapshot.UICount != 1 {
 		t.Fatalf("counts script=%d ui=%d, want 1/1", snapshot.ScriptCount, snapshot.UICount)
+	}
+}
+
+func TestScanScriptPropertiesMergeIntoScriptRecord(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "ServerScriptService/Foo.Script/Foo.server.luau", "print('hi')")
+	writeFile(t, root, "ServerScriptService/Foo.Script/properties.init.json", `{"properties":{"Disabled":true}}`)
+
+	snapshot, err := Scan(testConfig(t, root))
+	if err != nil {
+		t.Fatalf("Scan returned error: %v", err)
+	}
+	if len(snapshot.Records) != 1 {
+		t.Fatalf("record count = %d, want 1 (%#v)", len(snapshot.Records), snapshot.Records)
+	}
+	record, ok := snapshot.Records["ServerScriptService/Foo.Script/Foo.server.luau"]
+	if !ok {
+		t.Fatalf("records = %#v, want script source local_path", snapshot.Records)
+	}
+	if record.Entity != records.EntityScript || record.RbxPath != "game.ServerScriptService.Foo" {
+		t.Fatalf("record = %#v, want script record", record)
+	}
+	properties, ok := record.Payload["properties"].(map[string]any)
+	if !ok || properties["Disabled"] != true {
+		t.Fatalf("payload = %#v, want Disabled true", record.Payload)
+	}
+	upsert := record.ToUpsert()
+	if upsert["payload"] == nil {
+		t.Fatalf("upsert = %#v, want script payload", upsert)
+	}
+}
+
+func TestScanScriptPropertiesChangeUpdatesHash(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "ServerScriptService/Foo.Script/Foo.server.luau", "print('hi')")
+	writeFile(t, root, "ServerScriptService/Foo.Script/properties.init.json", `{"properties":{"Disabled":true}}`)
+	cfg := testConfig(t, root)
+	cache := NewCache()
+
+	first, err := cache.Scan(cfg)
+	if err != nil {
+		t.Fatalf("first Scan returned error: %v", err)
+	}
+	firstRecord := first.Records["ServerScriptService/Foo.Script/Foo.server.luau"]
+
+	writeFile(t, root, "ServerScriptService/Foo.Script/properties.init.json", `{"properties":{"Disabled":false}}`)
+	second, err := cache.Scan(cfg)
+	if err != nil {
+		t.Fatalf("second Scan returned error: %v", err)
+	}
+	secondRecord := second.Records["ServerScriptService/Foo.Script/Foo.server.luau"]
+	if firstRecord.ContentHash == secondRecord.ContentHash {
+		t.Fatalf("ContentHash did not change after script properties edit: %q", firstRecord.ContentHash)
+	}
+	properties, ok := secondRecord.Payload["properties"].(map[string]any)
+	if !ok || properties["Disabled"] != false {
+		t.Fatalf("payload = %#v, want Disabled false", secondRecord.Payload)
 	}
 }
 

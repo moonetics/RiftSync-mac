@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------------------
--- RiftSyncPlugin v3.0.0
+-- RiftSyncPlugin v3.2.0
 -- One-way sync plugin: local folder -> Roblox Studio
 --------------------------------------------------------------------------------------------
 
@@ -61,7 +61,7 @@ local function getModeLabelText(value)
 end
 
 local toolbar = plugin:CreateToolbar("RiftSync")
-local toolbarButton = toolbar:CreateButton("Sync", "Open RiftSync Studio", "", "RiftSync")
+local toolbarButton = toolbar:CreateButton("Sync", "Open RiftSync Studio", tostring(TypeList.PLUGIN_ICON or ""), "RiftSync")
 
 local widgetInfo = DockWidgetPluginGuiInfo.new(
 	Enum.InitialDockState.Float,
@@ -333,8 +333,49 @@ debugToggleButton.Parent = debugBox
 applyCorner(debugToggleButton, 8)
 debugToggleButton.BackgroundColor3 = COLORS.DebugOff
 
+local execFrame = makePanel(card, 58, COLORS.PanelSoft, 3)
+execFrame.Position = UDim2.new(0, 0, 0, 146)
+
+local execTitleLabel = makeText(execFrame, "Exec Token", 11, COLORS.Muted, Enum.Font.GothamMedium, 1)
+execTitleLabel.Size = UDim2.new(0, 86, 0, 18)
+execTitleLabel.Position = UDim2.new(0, 10, 0, 7)
+
+local execStatusLabel = makeText(execFrame, "Exec disabled", 11, COLORS.DebugMuted, Enum.Font.GothamMedium, 2)
+execStatusLabel.Size = UDim2.new(1, -106, 0, 18)
+execStatusLabel.Position = UDim2.new(0, 96, 0, 7)
+execStatusLabel.TextXAlignment = Enum.TextXAlignment.Right
+
+local execTokenInput = Instance.new("TextBox")
+execTokenInput.Size = UDim2.new(1, -124, 0, 28)
+execTokenInput.Position = UDim2.new(0, 10, 0, 25)
+execTokenInput.BackgroundColor3 = COLORS.InputBg
+execTokenInput.BorderSizePixel = 0
+execTokenInput.TextColor3 = COLORS.Text
+execTokenInput.PlaceholderText = "remote_exec_token"
+execTokenInput.PlaceholderColor3 = COLORS.DebugMuted
+execTokenInput.ClearTextOnFocus = false
+execTokenInput.TextXAlignment = Enum.TextXAlignment.Left
+execTokenInput.Font = Enum.Font.Code
+execTokenInput.TextSize = 11
+execTokenInput.Text = ""
+execTokenInput.Parent = execFrame
+applyCorner(execTokenInput, 8)
+applyStroke(execTokenInput, COLORS.InputBorder, 1)
+
+local execToggleButton = Instance.new("TextButton")
+execToggleButton.Size = UDim2.new(0, 88, 0, 28)
+execToggleButton.Position = UDim2.new(1, -98, 0, 25)
+execToggleButton.BorderSizePixel = 0
+execToggleButton.TextColor3 = COLORS.ButtonText
+execToggleButton.Font = Enum.Font.GothamBold
+execToggleButton.TextSize = 11
+execToggleButton.Text = "Exec OFF"
+execToggleButton.BackgroundColor3 = COLORS.DebugOff
+execToggleButton.Parent = execFrame
+applyCorner(execToggleButton, 8)
+
 local statusFrame = makePanel(card, 198, COLORS.StatusBg, 3)
-statusFrame.Position = UDim2.new(0, 0, 0, 146)
+statusFrame.Position = UDim2.new(0, 0, 0, 216)
 statusFrame.Size = UDim2.new(1, 0, 0, 68)
 
 local statusTopRow = Instance.new("Frame")
@@ -477,7 +518,7 @@ debugEventsLabel.TextYAlignment = Enum.TextYAlignment.Top
 
 local buttonRow = Instance.new("Frame")
 buttonRow.Size = UDim2.new(1, 0, 0, 42)
-buttonRow.Position = UDim2.new(0, 0, 0, 230)
+buttonRow.Position = UDim2.new(0, 0, 0, 300)
 buttonRow.BackgroundTransparency = 1
 buttonRow.LayoutOrder = 6
 buttonRow.Parent = card
@@ -508,13 +549,14 @@ stopButton.Parent = buttonRow
 styleButton(stopButton, COLORS.Stop, COLORS.ButtonMutedText)
 
 local function applyAdaptivePanelLayout(debugEnabled)
-	statusFrame.Position = UDim2.new(0, 0, 0, 146)
+	execFrame.Position = UDim2.new(0, 0, 0, 146)
+	statusFrame.Position = UDim2.new(0, 0, 0, 216)
 	statusFrame.Size = UDim2.new(1, 0, 0, 68)
 	historyPanel.Visible = false
 	metaFrame.Visible = false
 	debugFrame.Visible = false
 	debugFrame.Size = UDim2.new(1, 0, 0, 0)
-	buttonRow.Position = UDim2.new(0, 0, 0, 230)
+	buttonRow.Position = UDim2.new(0, 0, 0, 300)
 end
 
 applyAdaptivePanelLayout(false)
@@ -533,6 +575,35 @@ local revisionSummaries = {}
 local selectedRevision = nil
 local historyRefreshBusy = false
 local client = nil
+
+local function updateExecUi(statusOverride)
+	local enabled = false
+	local statusText = tostring(statusOverride or "Exec disabled")
+	if client then
+		if client.isRemoteExecEnabled then
+			enabled = client:isRemoteExecEnabled()
+		end
+		if not statusOverride and client.getRemoteExecStatus then
+			statusText = tostring(client:getRemoteExecStatus())
+		end
+	end
+
+	execToggleButton.Text = enabled and "Exec ON" or "Exec OFF"
+	execToggleButton.BackgroundColor3 = enabled and COLORS.DebugOn or COLORS.DebugOff
+	execToggleButton.TextColor3 = enabled and COLORS.ButtonText or COLORS.ButtonMutedText
+	execStatusLabel.Text = statusText
+
+	local lowerStatus = string.lower(statusText)
+	if string.find(lowerStatus, "error", 1, true) then
+		execStatusLabel.TextColor3 = COLORS.StatusError
+	elseif enabled and string.find(lowerStatus, "running", 1, true) then
+		execStatusLabel.TextColor3 = COLORS.StatusSync
+	elseif enabled then
+		execStatusLabel.TextColor3 = COLORS.StatusGood
+	else
+		execStatusLabel.TextColor3 = COLORS.DebugMuted
+	end
+end
 
 local function compactStatusText(textValue)
 	if #textValue <= MAX_STATUS_LENGTH then
@@ -1053,6 +1124,12 @@ local function updateDebugPanel(payload)
 	updateDebugToggleUi(enabled)
 	updateHealthPanel(payload)
 	applyAdaptivePanelLayout(enabled)
+	local execStats = typeof(payload) == "table" and typeof(payload.stats) == "table" and payload.stats or nil
+	if execStats and execStats.remote_exec_status then
+		updateExecUi(tostring(execStats.remote_exec_status))
+	else
+		updateExecUi()
+	end
 
 	if not enabled then
 		debugChecklistLabel.Text = "[ ] Handshake  [ ] Snapshot  [ ] Poll  [ ] Delta\n[ ] ACK Sent  [ ] ACK OK"
@@ -1137,6 +1214,9 @@ do
 	local host, port = client:getConnection()
 	hostInput.Text = safeHostText(host)
 	portInput.Text = tostring(safePortNumber(port))
+	if client.getRemoteExecToken then
+		execTokenInput.Text = tostring(client:getRemoteExecToken())
+	end
 	currentStartMode = START_MODES.FolderToStudio
 	if client.setStartMode then
 		client:setStartMode(currentStartMode)
@@ -1147,6 +1227,7 @@ do
 		updateDebugToggleUi(debugEnabled)
 		applyAdaptivePanelLayout(debugEnabled)
 	end
+	updateExecUi()
 	showLocalHistory()
 	populateHistoryDropdown()
 end
@@ -1176,12 +1257,14 @@ startButton.MouseButton1Click:Connect(function()
 	if not ok then
 		updateStatus(tostring(err), true)
 	else
+		updateExecUi()
 		refreshRevisionHistory(false)
 	end
 end)
 
 stopButton.MouseButton1Click:Connect(function()
 	client:stop()
+	updateExecUi()
 end)
 
 snapshotButton.MouseButton1Click:Connect(function()
@@ -1222,6 +1305,30 @@ debugToggleButton.MouseButton1Click:Connect(function()
 		client:refreshServerDebugState(true)
 		refreshRevisionHistory(false)
 	end
+end)
+
+execTokenInput.FocusLost:Connect(function()
+	if client and client.setRemoteExecToken then
+		client:setRemoteExecToken(execTokenInput.Text)
+	end
+	updateExecUi()
+end)
+
+execToggleButton.MouseButton1Click:Connect(function()
+	if not client then
+		return
+	end
+	if client.setRemoteExecToken then
+		client:setRemoteExecToken(execTokenInput.Text)
+	end
+	local enabled = false
+	if client.isRemoteExecEnabled then
+		enabled = client:isRemoteExecEnabled()
+	end
+	if client.setRemoteExecEnabled then
+		client:setRemoteExecEnabled(not enabled)
+	end
+	updateExecUi()
 end)
 
 if plugin.Unloading then

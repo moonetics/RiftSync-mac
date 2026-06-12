@@ -209,6 +209,25 @@ func (s *Service) processBatch(batch map[string]fsnotify.Op) {
 			s.removeWatchesUnder(absPath)
 			s.cache.InvalidateSubtree(relPosix)
 			removeUnder(nextRecords, relPosix)
+			if sourcePath, ok, pathErr := records.ScriptSourcePathForPropertiesPath(relPosix); pathErr == nil && ok {
+				s.cache.Invalidate(sourcePath)
+				result := s.cache.ParseRelativeFile(s.cfg, sourcePath)
+				if result.CacheHit {
+					cacheHits++
+				} else {
+					cacheMisses++
+				}
+				if result.Warning != "" {
+					warnings = append(warnings, result.Warning)
+				}
+				if result.InvalidPath != "" {
+					invalidPaths = append(invalidPaths, result.InvalidPath)
+				}
+				delete(nextRecords, sourcePath)
+				if result.Record != nil {
+					nextRecords[result.Record.LocalPath] = *result.Record
+				}
+			}
 			continue
 		}
 		if err != nil {
@@ -264,7 +283,7 @@ func (s *Service) SyncTree() (SyncResult, error) {
 		if !entry.IsDir() {
 			return nil
 		}
-		if entry.Name() == ".git" || entry.Name() == config.MetadataDir {
+		if entry.Name() == ".git" || entry.Name() == config.MetadataDir || entry.Name() == config.GuidebookDir {
 			return filepath.SkipDir
 		}
 		if s.isIgnored(absPath) {
@@ -326,7 +345,7 @@ func (s *Service) addRecursive(root string) (int, error) {
 		if !entry.IsDir() {
 			return nil
 		}
-		if entry.Name() == ".git" || entry.Name() == config.MetadataDir {
+		if entry.Name() == ".git" || entry.Name() == config.MetadataDir || entry.Name() == config.GuidebookDir {
 			return filepath.SkipDir
 		}
 		if s.isIgnored(absPath) {
@@ -400,12 +419,13 @@ func (s *Service) isIgnored(absPath string) bool {
 		return true
 	}
 	if rel == ".git" || strings.HasPrefix(rel, ".git"+string(os.PathSeparator)) ||
-		rel == config.MetadataDir || strings.HasPrefix(rel, config.MetadataDir+string(os.PathSeparator)) {
+		rel == config.MetadataDir || strings.HasPrefix(rel, config.MetadataDir+string(os.PathSeparator)) ||
+		rel == config.GuidebookDir || strings.HasPrefix(rel, config.GuidebookDir+string(os.PathSeparator)) {
 		return true
 	}
 	parts := strings.Split(rel, string(os.PathSeparator))
 	for _, part := range parts {
-		if part == ".git" || part == config.MetadataDir {
+		if part == ".git" || part == config.MetadataDir || part == config.GuidebookDir {
 			return true
 		}
 	}
