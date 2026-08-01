@@ -180,15 +180,29 @@ Script properties example:
 ~~~json
 {
   "properties": {
-    "Disabled": true
+    "Enabled": false,
+    "RunContext": {
+      "$type": "Enum",
+      "enumType": "RunContext",
+      "value": "Server"
+    }
   }
 }
 ~~~
 
 Notes:
 
-- Disabled is supported for Script and LocalScript.
+- Enabled is canonical for Script and LocalScript. Legacy Disabled is accepted on import; Enabled wins when both exist.
 - Source belongs in the .server.luau/.client.luau/.module.luau file, not in properties.init.json.
+
+Broad properties metadata (4.1):
+- Studio -> Folder scans every descendant under managed_roots and writes safe persistent properties, attributes, and tags for supported non-geometry classes.
+- Supported families include script, ValueBase, Workspace/Terrain/Lighting effects, UI, remotes/bindables, audio, animation, visual effects, prompts, tools, attachments, and constraints.
+- BasePart and Model remain path anchors only. Their supported descendants are synced, but geometry never receives metadata or automatic create/delete ownership.
+- A missing BasePart/Model ancestor is reported as parent-missing; RiftSync does not create replacement geometry.
+- Root services and Terrain are update-only. Terrain voxel data, Source, runtime state, and protected/read-only properties are excluded.
+- Instance references use {"$type":"InstanceRef","stableId":"...","path":"game.Workspace.Target"}; nil uses {"$type":"InstanceRef","null":true}.
+- InstanceRef resolution uses stable ID first and path second. Use plugin and server 4.1 together for projects containing references.
 
 UI/model metadata:
 
@@ -205,11 +219,12 @@ Example UI tree:
 ## Normal Sync Workflow
 
 1. Start the RiftSync app or server.
-2. Start the RiftSync Studio plugin and connect to the same host/port.
-3. Edit files under the sync root.
-4. RiftSync detects create/update/delete/rename/move changes and applies them to Studio.
-5. Use Resync if Studio needs a fresh local-to-Studio snapshot.
-6. Use Pull Studio when Studio should mirror back into the local folder.
+2. In the multi-instance app, select the intended project and Start it. Multiple projects may run concurrently on different ports.
+3. In Studio, choose the saved connection profile for this Place. Its host, port, and Exec token must match the selected desktop project.
+4. Edit files under the sync root.
+5. RiftSync detects create/update/delete/rename/move changes and applies them to Studio.
+6. Use Resync if Studio needs a fresh local-to-Studio snapshot.
+7. Use Pull Studio when Studio should mirror back into the local folder.
 
 Important rules:
 
@@ -263,10 +278,10 @@ The .guidebook/riftsync-exec.ps1 launcher is generated for this machine. It poin
 
 Remote Exec history:
 
-- CLI and app console commands are stored in .rblxsync/exec-history.json.
+- CLI and app console commands are stored in the selected project's .rblxsync/exec-history.json.
 - History is local-only and stores full source so rerun works even for inline/stdin/app commands.
 - The latest command can be rerun with .\.guidebook\riftsync-exec.ps1 --last.
-- The desktop app has an Exec tab for paste/run output, recent reruns, and a readonly token field to copy into the Studio plugin.
+- The desktop app has an Exec tab for paste/run output, recent reruns, a readonly View modal, and a token field to copy into the matching Studio profile.
 
 Direct fallback:
 

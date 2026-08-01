@@ -107,6 +107,70 @@ func TestScanScriptPropertiesChangeUpdatesHash(t *testing.T) {
 	}
 }
 
+func TestScanCanonicalEnabledAndNestedBroadMetadata(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "Workspace/Map.Model/Trigger.Part/Runner.Script/Runner.server.luau", "print('nested')")
+	writeFile(t, root, "Workspace/Map.Model/Trigger.Part/Runner.Script/properties.init.json", `{"properties":{"Enabled":false,"RunContext":{"$type":"Enum","enumType":"RunContext","value":"Server"}}}`)
+	writeFile(t, root, "Workspace/Map.Model/Trigger.Part/Counter.IntValue/properties.init.json", `{"id":"counter","className":"IntValue","name":"Counter","properties":{"Value":12},"attributes":{"Unit":"rounds"},"tags":["state"]}`)
+
+	snapshot, err := Scan(testConfig(t, root))
+	if err != nil {
+		t.Fatalf("Scan returned error: %v", err)
+	}
+	if snapshot.ScriptCount != 1 || snapshot.UICount != 1 {
+		t.Fatalf("counts script=%d metadata=%d, want 1/1", snapshot.ScriptCount, snapshot.UICount)
+	}
+	scriptRecord, ok := snapshot.Records["Workspace/Map.Model/Trigger.Part/Runner.Script/Runner.server.luau"]
+	if !ok {
+		t.Fatalf("script record missing: %#v", snapshot.Records)
+	}
+	properties := scriptRecord.Payload["properties"].(map[string]any)
+	if properties["Enabled"] != false {
+		t.Fatalf("script properties = %#v, want canonical Enabled false", properties)
+	}
+	valueRecord, ok := snapshot.Records["Workspace/Map.Model/Trigger.Part/Counter.IntValue/properties.init.json"]
+	if !ok || valueRecord.RbxPath != "game.Workspace.Map.Trigger.Counter" || valueRecord.ClassName != "IntValue" {
+		t.Fatalf("value record = %#v", valueRecord)
+	}
+}
+
+func TestDeletingScriptMetadataKeepsSourceOwnedScript(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := "ServerScriptService/Foo.Script/Foo.server.luau"
+	metadataPath := "ServerScriptService/Foo.Script/properties.init.json"
+	writeFile(t, root, sourcePath, "print('still owned by source')")
+	writeFile(t, root, metadataPath, `{"properties":{"Enabled":false}}`)
+	cfg := testConfig(t, root)
+	cache := NewCache()
+
+	withMetadata, err := cache.Scan(cfg)
+	if err != nil {
+		t.Fatalf("scan with metadata: %v", err)
+	}
+	before := withMetadata.Records[sourcePath]
+	if before.Payload == nil {
+		t.Fatal("script payload missing before metadata deletion")
+	}
+	if err := os.Remove(filepath.Join(root, filepath.FromSlash(metadataPath))); err != nil {
+		t.Fatalf("remove metadata: %v", err)
+	}
+
+	withoutMetadata, err := cache.Scan(cfg)
+	if err != nil {
+		t.Fatalf("scan without metadata: %v", err)
+	}
+	after, ok := withoutMetadata.Records[sourcePath]
+	if !ok || after.Entity != records.EntityScript {
+		t.Fatalf("source-owned script disappeared: %#v", withoutMetadata.Records)
+	}
+	if after.Payload != nil {
+		t.Fatalf("stale metadata remained after delete: %#v", after.Payload)
+	}
+	if before.ContentHash == after.ContentHash {
+		t.Fatal("metadata deletion did not change script content hash")
+	}
+}
+
 func TestScanInvalidJSONWarning(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "StarterGui/Main.ScreenGui/properties.init.json", `{"className":`)

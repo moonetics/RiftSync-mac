@@ -1,6 +1,6 @@
 # RiftSync Plugin (One-Way + Properties Tree)
 
-Versi: `3.9.0`
+Versi: `4.1.0`
 Protocol sync: `rbxsync/2.0.0`
 
 One-way sync untuk Roblox Studio:
@@ -51,7 +51,7 @@ Dokumen itu menjelaskan format `init.meta.json`, `*.model.json`, typed values se
   - `<Name>.server.luau` -> `Script`
   - `<Name>.client.luau` -> `LocalScript`
   - `<Name>.module.luau` -> `ModuleScript`
-- `properties.init.json` -> metadata + properti instance (folder-per-instance), termasuk `Disabled` untuk `Script` dan `LocalScript`
+- `properties.init.json` -> metadata + properti persistent yang aman untuk script, ValueBase, environment, UI, audio/effect, attachment/constraint, dan instance non-geometry lain.
 - Legacy script format (`source.*.luau`, `*.server.lua`, `*.client.lua`, `*.module.lua`) masih dibaca untuk kompatibilitas migrasi.
 
 Aturan penamaan:
@@ -79,12 +79,17 @@ ServerScriptService/
 ```json
 {
   "properties": {
-    "Disabled": true
+    "Enabled": false,
+    "RunContext": {
+      "$type": "Enum",
+      "enumType": "RunContext",
+      "value": "Server"
+    }
   }
 }
 ```
 
-Saat `Disabled` diubah ke `false`, RiftSync mengirim delta untuk meng-enable script di Studio. `Source` tetap ditulis di file `.server.luau`/`.client.luau`/`.module.luau`, bukan di `properties.init.json`.
+`Enabled` adalah property canonical untuk `Script` dan `LocalScript`; metadata lama dengan `Disabled` tetap diterima saat import. Jika keduanya ada, `Enabled` menang. `Source` tetap ditulis di file `.server.luau`/`.client.luau`/`.module.luau`, bukan di `properties.init.json`.
 
 ### Format Folder UI
 
@@ -108,6 +113,30 @@ StarterGui/
 - `properties` (typed JSON, contoh `UDim2`, `Color3`, `Enum`, dst)
 - `attributes`
 - `tags`
+
+### Broad Properties Metadata (4.1)
+
+Saat menjalankan `Studio -> Folder`, RiftSync 4.1 menelusuri seluruh descendant dari `managed_roots` dan membuat metadata untuk class non-geometry yang aman. Cakupannya meliputi script; seluruh concrete `ValueBase`; Workspace/Terrain/Lighting dan effect; UI; Folder/Configuration/remotes/bindables; Sound/SoundEffect/audio node; Animation; particle/beam/trail/highlight/light/decal/texture/mesh modifier; prompt/detector/tool; attachment; serta concrete Constraint.
+
+`BasePart` dan `Model` tetap dipakai sebagai segmen path, tetapi tidak memperoleh `properties.init.json` dan tidak menjadi milik RiftSync. Contoh berikut tetap mengekspor `Health.IntValue`:
+
+```text
+Workspace/Map.Model/Trigger.Part/Health.IntValue/properties.init.json
+```
+
+Jika ancestor `Map` atau `Trigger` tidak ada saat `Folder -> Studio`, RiftSync melaporkan parent-missing dan tidak membuat geometry pengganti. Root service dan `Terrain` juga hanya dapat di-update, tidak dibuat, di-rename, atau dihapus. Voxel Terrain, Camera/runtime character, Player, joint/Motor6D, `Source`, serta state runtime/read-only tidak ikut metadata.
+
+Reference antar-instance, misalnya `ObjectValue.Value`, disimpan sebagai typed value:
+
+```json
+{
+  "$type": "InstanceRef",
+  "stableId": "stable-guid",
+  "path": "game.Workspace.Map.Target"
+}
+```
+
+Nil reference ditulis sebagai `{ "$type": "InstanceRef", "null": true }`. Saat apply, RiftSync mencari stable ID terlebih dahulu lalu path; reference non-null yang tidak ditemukan menjadi sync error. Plugin dan server 4.1 sebaiknya digunakan bersama untuk project yang memakai `InstanceRef`.
 
 ### Format UI Rojo-Like (`init.meta.json` + `.model.json`)
 
@@ -259,7 +288,7 @@ Contoh minimal:
 Go app adalah workflow recommended. Ada dua executable:
 
 - `riftsync.exe`: app launcher untuk double-click. Ini membuka window app embedded WebView2 dan tidak menampilkan console.
-- `riftsync-server.exe`: console/headless/debug mode untuk terminal.
+- `riftsync-server.exe`: console server untuk terminal. Secara default menampilkan startup, event sync/Studio/Remote Exec/Git, heartbeat status, error, dan shutdown; tambahkan `--debug` untuk metrics scan/cache/payload yang lebih detail.
 
 Build keduanya dari root project:
 
@@ -289,12 +318,22 @@ Untuk pemakaian normal, jalankan:
 .\riftsync.exe
 ```
 
-Window app `RiftSync` akan terbuka memakai embedded WebView2, bukan tab browser eksternal. Server berada dalam kondisi stopped sampai kamu klik **Start**. Tombol **Change Path** membuka input manual untuk mengganti `sync_root`; tidak ada folder picker supaya tetap ringan di laptop low-end.
+Window app `RiftSync` akan terbuka pada ukuran default **1280×720** memakai embedded WebView2, bukan tab browser eksternal. Semua project dimuat dalam kondisi stopped sampai kamu klik **Start** pada project terkait atau **Start All**.
 
-Untuk debug/automation dari terminal:
+### Multi-Instance
+
+- Daftar project disimpan di `%AppData%\RiftSync\instances.json`; file ini hanya menyimpan ID, nama tampilan, config path, project aktif, dan preferensi sidebar.
+- `sync_config.json` tetap terpisah per project sehingga CLI, headless server, guidebook, dan endpoint Studio lama tetap kompatibel.
+- Config project baru dibuat di `<sync_root>/.rblxsync/sync_config.json`, dengan port lokal kosong mulai `8765` dan token Remote Exec tersendiri.
+- Config yang diberikan lewat `--config` di-import sebagai project pertama tanpa ditulis ulang saat migrasi.
+- Project dapat berjalan bersamaan. Setiap project memiliki runner, watcher, port, status, history, dan antrean Remote Exec sendiri.
+- Menghapus project dari sidebar hanya menghapus entry registry; folder, config, history, dan file game tidak dihapus.
+- Sidebar normalnya berupa rail ikon dan melebar saat hover/focus. Tombol pin mempertahankan sidebar dalam keadaan terbuka.
+
+Untuk menjalankan server langsung dari terminal dengan live log:
 
 ```powershell
-.\riftsync-server.exe --headless
+.\riftsync-server.exe
 ```
 
 Untuk validasi project tanpa menjalankan server:
@@ -322,7 +361,7 @@ return part.Name
 
 Remote Exec membutuhkan `"remote_exec_enabled": true` dan `"remote_exec_token": "..."` di config lokal. App akan generate token 32 karakter jika token belum ada, lalu menampilkannya sebagai readonly field di tab `Exec` supaya bisa dicopy ke field `Exec Token` di Studio plugin. CLI membaca token itu dan mengirim `Authorization: Bearer <token>` ke server. Launcher `.guidebook/riftsync-exec.ps1` auto-generated per mesin dan meneruskan argumen ke `riftsync-server.exe --config <config> exec`. Jika argumen pertama berakhiran `.lua` atau `.luau`, launcher/CLI membacanya sebagai file source sehingga script command bar bisa disimpan dan dirawat seperti file biasa. Subcommand `exec` hanya menghubungi server yang sudah berjalan; ia tidak menyalakan server baru. Gunakan `--json` untuk output terstruktur atau `--raw` untuk output plain tanpa label.
 
-Setiap command Remote Exec dari CLI dan tab Exec app dicatat ke `.rblxsync/exec-history.json`. History ini local-only, menyimpan source penuh untuk rerun, dan otomatis dibatasi ke 100 entry terbaru. Jalankan ulang command terakhir dengan:
+Setiap command Remote Exec dari CLI dan tab Exec app dicatat ke `.rblxsync/exec-history.json` milik project terkait. History ini local-only, menyimpan source penuh dan detail hasil untuk View/rerun, dan otomatis dibatasi ke 100 entry terbaru. Jalankan ulang command terakhir dengan:
 
 ```powershell
 .\riftsync-server.exe --config .\sync_config.json exec --last
@@ -343,9 +382,9 @@ Fallback langsung jika tidak berada di `sync_root`:
 
 Manual test Studio Remote Exec:
 
-1. Jalankan `.\riftsync.exe`; token akan muncul di tab `Exec` sebagai readonly `Exec Token`.
+1. Jalankan `.\riftsync.exe`, pilih project, lalu Start; token akan muncul di tab `Exec`.
 2. Copy token dari app.
-3. Di widget RiftSync Studio, paste token ke field `Exec Token`.
+3. Di widget RiftSync Studio, buat/pilih connection profile bernama, isi host, port, dan token project, lalu Save Profile. Profil aktif diingat per Roblox Place.
 4. Klik `Start Sync`, lalu toggle `Exec ON`. Fresh session selalu mulai dari `Exec OFF`.
 5. Jalankan inline command:
 
@@ -394,16 +433,19 @@ Flag opsional:
 - `--host`: bind host lokal, hanya `127.0.0.1` atau `localhost`.
 - `--port`: override port dari config.
 - `--sync-root`: override folder sinkronisasi dari config.
-- `--debug`: print detail startup, scan warning, Git/watcher status, dan shutdown.
+- `--debug`: tambahkan heartbeat cepat serta detail scan, cache, payload, Git/watcher, dan error ke live log `riftsync-server.exe`.
 - `--legacy-scan`: fallback periodic scan Go jika watcher event filesystem bermasalah.
-- `--headless`: hanya tersedia di `riftsync-server.exe`, menjalankan server console tanpa UI untuk automation.
+- `--headless`: alias kompatibilitas pada `riftsync-server.exe`; console/headless sekarang sudah menjadi mode default.
 
-App UI lokal memakai layout tab tanpa scroll halaman utama:
+App UI lokal memakai dark subtle glassmorphism untuk shell dan panel utama, dipadukan dengan kontrol flat berkontras tinggi:
 
-- `Overview`: status, sync root, indexed counts, health, Git, dan quick actions.
+- Sidebar project: pindah project, melihat status ring, Add Project, Start All, hover-expand, dan pin.
+- `Overview`: status, sync root, tiga metric utama, aktivitas terakhir, dan Diagnostics yang dapat dibuka saat diperlukan.
 - `History`: revision list + detail viewer dengan scroll internal.
-- `Exec`: paste/run Remote Exec Luau, output, dan recent rerun.
-- `Config`: config path, sync root, host, port, Git/debug/legacy scan, dan Save & Restart.
+- `Exec`: paste/run Remote Exec Luau, output, recent rerun, dan View read-only untuk source/result penuh.
+- `Config`: Project dan Connection sebagai pengaturan utama; config path dan debug berada di Advanced, sedangkan remove registry tetap non-destruktif.
+
+Semua panel membatasi kontennya sendiri. Path, error, atau command panjang di-wrap/ellipsis dan list memiliki internal scroll sehingga tidak memperlebar window. Tabs, sidebar, disclosures, dan modal dapat digunakan dengan keyboard; status selalu memiliki teks selain warna, dan animasi mengikuti preferensi reduced motion sistem.
 
 Header app custom menggantikan title bar Windows bila frameless mode berhasil. Jika Win32 frameless gagal di mesin tertentu, app tetap jalan dengan title bar normal.
 

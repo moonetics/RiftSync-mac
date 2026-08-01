@@ -687,6 +687,40 @@ func TestBootstrapValidation(t *testing.T) {
 	}
 }
 
+func TestNormalizeBootstrapMetadataJSONDeterministically(t *testing.T) {
+	first := `{"tags":["state"],"properties":{"Value":{"path":"game.Workspace.Target","$type":"InstanceRef","stableId":"target"}},"name":"TargetRef","className":"ObjectValue","id":"ref","attributes":{}}`
+	second := `{
+  "attributes": {},
+  "id": "ref",
+  "className": "ObjectValue",
+  "name": "TargetRef",
+  "properties": {"Value": {"stableId": "target", "$type": "InstanceRef", "path": "game.Workspace.Target"}},
+  "tags": ["state"]
+}`
+	normalizedFirst, err := normalizeBootstrapFileSource("Workspace/TargetRef.ObjectValue/properties.init.json", first)
+	if err != nil {
+		t.Fatalf("normalize first metadata: %v", err)
+	}
+	normalizedSecond, err := normalizeBootstrapFileSource("Workspace/TargetRef.ObjectValue/properties.init.json", second)
+	if err != nil {
+		t.Fatalf("normalize second metadata: %v", err)
+	}
+	if normalizedFirst != normalizedSecond {
+		t.Fatalf("normalized metadata differs:\nfirst=%s\nsecond=%s", normalizedFirst, normalizedSecond)
+	}
+	if !strings.HasSuffix(normalizedFirst, "\n") || !strings.Contains(normalizedFirst, `"$type": "InstanceRef"`) {
+		t.Fatalf("normalized metadata = %q", normalizedFirst)
+	}
+	plain := "print('untouched')\r\n"
+	normalizedPlain, err := normalizeBootstrapFileSource("ServerScriptService/Foo.server.luau", plain)
+	if err != nil || normalizedPlain != plain {
+		t.Fatalf("plain source changed: body=%q err=%v", normalizedPlain, err)
+	}
+	if _, err := normalizeBootstrapFileSource("Workspace/Bad.IntValue/properties.init.json", `{`); err == nil {
+		t.Fatal("invalid metadata JSON was accepted")
+	}
+}
+
 func TestBootstrapPreviewReplaceDiffAndNoMutation(t *testing.T) {
 	cfg := config.Default()
 	root := t.TempDir()

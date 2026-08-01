@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"riftsync/internal/config"
+	"riftsync/internal/debuglog"
 	"riftsync/internal/exechistory"
 	"riftsync/internal/records"
 	"riftsync/internal/scanner"
@@ -71,6 +72,57 @@ func TestParseOptionsInvalidHost(t *testing.T) {
 func TestParseOptionsHelp(t *testing.T) {
 	if _, err := parseOptions([]string{"--help"}); err != flag.ErrHelp {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)
+	}
+}
+
+func TestPrintRuntimeEventsOnlyPrintsNewEntries(t *testing.T) {
+	events := []debuglog.Event{
+		{TS: 1, Kind: "boot", Message: "server booted"},
+		{TS: 2, Kind: "watcher", Message: "file changed"},
+	}
+	var output bytes.Buffer
+	last := printRuntimeEvents(&output, events, "")
+	if !strings.Contains(output.String(), "[boot     ] server booted") || !strings.Contains(output.String(), "[watcher  ] file changed") {
+		t.Fatalf("initial event output = %q", output.String())
+	}
+
+	output.Reset()
+	events = append(events, debuglog.Event{TS: 3, Kind: "revision", Message: "revision 2 changes=1"})
+	last = printRuntimeEvents(&output, events, last)
+	if strings.Contains(output.String(), "server booted") || !strings.Contains(output.String(), "revision 2 changes=1") {
+		t.Fatalf("incremental event output = %q", output.String())
+	}
+	if last != runtimeEventKey(events[2]) {
+		t.Fatalf("last event = %q, want newest event key", last)
+	}
+}
+
+func TestPrintRuntimeStatusIncludesOperationalAndDebugMetrics(t *testing.T) {
+	status := serverapp.Status{
+		StartedAt: time.Now().Add(-5 * time.Second),
+		Revision:  7,
+		Counts:    state.IndexedCounts{Entry: 21, Script: 8, UI: 4},
+		Metrics: state.Metrics{
+			RequestCount:       13,
+			HandshakeCount:     2,
+			ChangesRequests:    9,
+			ScanCycles:         6,
+			LastScanSec:        .125,
+			LastCacheHitCount:  18,
+			LastCacheMissCount: 3,
+			LastPayloadBytes:   2048,
+		},
+		Git: state.GitState{Status: state.GitStatusReady},
+	}
+	var output bytes.Buffer
+	printRuntimeStatus(&output, status, true)
+	for _, needle := range []string{
+		"revision=7", "indexed=21", "requests=13", "handshakes=2", "change_polls=9", "git=ready",
+		"scans=6", "last_scan=0.125s", "scripts=8", "ui=4", "cache_hits=18", "cache_misses=3", "payload=2048B",
+	} {
+		if !strings.Contains(output.String(), needle) {
+			t.Fatalf("runtime status missing %q in %q", needle, output.String())
+		}
 	}
 }
 

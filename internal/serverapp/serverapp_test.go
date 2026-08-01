@@ -92,6 +92,31 @@ func TestRunnerStartStopAndHealth(t *testing.T) {
 	}
 }
 
+func TestRunnerStartReportsPortConflictSynchronously(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sync_config.json")
+	cfg := config.Default()
+	cfg.SyncRoot = filepath.Join(root, "game")
+	cfg.Port = listener.Addr().(*net.TCPAddr).Port
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	runner := New(Options{ConfigPath: configPath})
+	err = runner.Start(context.Background())
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "listen") {
+		t.Fatalf("Start error = %v, want synchronous listen error", err)
+	}
+	if runner.Status(1).Running {
+		t.Fatal("runner reported running after bind failure")
+	}
+}
+
 func TestRunnerApplyOptionsStoppedDoesNotStart(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "sync_config.json")

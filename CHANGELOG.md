@@ -2,6 +2,24 @@
 
 Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
+## 4.1.0 - 2026-08-01
+
+- Expanded `Studio -> Folder` metadata snapshots to scripts, ValueBase, Workspace/Terrain/Lighting effects, UI, audio, animation, visual effects, prompts, tools, attachments, constraints, and other curated non-geometry classes.
+- Added full managed-root descendant traversal while keeping `BasePart` and `Model` as path-only anchors that never receive metadata or automatic ownership.
+- Added canonical `Enabled` script metadata with backward-compatible `Disabled` import.
+- Added typed `InstanceRef` and `Ray` serialization, stable-ID-first/path-fallback resolution, explicit nil references, and two-phase property apply for forward and cyclic references.
+- Added deterministic JSON formatting for pulled metadata to prevent random key-order Git diffs.
+- Protected root services, Terrain, missing geometry ancestors, script source ownership, and unmanaged instances during metadata create/delete operations.
+
+## 4.0.0 - 2026-07-31
+
+- Added concurrent multi-instance desktop management with an AppData registry, isolated configs, ports, runtime state, Remote Exec queues, and histories.
+- Added automatic editable port allocation, Start All, safe first-run import, and non-destructive project removal.
+- Rebuilt the desktop app with subtle dark glass surfaces, consistent flat controls, a hover-expandable and pinnable project sidebar, progressive disclosure, and keyboard-accessible tabs/modals.
+- Fixed long Remote Exec history rows so they remain bounded, and added a read-only View action with full source and stored result details.
+- Rebuilt the Roblox Studio widget with flat frosted surfaces, automatic scrolling/layout, collapsible profile/diagnostic controls, and named connection profiles remembered per Place.
+- Changed server startup to validate the listening port synchronously before reporting a running state.
+
 ## 3.9.0 - 2026-06-12
 
 - Increased generated Remote Exec tokens from 18 to 32 random alphanumeric characters.
@@ -18,7 +36,7 @@ Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 Rilis development terkini. Entry ini menggabungkan iterasi internal `3.1.0` sampai `3.7.0` agar changelog tetap enak dibaca walaupun beberapa perubahan dibuat di hari yang sama.
 
 - Added Remote Exec file shortcut untuk `.lua`/`.luau`, termasuk direct CLI shortcut `riftsync-server.exe exec .\studio-command.lua --timeout 30`.
-- Added script `properties.init.json` support untuk folder-style scripts, termasuk properti `Disabled` untuk `Script` dan `LocalScript`.
+- Added script `properties.init.json` support untuk folder-style scripts, termasuk properti legacy `Disabled` untuk `Script` dan `LocalScript`.
 - Fixed `Pull Studio` replace semantics agar file lokal yang sudah dihapus di Studio ikut terhapus secara lokal.
 - Added compact RiftSync brand icon di header desktop app.
 - Added `riftsync-server validate [--json]` untuk validasi config/project non-destruktif.

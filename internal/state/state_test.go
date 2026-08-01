@@ -172,6 +172,34 @@ func TestRemoteExecRunningCommandExpires(t *testing.T) {
 	}
 }
 
+func TestRemoteExecQueuesAreIsolatedPerProjectState(t *testing.T) {
+	cfgA := config.Default()
+	cfgA.SyncRoot = t.TempDir()
+	cfgA.RemoteExecEnabled = true
+	if err := cfgA.NormalizeAndValidate(); err != nil {
+		t.Fatal(err)
+	}
+	cfgB := config.Default()
+	cfgB.SyncRoot = t.TempDir()
+	cfgB.RemoteExecEnabled = true
+	if err := cfgB.NormalizeAndValidate(); err != nil {
+		t.Fatal(err)
+	}
+	projectA := New(cfgA)
+	projectB := New(cfgB)
+	queued, err := projectA.EnqueueRemoteExecCommand("print('A')", "app", "edit", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed := projectB.ClaimRemoteExecCommand(context.Background(), "studio-b", time.Millisecond); claimed {
+		t.Fatal("project B claimed a command queued in project A")
+	}
+	claimed, ok := projectA.ClaimRemoteExecCommand(context.Background(), "studio-a", time.Millisecond)
+	if !ok || claimed.ID != queued.ID || claimed.ClaimedBy != "studio-a" {
+		t.Fatalf("project A claim = %#v ok=%v", claimed, ok)
+	}
+}
+
 func TestHistoryPersistsAndLoads(t *testing.T) {
 	appState := testState(t, 10)
 	a := testRecord("ServerScriptService/A.server.luau", "A", "print(1)")

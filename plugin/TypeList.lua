@@ -1,6 +1,6 @@
 local TypeList = {}
 
-TypeList.VERSION = "3.9.0"
+TypeList.VERSION = "4.1.0"
 TypeList.PROTOCOL = "rbxsync/2.0.0"
 TypeList.PLUGIN_ICON = "rbxassetid://72034413544662"
 TypeList.CHANGE_ENCODINGS = {
@@ -95,6 +95,12 @@ TypeList.ROOT_SERVICE_CLASS = {
 	Lighting = "Lighting",
 	ReplicatedStorage = "ReplicatedStorage",
 	ReplicatedFirst = "ReplicatedFirst",
+	StarterPlayer = "StarterPlayer",
+	StarterPack = "StarterPack",
+	ServerScriptService = "ServerScriptService",
+	ServerStorage = "ServerStorage",
+	SoundService = "SoundService",
+	TextChatService = "TextChatService",
 }
 
 TypeList.REMOTE_SYNC_ROOT_SERVICES = {
@@ -124,11 +130,13 @@ TypeList.REMOTE_SYNC_CONTAINER_CLASSES = {
 TypeList.LIGHTING_CHILD_CLASSES = {
 	Atmosphere = true,
 	Sky = true,
+	Clouds = true,
 	BloomEffect = true,
 	BlurEffect = true,
 	ColorCorrectionEffect = true,
 	DepthOfFieldEffect = true,
 	SunRaysEffect = true,
+	ColorGradingEffect = true,
 }
 
 TypeList.UI_PROPERTY_CANDIDATES = {
@@ -178,7 +186,6 @@ TypeList.UI_PROPERTY_CANDIDATES = {
 	"Size",
 	"SliceCenter",
 	"SliceScale",
-	"Source",
 	"Text",
 	"TextColor3",
 	"TextDirection",
@@ -231,35 +238,125 @@ TypeList.UI_PROPERTY_CANDIDATES = {
 	"Selectable",
 }
 
+TypeList.COMMON_SAFE_PROPERTIES = {
+	"Archivable",
+}
+
+TypeList.CONSTRAINT_PROPERTY_CANDIDATES = {
+	"ActuatorType",
+	"AngularSpeed",
+	"AngularVelocity",
+	"Attachment0",
+	"Attachment1",
+	"Color",
+	"Enabled",
+	"FreeLength",
+	"LimitsEnabled",
+	"LinearResponsiveness",
+	"LowerAngle",
+	"LowerLimit",
+	"MaxForce",
+	"MaxFrictionTorque",
+	"MaxLength",
+	"MaxPlanarAxesForce",
+	"MaxTorque",
+	"MaxVelocity",
+	"MinLength",
+	"MotorMaxAcceleration",
+	"MotorMaxTorque",
+	"OrientationAlignmentMode",
+	"PlaneVelocity",
+	"Radius",
+	"ReactionForceEnabled",
+	"ReactionTorqueEnabled",
+	"RelativeTo",
+	"Restitution",
+	"Responsiveness",
+	"RigidityEnabled",
+	"RopeStyle",
+	"ServoMaxTorque",
+	"Size",
+	"Speed",
+	"Stiffness",
+	"Thickness",
+	"UpperAngle",
+	"UpperLimit",
+	"VelocityConstraintMode",
+	"Visible",
+	"WinchEnabled",
+	"WinchForce",
+	"WinchResponsiveness",
+	"WinchSpeed",
+}
+
+TypeList.SOUND_EFFECT_PROPERTY_CANDIDATES = {
+	"Attack",
+	"Bypass",
+	"DecayTime",
+	"Delay",
+	"Density",
+	"Diffusion",
+	"DryLevel",
+	"Enabled",
+	"Feedback",
+	"GainHigh",
+	"GainLow",
+	"GainMakeup",
+	"GainMid",
+	"Intensity",
+	"Mix",
+	"Octave",
+	"Priority",
+	"Rate",
+	"Ratio",
+	"Release",
+	"SideChain",
+	"Threshold",
+	"WetLevel",
+}
+
+TypeList.LIGHT_PROPERTY_CANDIDATES = {
+	"Angle",
+	"Brightness",
+	"Color",
+	"Enabled",
+	"Face",
+	"Range",
+	"Shadows",
+}
+
+TypeList.POST_EFFECT_PROPERTY_CANDIDATES = {
+	"Enabled",
+}
+
+-- These classes may appear in a local path as structural anchors, but RiftSync
+-- never owns or creates them from properties metadata.
+TypeList.GEOMETRY_ANCESTOR_CLASSES = {
+	Model = true,
+	Part = true,
+	MeshPart = true,
+	UnionOperation = true,
+	NegateOperation = true,
+	TrussPart = true,
+	WedgePart = true,
+	CornerWedgePart = true,
+	SpawnLocation = true,
+	Seat = true,
+	VehicleSeat = true,
+	Terrain = true,
+}
+
 TypeList.CLASS_PROPERTY_WHITELIST = {
-	Script = {
-		"Disabled",
-	},
-	LocalScript = {
-		"Disabled",
-	},
+	Script = { "Enabled", "RunContext" },
+	LocalScript = { "Enabled" },
 	ModuleScript = {},
-	RemoteEvent = {
-		"Archivable",
-	},
-	RemoteFunction = {
-		"Archivable",
-	},
-	UnreliableRemoteEvent = {
-		"Archivable",
-	},
-	BindableEvent = {
-		"Archivable",
-	},
-	BindableFunction = {
-		"Archivable",
-	},
-	Folder = {
-		"Archivable",
-	},
-	Configuration = {
-		"Archivable",
-	},
+	RemoteEvent = {},
+	RemoteFunction = {},
+	UnreliableRemoteEvent = {},
+	BindableEvent = {},
+	BindableFunction = {},
+	Folder = {},
+	Configuration = {},
 	Workspace = {
 		"Gravity",
 		"FallenPartsDestroyHeight",
@@ -269,6 +366,36 @@ TypeList.CLASS_PROPERTY_WHITELIST = {
 		"GlobalWind",
 		"AirDensity",
 	},
+	StarterGui = { "ScreenOrientation", "ShowDevelopmentGui" },
+	StarterPlayer = {
+		"CameraMaxZoomDistance",
+		"CameraMinZoomDistance",
+		"CameraMode",
+		"CharacterJumpHeight",
+		"CharacterJumpPower",
+		"CharacterMaxSlopeAngle",
+		"CharacterUseJumpPower",
+		"DevCameraOcclusionMode",
+		"DevComputerCameraMovementMode",
+		"DevComputerMovementMode",
+		"DevTouchCameraMovementMode",
+		"DevTouchMovementMode",
+		"EnableMouseLockOption",
+		"HealthDisplayDistance",
+		"LoadCharacterAppearance",
+		"NameDisplayDistance",
+		"UserEmotesEnabled",
+	},
+	SoundService = {
+		"AcousticSimulationEnabled",
+		"AmbientReverb",
+		"DefaultListenerLocation",
+		"DistanceFactor",
+		"DopplerScale",
+		"RespectFilteringEnabled",
+		"RolloffScale",
+	},
+	TextChatService = { "ChatVersion", "CreateDefaultCommands", "CreateDefaultTextChannels" },
 	Terrain = {
 		"Decoration",
 		"WaterColor",
@@ -277,6 +404,7 @@ TypeList.CLASS_PROPERTY_WHITELIST = {
 		"WaterWaveSize",
 		"WaterWaveSpeed",
 	},
+	Clouds = { "Color", "Cover", "Density", "Enabled" },
 	Lighting = {
 		"Ambient",
 		"OutdoorAmbient",
@@ -347,6 +475,115 @@ TypeList.CLASS_PROPERTY_WHITELIST = {
 		"Intensity",
 		"Spread",
 	},
+	ColorGradingEffect = { "Enabled", "TonemapperPreset" },
+
+	BoolValue = { "Value" },
+	BrickColorValue = { "Value" },
+	CFrameValue = { "Value" },
+	Color3Value = { "Value" },
+	DoubleConstrainedValue = { "MaxValue", "MinValue", "Value" },
+	IntConstrainedValue = { "MaxValue", "MinValue", "Value" },
+	IntValue = { "Value" },
+	NumberValue = { "Value" },
+	ObjectValue = { "Value" },
+	RayValue = { "Value" },
+	StringValue = { "Value" },
+	Vector3Value = { "Value" },
+
+	Sound = {
+		"AcousticSimulationEnabled",
+		"Looped",
+		"LoopRegion",
+		"PlaybackRegion",
+		"PlaybackRegionsEnabled",
+		"PlaybackSpeed",
+		"PlayOnRemove",
+		"RollOffMaxDistance",
+		"RollOffMinDistance",
+		"RollOffMode",
+		"SoundGroup",
+		"SoundId",
+		"Volume",
+	},
+	SoundGroup = { "Volume" },
+	AudioPlayer = { "Asset", "AutoLoad", "Looping", "PlaybackSpeed" },
+	AudioEmitter = { "AudioInteractionGroup" },
+	AudioListener = { "AudioInteractionGroup" },
+	AudioFader = { "Volume" },
+	AudioPitchShifter = { "Pitch" },
+	AudioEqualizer = { "HighGain", "LowGain", "MidGain" },
+	AudioCompressor = { "Attack", "MakeupGain", "Ratio", "Release", "Threshold" },
+	AudioReverb = { "DecayRatio", "DecayTime", "Density", "Diffusion", "DryLevel", "HighCutFrequency", "WetLevel" },
+	AudioEcho = { "DelayTime", "DryLevel", "Feedback", "WetLevel" },
+	AudioAnalyzer = { "SpectrumEnabled", "WindowSize" },
+	Wire = { "SourceInstance", "SourceName", "TargetInstance", "TargetName" },
+
+	Animation = { "AnimationId" },
+	AnimationController = {},
+	Animator = {},
+	ParticleEmitter = {
+		"Acceleration", "Brightness", "Color", "Drag", "EmissionDirection", "Enabled", "FlipbookBlendFrames", "FlipbookFramerate",
+		"FlipbookLayout", "FlipbookMode", "FlipbookStartRandom", "Lifetime", "LightEmission",
+		"LightInfluence", "LockedToPart", "Orientation", "Rate", "RotSpeed", "Rotation", "Shape", "ShapeInOut",
+		"ShapePartial", "ShapeStyle", "Size", "Speed", "SpreadAngle", "Squash", "Texture", "TimeScale",
+		"Transparency", "VelocityInheritance", "WindAffectsDrag", "ZOffset",
+	},
+	Beam = {
+		"Attachment0", "Attachment1", "Brightness", "Color", "CurveSize0", "CurveSize1", "Enabled", "FaceCamera",
+		"LightEmission", "LightInfluence", "LocalTransparencyModifier", "Segments", "Texture", "TextureLength",
+		"TextureMode", "TextureSpeed", "Transparency", "Width0", "Width1", "ZOffset",
+	},
+	Trail = {
+		"Attachment0", "Attachment1", "Brightness", "Color", "Enabled", "FaceCamera", "Lifetime", "LightEmission",
+		"LightInfluence", "MaxLength", "MinLength", "Texture", "TextureLength", "TextureMode", "Transparency",
+		"WidthScale",
+	},
+	Smoke = { "Color", "Enabled", "Opacity", "RiseVelocity", "Size", "TimeScale" },
+	Fire = { "Color", "Enabled", "Heat", "SecondaryColor", "Size", "TimeScale" },
+	Sparkles = { "Enabled", "SparkleColor", "TimeScale" },
+	Highlight = { "Adornee", "DepthMode", "Enabled", "FillColor", "FillTransparency", "OutlineColor", "OutlineTransparency" },
+	PointLight = {},
+	SpotLight = {},
+	SurfaceLight = {},
+	Decal = { "Color3", "LocalTransparencyModifier", "Texture", "Transparency", "ZIndex" },
+	Texture = { "Color3", "OffsetStudsU", "OffsetStudsV", "StudsPerTileU", "StudsPerTileV", "Texture", "Transparency", "ZIndex" },
+	SurfaceAppearance = { "AlphaMode", "Color", "ColorMap", "MetalnessMap", "NormalMap", "RoughnessMap" },
+	SpecialMesh = { "MeshId", "MeshType", "Offset", "Scale", "TextureId", "VertexColor" },
+	BlockMesh = { "Offset", "Scale", "VertexColor" },
+	CylinderMesh = { "Offset", "Scale", "VertexColor" },
+	ProximityPrompt = {
+		"ActionText", "AutoLocalize", "ClickablePrompt", "Enabled", "Exclusivity", "GamepadKeyCode", "HoldDuration",
+		"KeyboardKeyCode", "MaxActivationDistance", "ObjectText", "RequiresLineOfSight", "RootLocalizationTable",
+		"Style", "UIOffset",
+	},
+	ClickDetector = { "CursorIcon", "MaxActivationDistance" },
+	Tool = { "CanBeDropped", "Enabled", "Grip", "GripForward", "GripPos", "GripRight", "GripUp", "ManualActivationOnly", "RequiresHandle", "ToolTip" },
+	Attachment = { "Axis", "CFrame", "Orientation", "Position", "SecondaryAxis", "Visible" },
+	Bone = { "CFrame", "Transform" },
+	WrapLayer = { "AutoSkin", "BindOffset", "CageMeshId", "CageOrigin", "Enabled", "ImportOrigin", "Order", "Puffiness", "ReferenceMeshId", "ReferenceOrigin", "ShrinkFactor" },
+	WrapTarget = { "CageMeshId", "CageOrigin", "ImportOrigin", "Stiffness" },
+	WeldConstraint = { "Enabled", "Part0", "Part1" },
+}
+
+TypeList.PROPERTY_FAMILY_CLASSES = {
+	Constraint = true,
+	Light = true,
+	PostEffect = true,
+	SoundEffect = true,
+}
+
+TypeList.INSTANCE_REFERENCE_PROPERTIES = {
+	Adornee = true,
+	Attachment0 = true,
+	Attachment1 = true,
+	Part0 = true,
+	Part1 = true,
+	RootLocalizationTable = true,
+	SideChain = true,
+	SoundGroup = true,
+	SourceInstance = true,
+	TargetInstance = true,
+	Value = true,
 }
 
 TypeList.DEFAULT_MANAGED_ROOTS = {

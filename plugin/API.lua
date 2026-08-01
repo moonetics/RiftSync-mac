@@ -6,6 +6,7 @@ local TypeList = require(script:WaitForChild("TypeList"))
 local httpService = game:GetService("HttpService")
 local scriptEditorService = game:GetService("ScriptEditorService")
 local runService = game:GetService("RunService")
+local playersService = game:GetService("Players")
 
 local DEBUG_EVENT_LIMIT = 28
 local SERVER_DEBUG_PULL_INTERVAL = 2.0
@@ -795,6 +796,8 @@ local SETTING_KEYS = {
 	LastRevision = "riftsync_last_revision",
 	DebugEnabled = "riftsync_debug_enabled",
 	RemoteExecToken = "riftsync_remote_exec_token",
+	ConnectionProfiles = "riftsync_connection_profiles_v1",
+	PlaceProfileMap = "riftsync_place_profile_map_v1",
 }
 
 local LEGACY_SETTING_KEYS = {
@@ -812,7 +815,77 @@ local function getPluginSetting(pluginInstance, keyName)
 	if value ~= nil then
 		return value
 	end
-	return pluginInstance:GetSetting(LEGACY_SETTING_KEYS[keyName])
+	local legacyKey = LEGACY_SETTING_KEYS[keyName]
+	if legacyKey ~= nil then
+		return pluginInstance:GetSetting(legacyKey)
+	end
+	return nil
+end
+
+local function decodePluginTable(value)
+	if typeof(value) == "table" then
+		return value
+	end
+	if typeof(value) ~= "string" or value == "" then
+		return nil
+	end
+	local ok, decoded = pcall(function()
+		return httpService:JSONDecode(value)
+	end)
+	if ok and typeof(decoded) == "table" then
+		return decoded
+	end
+	return nil
+end
+
+local function encodePluginTable(value)
+	local ok, encoded = pcall(function()
+		return httpService:JSONEncode(value)
+	end)
+	if ok then
+		return encoded
+	end
+	return "{}"
+end
+
+local function currentPlaceProfileKey()
+	local gameId = tonumber(game.GameId) or 0
+	local placeId = tonumber(game.PlaceId) or 0
+	if placeId > 0 then
+		return tostring(gameId) .. ":" .. tostring(placeId)
+	end
+	return "unpublished:" .. tostring(game.Name)
+end
+
+local function normalizeConnectionProfiles(rawProfiles, fallbackHost, fallbackPort, fallbackToken)
+	local profiles = {}
+	if typeof(rawProfiles) == "table" then
+		for _, profile in ipairs(rawProfiles) do
+			if typeof(profile) == "table" then
+				local id = tostring(profile.id or "")
+				local name = tostring(profile.name or "")
+				if id ~= "" and name ~= "" then
+					table.insert(profiles, {
+						id = id,
+						name = name,
+						host = TypeList.normaliseHost(tostring(profile.host or TypeList.DEFAULT_HOST)),
+						port = TypeList.normalisePort(profile.port or TypeList.DEFAULT_PORT),
+						token = tostring(profile.token or ""),
+					})
+				end
+			end
+		end
+	end
+	if #profiles == 0 then
+		table.insert(profiles, {
+			id = httpService:GenerateGUID(false),
+			name = "Default",
+			host = TypeList.normaliseHost(tostring(fallbackHost or TypeList.DEFAULT_HOST)),
+			port = TypeList.normalisePort(fallbackPort or TypeList.DEFAULT_PORT),
+			token = tostring(fallbackToken or ""),
+		})
+	end
+	return profiles
 end
 
 function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, boolean?, any?) -> (), updateDebugCallback)
@@ -821,6 +894,24 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 	local configuredHost = getPluginSetting(pluginInstance, "Host")
 	local configuredPort = getPluginSetting(pluginInstance, "Port")
 	local configuredStartMode = getPluginSetting(pluginInstance, "StartMode")
+	local configuredToken = getPluginSetting(pluginInstance, "RemoteExecToken")
+	local rawProfiles = decodePluginTable(getPluginSetting(pluginInstance, "ConnectionProfiles"))
+	local rawPlaceMap = decodePluginTable(getPluginSetting(pluginInstance, "PlaceProfileMap")) or {}
+	local connectionProfiles = normalizeConnectionProfiles(rawProfiles, configuredHost, configuredPort, configuredToken)
+	local placeKey = currentPlaceProfileKey()
+	local selectedProfileId = tostring(rawPlaceMap[placeKey] or "")
+	local selectedProfile = nil
+	for _, profile in ipairs(connectionProfiles) do
+		if profile.id == selectedProfileId then
+			selectedProfile = profile
+			break
+		end
+	end
+	if selectedProfile == nil then
+		selectedProfile = connectionProfiles[1]
+		selectedProfileId = selectedProfile.id
+		rawPlaceMap[placeKey] = selectedProfileId
+	end
 
 	self.plugin = pluginInstance
 	local rawUpdateStatus = updateStatusCallback or function()
@@ -833,8 +924,12 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 	self.updateDebug = updateDebugCallback or function()
 		return
 	end
-	self.host = TypeList.normaliseHost(tostring(configuredHost or TypeList.DEFAULT_HOST))
-	self.port = TypeList.normalisePort(configuredPort or TypeList.DEFAULT_PORT)
+	self.connectionProfiles = connectionProfiles
+	self.placeProfileMap = rawPlaceMap
+	self.placeProfileKey = placeKey
+	self.selectedConnectionProfileId = selectedProfileId
+	self.host = selectedProfile.host
+	self.port = selectedProfile.port
 	self.baseUrl = TypeList.buildBaseUrl(self.host, self.port)
 	self.clientId = getPluginSetting(pluginInstance, "ClientId") or httpService:GenerateGUID(false)
 	self.lastAppliedRevision = tonumber(getPluginSetting(pluginInstance, "LastRevision")) or 0
@@ -853,7 +948,7 @@ self.serverIndexedCount = 0
 	self.changeEncoding = TypeList.CHANGE_ENCODINGS and TypeList.CHANGE_ENCODINGS.Compact or "compact-json-v1"
 	self.debugEnabled = getPluginSetting(pluginInstance, "DebugEnabled") == true
 	self.remoteExecEnabled = false
-	self.remoteExecToken = tostring(getPluginSetting(pluginInstance, "RemoteExecToken") or "")
+	self.remoteExecToken = tostring(selectedProfile.token or "")
 	self.remoteExecBusy = false
 	self.remoteExecLoopRunning = false
 	self.lastExecStatus = "Exec disabled"
@@ -878,9 +973,135 @@ self.serverIndexedCount = 0
 
 	pluginInstance:SetSetting(SETTING_KEYS.ClientId, self.clientId)
 	pluginInstance:SetSetting(SETTING_KEYS.StartMode, self.startMode)
+	pluginInstance:SetSetting(SETTING_KEYS.ConnectionProfiles, encodePluginTable(self.connectionProfiles))
+	pluginInstance:SetSetting(SETTING_KEYS.PlaceProfileMap, encodePluginTable(self.placeProfileMap))
 
 	self:pushDebugUpdate()
 	return self
+end
+
+function SyncAPI:saveConnectionProfiles()
+	self.plugin:SetSetting(SETTING_KEYS.ConnectionProfiles, encodePluginTable(self.connectionProfiles))
+	self.plugin:SetSetting(SETTING_KEYS.PlaceProfileMap, encodePluginTable(self.placeProfileMap))
+end
+
+function SyncAPI:listConnectionProfiles()
+	local result = {}
+	for _, profile in ipairs(self.connectionProfiles or {}) do
+		table.insert(result, {
+			id = profile.id,
+			name = profile.name,
+			host = profile.host,
+			port = profile.port,
+			token = profile.token,
+		})
+	end
+	return result
+end
+
+function SyncAPI:getSelectedConnectionProfileId()
+	return tostring(self.selectedConnectionProfileId or "")
+end
+
+function SyncAPI:selectConnectionProfile(profileId : string)
+	if self.running == true then
+		return false, "Stop sync before changing connection profile"
+	end
+	profileId = tostring(profileId or "")
+	for _, profile in ipairs(self.connectionProfiles or {}) do
+		if profile.id == profileId then
+			self.selectedConnectionProfileId = profile.id
+			self.placeProfileMap[self.placeProfileKey] = profile.id
+			self.host = profile.host
+			self.port = profile.port
+			self.baseUrl = TypeList.buildBaseUrl(self.host, self.port)
+			self.remoteExecToken = tostring(profile.token or "")
+			self:saveConnectionProfiles()
+			self:pushDebugUpdate()
+			return true
+		end
+	end
+	return false, "Connection profile not found"
+end
+
+function SyncAPI:upsertConnectionProfile(profile)
+	if self.running == true then
+		return nil, "Stop sync before editing connection profiles"
+	end
+	if typeof(profile) ~= "table" then
+		return nil, "Profile is required"
+	end
+	local profileId = tostring(profile.id or "")
+	if profileId == "" then
+		profileId = httpService:GenerateGUID(false)
+	end
+	local normalized = {
+		id = profileId,
+		name = tostring(profile.name or "Profile"),
+		host = TypeList.normaliseHost(tostring(profile.host or TypeList.DEFAULT_HOST)),
+		port = TypeList.normalisePort(profile.port or TypeList.DEFAULT_PORT),
+		token = tostring(profile.token or ""),
+	}
+	local replaced = false
+	for index, existing in ipairs(self.connectionProfiles or {}) do
+		if existing.id == profileId then
+			self.connectionProfiles[index] = normalized
+			replaced = true
+			break
+		end
+	end
+	if not replaced then
+		table.insert(self.connectionProfiles, normalized)
+	end
+	self:saveConnectionProfiles()
+	return normalized
+end
+
+function SyncAPI:removeConnectionProfile(profileId : string)
+	if self.running == true then
+		return false, "Stop sync before removing connection profiles"
+	end
+	if #(self.connectionProfiles or {}) <= 1 then
+		return false, "At least one connection profile is required"
+	end
+	profileId = tostring(profileId or "")
+	local filtered = {}
+	for _, profile in ipairs(self.connectionProfiles) do
+		if profile.id ~= profileId then
+			table.insert(filtered, profile)
+		end
+	end
+	if #filtered == #self.connectionProfiles then
+		return false, "Connection profile not found"
+	end
+	self.connectionProfiles = filtered
+	if self.selectedConnectionProfileId == profileId then
+		self.selectedConnectionProfileId = filtered[1].id
+		self.placeProfileMap[self.placeProfileKey] = filtered[1].id
+		self.host = filtered[1].host
+		self.port = filtered[1].port
+		self.baseUrl = TypeList.buildBaseUrl(self.host, self.port)
+		self.remoteExecToken = tostring(filtered[1].token or "")
+	end
+	self:saveConnectionProfiles()
+	return true
+end
+
+function SyncAPI:updateSelectedConnectionProfile()
+	local selectedId = tostring(self.selectedConnectionProfileId or "")
+	for index, profile in ipairs(self.connectionProfiles or {}) do
+		if profile.id == selectedId then
+			self.connectionProfiles[index] = {
+				id = profile.id,
+				name = profile.name,
+				host = self.host,
+				port = self.port,
+				token = self.remoteExecToken,
+			}
+			self:saveConnectionProfiles()
+			return
+		end
+	end
 end
 
 function SyncAPI:setConnection(host : string, port : string | number)
@@ -889,6 +1110,7 @@ function SyncAPI:setConnection(host : string, port : string | number)
 	self.baseUrl = TypeList.buildBaseUrl(self.host, self.port)
 	self.plugin:SetSetting(SETTING_KEYS.Host, self.host)
 	self.plugin:SetSetting(SETTING_KEYS.Port, self.port)
+	self:updateSelectedConnectionProfile()
 end
 
 function SyncAPI:getConnection()
@@ -955,6 +1177,7 @@ function SyncAPI:setRemoteExecToken(token : string)
 	self.remoteExecToken = tostring(token or "")
 	self.lastExecAuthError = false
 	self.plugin:SetSetting(SETTING_KEYS.RemoteExecToken, self.remoteExecToken)
+	self:updateSelectedConnectionProfile()
 	if self.remoteExecEnabled and self.remoteExecToken == "" then
 		self.lastExecStatus = "Exec error: token required"
 	elseif self.remoteExecEnabled and self.running == true then
@@ -2580,6 +2803,32 @@ local function isRemoteSyncCandidate(instance : Instance)
 	return REMOTE_SYNC_CLASSES[className] == true or REMOTE_SYNC_CONTAINER_CLASSES[className] == true
 end
 
+local function isBroadPropertySyncCandidate(instance : Instance)
+	if instance:IsA("BasePart") or instance:IsA("Model") or instance:IsA("Camera") then
+		return false
+	end
+	for _, player in ipairs(playersService:GetPlayers()) do
+		local character = player.Character
+		if character and (instance == character or instance:IsDescendantOf(character)) then
+			return false
+		end
+	end
+
+	local whitelist = TypeList.CLASS_PROPERTY_WHITELIST or {}
+	if whitelist[instance.ClassName] ~= nil then
+		return true
+	end
+
+	local families = TypeList.PROPERTY_FAMILY_CLASSES or {}
+	for familyName, enabled in pairs(families) do
+		if enabled == true and instance:IsA(familyName) then
+			return true
+		end
+	end
+
+	return false
+end
+
 local function shouldTraverseRemoteScopeChild(child : Instance)
 	local className = child.ClassName
 	return REMOTE_SYNC_CLASSES[className] == true or REMOTE_SYNC_CONTAINER_CLASSES[className] == true
@@ -2589,27 +2838,7 @@ local function shouldTrackPropertyInstance(instance : Instance)
 	if isGuiSyncCandidate(instance) then
 		return true
 	end
-	if isScriptClass(instance.ClassName) then
-		return true
-	end
-
-	if instance == workspaceService or instance == lightingService then
-		return true
-	end
-
-	if instance:IsA("Terrain") and instance.Parent == workspaceService then
-		return true
-	end
-
-	if instance.Parent == lightingService and isLightingSyncChild(instance) then
-		return true
-	end
-
-	if isRemoteSyncCandidate(instance) then
-		return true
-	end
-
-	return false
+	return isBroadPropertySyncCandidate(instance)
 end
 
 local function shouldTraversePropertyChild(rootServiceName : string, child : Instance)
@@ -2851,6 +3080,14 @@ local function serializeValue(value : any)
 		return {
 			["$type"] = "ColorSequence",
 			keypoints = keypoints,
+		}
+	end
+
+	if valueType == "Ray" then
+		return {
+			["$type"] = "Ray",
+			origin = serializeValue(value.Origin),
+			direction = serializeValue(value.Direction),
 		}
 	end
 
@@ -3136,6 +3373,15 @@ local function deserializeValue(raw : any)
 		return ColorSequence.new(points)
 	end
 
+	if taggedType == "Ray" then
+		local origin = deserializeValue(raw.origin)
+		local direction = deserializeValue(raw.direction)
+		if typeof(origin) == "Vector3" and typeof(direction) == "Vector3" then
+			return Ray.new(origin, direction)
+		end
+		return nil
+	end
+
 	if taggedType == "CFrame" then
 		local components = raw.components
 		if typeof(components) == "table" and #components == 12 then
@@ -3225,7 +3471,7 @@ end
 
 local function buildExtraAllowedSet(self, className : string)
 	local result = {}
-	local map = self.extraAllowedProperties or {}
+	local map = if self then self.extraAllowedProperties or {} else {}
 	local wildcards = map["*"]
 	if typeof(wildcards) == "table" then
 		for _, propertyName in ipairs(wildcards) do
@@ -3247,9 +3493,10 @@ local function buildExtraAllowedSet(self, className : string)
 	return result
 end
 
-local function buildPropertyCandidateList(self, className : string)
+local function buildPropertyCandidateList(self, className : string, instance : Instance?)
 	local candidates = {}
 	local seen = {}
+	local schemaKnown = false
 
 	local function push(propertyName : string)
 		if propertyName == "" or seen[propertyName] then
@@ -3268,6 +3515,12 @@ local function buildPropertyCandidateList(self, className : string)
 	end
 
 	if typeof(classWhitelist) == "table" then
+		schemaKnown = true
+		for _, propertyName in ipairs(TypeList.COMMON_SAFE_PROPERTIES or {}) do
+			if typeof(propertyName) == "string" then
+				push(propertyName)
+			end
+		end
 		for _, propertyName in ipairs(classWhitelist) do
 			if typeof(propertyName) == "string" then
 				push(propertyName)
@@ -3275,9 +3528,41 @@ local function buildPropertyCandidateList(self, className : string)
 		end
 	end
 
-	local strictMode = self.strictPropertyWhitelist == true
-	if not strictMode then
+	if instance and instance:IsA("Constraint") then
+		schemaKnown = true
+		for _, propertyName in ipairs(TypeList.CONSTRAINT_PROPERTY_CANDIDATES or {}) do
+			push(propertyName)
+		end
+	end
+	if instance and instance:IsA("SoundEffect") then
+		schemaKnown = true
+		for _, propertyName in ipairs(TypeList.SOUND_EFFECT_PROPERTY_CANDIDATES or {}) do
+			push(propertyName)
+		end
+	end
+	if instance and instance:IsA("Light") then
+		schemaKnown = true
+		for _, propertyName in ipairs(TypeList.LIGHT_PROPERTY_CANDIDATES or {}) do
+			push(propertyName)
+		end
+	end
+	if instance and instance:IsA("PostEffect") then
+		schemaKnown = true
+		for _, propertyName in ipairs(TypeList.POST_EFFECT_PROPERTY_CANDIDATES or {}) do
+			push(propertyName)
+		end
+	end
+
+	if instance and isGuiSyncCandidate(instance) then
+		schemaKnown = true
 		for _, propertyName in ipairs(TypeList.UI_PROPERTY_CANDIDATES or {}) do
+			if typeof(propertyName) == "string" then
+				push(propertyName)
+			end
+		end
+	end
+	if schemaKnown then
+		for _, propertyName in ipairs(TypeList.COMMON_SAFE_PROPERTIES or {}) do
 			if typeof(propertyName) == "string" then
 				push(propertyName)
 			end
@@ -3289,23 +3574,61 @@ local function buildPropertyCandidateList(self, className : string)
 		push(propertyName)
 	end
 
-	return candidates, classWhitelist, extraAllowed
+	return candidates, schemaKnown, extraAllowed
 end
 
-local function serialiseUiProperties(self, instance : Instance)
+local function isReferenceProperty(className : string, propertyName : string)
+	if propertyName == "Value" then
+		return className == "ObjectValue"
+	end
+	return (TypeList.INSTANCE_REFERENCE_PROPERTIES or {})[propertyName] == true
+end
+
+local function isPathUnderManagedRoots(self, gamePath : string)
+	for _, rootPath in ipairs(self.managedRoots or {}) do
+		if gamePath == rootPath or string.sub(gamePath, 1, #rootPath + 1) == rootPath .. "." then
+			return true
+		end
+	end
+	return false
+end
+
+local function serialiseInstanceReference(self, value : Instance?, ensureReferenceStableId)
+	if value == nil then
+		return { ["$type"] = "InstanceRef", null = true }
+	end
+	if not value:IsDescendantOf(game) then
+		return nil
+	end
+
+	local gamePath = buildGamePath(value)
+	local stableId = value:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+	if isPathUnderManagedRoots(self, gamePath) and ensureReferenceStableId then
+		stableId = ensureReferenceStableId(value)
+	end
+	return {
+		["$type"] = "InstanceRef",
+		stableId = typeof(stableId) == "string" and stableId or "",
+		path = gamePath,
+	}
+end
+
+local function serialiseUiProperties(self, instance : Instance, ensureReferenceStableId)
 	local result = {}
 	local className = instance.ClassName
-	local candidates = buildPropertyCandidateList(self, className)
+	local candidates = buildPropertyCandidateList(self, className, instance)
 	for _, propertyName in ipairs(candidates) do
-		if propertyName ~= "Name" then
-			if isScriptClass(className) and propertyName == "Source" then
-				continue
-			end
+		if propertyName ~= "Name" and propertyName ~= "Parent" and propertyName ~= "ClassName" and propertyName ~= "Source" then
 			local ok, value = pcall(function()
 				return (instance :: any)[propertyName]
 			end)
 			if ok then
-				local encoded = serializeValue(value)
+				local encoded
+				if typeof(value) == "Instance" or (value == nil and isReferenceProperty(className, propertyName)) then
+					encoded = serialiseInstanceReference(self, value, ensureReferenceStableId)
+				else
+					encoded = serializeValue(value)
+				end
 				if encoded ~= nil then
 					result[propertyName] = encoded
 				end
@@ -3404,6 +3727,21 @@ local function isRemoteOrContainerClass(className : string)
 	return REMOTE_SYNC_CLASSES[className] == true or REMOTE_SYNC_CONTAINER_CLASSES[className] == true
 end
 
+local function hasGeometryAncestorLocalPath(localPath : any)
+	if typeof(localPath) ~= "string" then
+		return false
+	end
+	local parts = splitBySlash(localPath)
+	local geometryClasses = TypeList.GEOMETRY_ANCESTOR_CLASSES or {}
+	for index = 2, #parts - 1 do
+		local className = string.match(parts[index], "%.([^%.]+)$")
+		if className and geometryClasses[className] == true then
+			return true
+		end
+	end
+	return false
+end
+
 local function buildManagedIndexes(managedRoots : {string})
 	local byStableId = {}
 	local byLocalPath = {}
@@ -3430,6 +3768,28 @@ local function buildManagedIndexes(managedRoots : {string})
 		byStableId = byStableId,
 		byLocalPath = byLocalPath,
 	}
+end
+
+local function buildReferenceIndex(managedRoots : {string})
+	local byStableId = {}
+	local visited = {}
+	for _, rootPath in ipairs(managedRoots or {}) do
+		local rootInstance = resolvePath(rootPath)
+		if rootInstance then
+			local candidates = rootInstance:GetDescendants()
+			table.insert(candidates, 1, rootInstance)
+			for _, instance in ipairs(candidates) do
+				if not visited[instance] then
+					visited[instance] = true
+					local stableId = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+					if typeof(stableId) == "string" and stableId ~= "" and not byStableId[stableId] then
+						byStableId[stableId] = instance
+					end
+				end
+			end
+		end
+	end
+	return { byStableId = byStableId }
 end
 
 function SyncAPI:collectStudioSnapshot()
@@ -3526,105 +3886,84 @@ function SyncAPI:collectStudioSnapshot()
 		})
 	end
 
-	local propertyRoots = TypeList.PROPERTY_SYNC_ROOTS or {
-		"game.StarterGui",
-		"game.Workspace",
-		"game.Lighting",
-	}
-
-	local visitedRoots = {}
-	for _, rootPath in ipairs(propertyRoots) do
-		if visitedRoots[rootPath] then
-			continue
+	local function ensureSnapshotStableId(instance : Instance)
+		local stableId = ensureStableId(instance)
+		if seenPropertyStableIds[stableId] and seenPropertyStableIds[stableId] ~= instance then
+			repeat
+				stableId = httpService:GenerateGUID(false)
+			until not seenPropertyStableIds[stableId]
+			instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, stableId)
 		end
-		visitedRoots[rootPath] = true
+		seenPropertyStableIds[stableId] = instance
+		return stableId
+	end
 
+	local function exportPropertyNode(instance : Instance)
+		if not shouldTrackPropertyInstance(instance) then
+			return
+		end
+
+		local gamePath = buildGamePath(instance)
+		if isIgnoredPath(gamePath, self.ignoredRbxPaths) then
+			noteSkip("properties_ignored_path", gamePath)
+			return
+		end
+
+		local folderPath = buildUiFolderPath(instance)
+		if not folderPath then
+			noteSkip("properties_invalid_folder_path", gamePath)
+			return
+		end
+
+		local localPath = folderPath .. "/" .. UI_PROPERTIES_FILENAME
+		local canRegister, conflictSource = registerLocalPath(localPath, gamePath)
+		if not canRegister then
+			noteSkip(
+				"local_path_collision",
+				localPath .. " <- " .. gamePath .. " conflicts with " .. tostring(conflictSource)
+			)
+			return
+		end
+
+		local stableId = ensureSnapshotStableId(instance)
+		local payload = {
+			id = stableId,
+			className = instance.ClassName,
+			name = instance.Name,
+			properties = serialiseUiProperties(self, instance, ensureSnapshotStableId),
+			attributes = serialiseAttributes(instance),
+			tags = serialiseTags(instance),
+		}
+		local ok, source = pcall(function()
+			return httpService:JSONEncode(payload)
+		end)
+		if not ok then
+			noteSkip("properties_json_encode_failed", gamePath)
+			return
+		end
+
+		table.insert(files, {
+			entity = INSTANCE_KINDS.UIInstance,
+			local_path = localPath,
+			rbx_path = gamePath,
+			class_name = instance.ClassName,
+			stable_id = stableId,
+			source = source,
+		})
+	end
+
+	local visitedInstances = {}
+	for _, rootPath in ipairs(self.managedRoots) do
 		local rootInstance = resolvePath(rootPath)
-		if not rootInstance then
-			continue
-		end
-
-		local rootServiceName = rootInstance.Name
-
-		local function exportPropertyNode(instance : Instance)
-			if not shouldTrackPropertyInstance(instance) then
-				return
-			end
-
-			local gamePath = buildGamePath(instance)
-			if isIgnoredPath(gamePath, self.ignoredRbxPaths) then
-				noteSkip("properties_ignored_path", gamePath)
-				return
-			end
-
-			local folderPath = buildUiFolderPath(instance)
-			if not folderPath then
-				noteSkip("properties_invalid_folder_path", gamePath)
-				return
-			end
-
-			local localPath = folderPath .. "/" .. UI_PROPERTIES_FILENAME
-			local canRegister, conflictSource = registerLocalPath(localPath, gamePath)
-			if not canRegister then
-				noteSkip(
-					"local_path_collision",
-					localPath .. " <- " .. gamePath .. " conflicts with " .. tostring(conflictSource)
-				)
-				return
-			end
-
-			local stableId = ensureStableId(instance)
-			if seenPropertyStableIds[stableId] and seenPropertyStableIds[stableId] ~= instance then
-				repeat
-					stableId = httpService:GenerateGUID(false)
-				until not seenPropertyStableIds[stableId]
-				instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, stableId)
-			end
-			seenPropertyStableIds[stableId] = instance
-
-			local payload = {
-				id = stableId,
-				className = instance.ClassName,
-				name = instance.Name,
-				properties = serialiseUiProperties(self, instance),
-				attributes = serialiseAttributes(instance),
-				tags = serialiseTags(instance),
-			}
-			local ok, source = pcall(function()
-				return httpService:JSONEncode(payload)
-			end)
-			if not ok then
-				noteSkip("properties_json_encode_failed", gamePath)
-				return
-			end
-
-			table.insert(files, {
-				entity = INSTANCE_KINDS.UIInstance,
-				local_path = localPath,
-				rbx_path = gamePath,
-				class_name = instance.ClassName,
-				stable_id = stableId,
-				source = source,
-			})
-		end
-
-		local function visitFromRoot(instance : Instance)
-			exportPropertyNode(instance)
-			for _, child in ipairs(instance:GetChildren()) do
-				if shouldTraversePropertyChild(rootServiceName, child) then
-					visitFromRoot(child)
+		if rootInstance then
+			local candidates = rootInstance:GetDescendants()
+			table.insert(candidates, 1, rootInstance)
+			for _, candidate in ipairs(candidates) do
+				if not visitedInstances[candidate] then
+					visitedInstances[candidate] = true
+					exportPropertyNode(candidate)
 				end
 			end
-		end
-
-		if rootServiceName == "StarterGui" then
-			for _, child in ipairs(rootInstance:GetChildren()) do
-				if shouldTraversePropertyChild(rootServiceName, child) then
-					visitFromRoot(child)
-				end
-			end
-		else
-			visitFromRoot(rootInstance)
 		end
 	end
 
@@ -3845,6 +4184,9 @@ local function isPermissionRestrictedWriteError(message : string)
 end
 
 local function isKnownRestrictedProperty(className : string, propertyName : string)
+	if propertyName == "Name" or propertyName == "Parent" or propertyName == "ClassName" or propertyName == "Source" then
+		return true
+	end
 	if className == "Lighting" and propertyName == "PrioritizeLightingQuality" then
 		return true
 	end
@@ -3886,42 +4228,62 @@ local function parsePropertyValue(propertyName : string, encodedValue : any)
 	return decoded
 end
 
-local function applyUiProperties(self, instance : Instance, payload : {[string]: any})
+local function resolveInstanceReference(encodedValue : {[string]: any}, referenceIndex)
+	if encodedValue.null == true then
+		return true, nil, nil
+	end
+
+	local stableId = tostring(encodedValue.stableId or "")
+	if stableId ~= "" and referenceIndex and referenceIndex.byStableId then
+		local byId = referenceIndex.byStableId[stableId]
+		if byId then
+			return true, byId, nil
+		end
+	end
+
+	local pathValue = tostring(encodedValue.path or "")
+	if pathValue ~= "" then
+		local byPath = resolvePath(pathValue)
+		if byPath then
+			return true, byPath, nil
+		end
+	end
+
+	return false, nil, "Unresolved InstanceRef stableId=" .. stableId .. " path=" .. pathValue
+end
+
+local function applyUiProperties(self, instance : Instance, payload : {[string]: any}, referenceIndex)
 	local errors = {}
 	local notices = {}
 	local className = tostring(payload.className or instance.ClassName)
-	local classWhitelist = nil
-	local extraAllowed = {}
-	if self then
-		local _, whitelist, extra = buildPropertyCandidateList(self, className)
-		classWhitelist = whitelist
-		extraAllowed = extra
-	else
-		if TypeList.getClassPropertyWhitelist then
-			classWhitelist = TypeList.getClassPropertyWhitelist(className)
-		end
-		if classWhitelist == nil and TypeList.CLASS_PROPERTY_WHITELIST then
-			classWhitelist = TypeList.CLASS_PROPERTY_WHITELIST[className]
-		end
-	end
+	local candidates, schemaKnown = buildPropertyCandidateList(self, className, instance)
 	local allowedSet = nil
-	if typeof(classWhitelist) == "table" then
+	if schemaKnown then
 		allowedSet = {}
-		for _, propertyName in ipairs(classWhitelist) do
-			allowedSet[propertyName] = true
-		end
-		for propertyName, _ in pairs(extraAllowed) do
+		for _, propertyName in ipairs(candidates) do
 			allowedSet[propertyName] = true
 		end
 	end
 	local strictMode = self and self.strictPropertyWhitelist == true or false
+	local properties = {}
+	for propertyName, encodedValue in pairs(payload.properties or {}) do
+		properties[propertyName] = encodedValue
+	end
+	if className == "Script" or className == "LocalScript" then
+		local legacyDisabled = properties.Disabled
+		properties.Disabled = nil
+		if properties.Enabled == nil and legacyDisabled ~= nil then
+			properties.Enabled = not (deserializeValue(legacyDisabled) == true)
+			table.insert(notices, "Migrated legacy Disabled property to Enabled @ " .. instance:GetFullName())
+		end
+	end
 
-	for propertyName, encodedValue in pairs(payload.properties) do
-		if propertyName ~= "Name" and propertyName ~= "ClassName" then
-			if isScriptClass(className) and propertyName == "Source" then
+	for propertyName, encodedValue in pairs(properties) do
+		if propertyName ~= "Name" and propertyName ~= "Parent" and propertyName ~= "ClassName" then
+			if propertyName == "Source" then
 				table.insert(
 					notices,
-					"Skip Source property for script node (use source file) @ " .. instance:GetFullName()
+					"Skip protected Source property (use a script source file) @ " .. instance:GetFullName()
 				)
 				continue
 			end
@@ -3944,9 +4306,21 @@ local function applyUiProperties(self, instance : Instance, payload : {[string]:
 				end
 			end
 
-			local decoded = parsePropertyValue(propertyName, encodedValue)
 			local encodedType = getSerializedTypeName(encodedValue)
-			if decoded == nil and encodedType then
+			local decoded
+			local explicitNil = false
+			if encodedType == "InstanceRef" and typeof(encodedValue) == "table" then
+				local resolved, referenceValue, referenceError = resolveInstanceReference(encodedValue, referenceIndex)
+				if not resolved then
+					table.insert(errors, referenceError .. " for " .. tostring(propertyName) .. " @ " .. instance:GetFullName())
+					continue
+				end
+				decoded = referenceValue
+				explicitNil = encodedValue.null == true
+			else
+				decoded = parsePropertyValue(propertyName, encodedValue)
+			end
+			if decoded == nil and encodedType and not explicitNil then
 				table.insert(
 					errors,
 					"Unsupported or invalid property type "
@@ -4224,7 +4598,10 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 
 	local parent, targetNameOrService, isRootService, parentError = parseRobloxPath(targetPath)
 	if parentError then
-		if isRemoteScopePath(targetPath) and isRemoteOrContainerClass(payload.className) then
+		if isRemoteScopePath(targetPath)
+			and isRemoteOrContainerClass(payload.className)
+			and not hasGeometryAncestorLocalPath(change.local_path)
+		then
 			local ensuredParent, ensuredName, ensureError = ensureParentPath(targetPath)
 			if not ensuredParent then
 				return false, ensureError or parentError
@@ -4234,7 +4611,7 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 			isRootService = false
 			parentError = nil
 		else
-			return false, parentError
+			return false, "Parent missing for metadata target " .. targetPath .. ": " .. tostring(parentError)
 		end
 	end
 
@@ -4534,7 +4911,13 @@ function SyncAPI:applyUpsert(change : {[string]: any}, revision : number)
 			return false, resultOrError
 		end
 		if typeof(resultOrError) == "table" and resultOrError.instance then
-			local propertyErrors, propertyNotices = applyUiProperties(self, resultOrError.instance, resultOrError.payload)
+			local referenceIndex = buildReferenceIndex(self.managedRoots)
+			local propertyErrors, propertyNotices = applyUiProperties(
+				self,
+				resultOrError.instance,
+				resultOrError.payload,
+				referenceIndex
+			)
 			local metadataErrors, metadataNotices = applyUiAttributesAndTags(resultOrError.instance, resultOrError.payload)
 			if #propertyErrors > 0 or #metadataErrors > 0 then
 				local merged = {}
@@ -4781,8 +5164,14 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 	if #uiPrepared > 0 and self.initialSyncInProgress == true then
 		self.updateStatus("Syncing properties... (90%)", false)
 	end
+	local referenceIndex = buildReferenceIndex(self.managedRoots)
 	for _, prepared in ipairs(uiPrepared) do
-		local propertyErrors, propertyNotices = applyUiProperties(self, prepared.instance, prepared.payload)
+		local propertyErrors, propertyNotices = applyUiProperties(
+			self,
+			prepared.instance,
+			prepared.payload,
+			referenceIndex
+		)
 		for _, errorMessage in ipairs(propertyErrors) do
 			pushError(errorMessage)
 		end

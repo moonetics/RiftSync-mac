@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 
 	"riftsync/internal/config"
 	"riftsync/internal/exechistory"
+	"riftsync/internal/instances"
 	"riftsync/internal/serverapp"
 	"riftsync/internal/state"
 )
@@ -50,6 +52,12 @@ func TestPortTextAndFallback(t *testing.T) {
 	}
 	if fallback("", "x") != "x" || fallback("ok", "x") != "ok" {
 		t.Fatal("fallback returned unexpected values")
+	}
+}
+
+func TestDefaultWindowSize(t *testing.T) {
+	if defaultWindowWidth != 1280 || defaultWindowHeight != 720 {
+		t.Fatalf("default window size = %dx%d, want 1280x720", defaultWindowWidth, defaultWindowHeight)
 	}
 }
 
@@ -107,7 +115,23 @@ func TestGitStatusText(t *testing.T) {
 func TestHTMLDocumentHasAppControls(t *testing.T) {
 	document := htmlDocument()
 	for _, needle := range []string{
-		`color-scheme: dark`,
+		`color-scheme:dark`,
+		`class="brand-logo"`,
+		`data:image/png;base64,`,
+		`ROBLOX STUDIO LIVE SYNC`,
+		`--space-1:4px`,
+		`--radius-md:12px`,
+		`--blur:14px`,
+		`backdrop-filter:blur(var(--blur))`,
+		`@supports`,
+		`@media(prefers-reduced-motion:reduce)`,
+		`sidebar-pinned`,
+		`force-collapsed`,
+		`width:var(--rail);transition:none`,
+		`addEventListener("mouseleave"`,
+		`projectList`,
+		`startAllBtn`,
+		`addProjectBtn`,
 		`startBtn`,
 		`stopBtn`,
 		`overviewTab`,
@@ -124,12 +148,12 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`configPathPanel`,
 		`serverSettingsPanel`,
 		`appHeader`,
-		`brand-title`,
-		`brand-icon`,
-		`aria-hidden="true"`,
 		`minimizeBtn`,
 		`closeBtn`,
-		`overflow: hidden`,
+		`overflow:hidden`,
+		`scrollbar-width:none`,
+		`-ms-overflow-style:none`,
+		`*::-webkit-scrollbar{display:none;width:0;height:0}`,
 		`changePathBtn`,
 		`configApplyStatus`,
 		`/app/config/apply`,
@@ -137,24 +161,13 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`syncRootInput`,
 		`historyRefreshBtn`,
 		`historyTimeline`,
-		`history-layout`,
-		`history-toolbar-panel`,
+		`history-shell`,
 		`logsBtn`,
 		`logsModal`,
 		`/app/logs`,
 		`activityText`,
-		`activityFill`,
-		`errorDetailsBtn`,
-		`errorDetailText`,
-		`copyErrorBtn`,
-		`activity_progress`,
-		`aria-live="polite"`,
-		`aria-busy="false"`,
-		`role="progressbar"`,
-		`setConfigLocked`,
-		`Stop sync before editing config.`,
+		`errorText`,
 		`syncRootPickerBtn`,
-		`toggle-switch`,
 		`historyDetail`,
 		`execSourceInput`,
 		`execTimeoutInput`,
@@ -163,16 +176,59 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`execTokenDisplay`,
 		`execTokenCopyBtn`,
 		`readonly`,
-		`copyExecToken`,
 		`execOutputText`,
 		`execHistoryList`,
+		`exec-history-item`,
+		`grid-template-columns:minmax(0,1fr) auto auto`,
+		`grid-template-columns:46px minmax(0,1fr)`,
+		`grid-template-columns:40px 0;justify-content:center`,
+		`.sidebar-wrap.force-collapsed .project-button`,
+		`class="side-icon"`,
+		`min-height:46px`,
+		`justify-self:start`,
+		`.config-side .panel{width:100%`,
+		`align-items:stretch`,
+		`overflow-x:hidden`,
+		`text-overflow:ellipsis`,
+		`overflow-wrap:anywhere`,
+		`data-view`,
+		`viewModal`,
+		`View`,
 		`/app/exec/run`,
 		`/app/exec/rerun`,
 		`/app/exec/history`,
+		`/app/instances`,
+		`/app/start-all`,
+		`role="tablist"`,
+		`role="tab"`,
+		`role="tabpanel"`,
+		`aria-selected="true"`,
+		`aria-current`,
+		`aria-expanded="false"`,
+		`aria-live="polite"`,
+		`role="dialog"`,
+		`aria-modal="true"`,
+		`diagnosticsToggle`,
+		`advancedToggle`,
+		`modalReturnFocus`,
+		`inert=true`,
+		`e.key==="Escape"`,
 	} {
 		if !strings.Contains(document, needle) {
 			t.Fatalf("htmlDocument missing %q", needle)
 		}
+	}
+	if strings.Contains(document, `background:linear-gradient`) || strings.Contains(document, `box-shadow:inset`) {
+		t.Fatal("htmlDocument still contains beveled control styling")
+	}
+	if strings.Contains(document, `MULTI-INSTANCE`) {
+		t.Fatal("htmlDocument still contains the implementation-focused brand subtitle")
+	}
+	if strings.Contains(document, `border-radius:999px`) {
+		t.Fatal("htmlDocument still contains oversized capsule status styling")
+	}
+	if strings.Contains(document, `<span>▶</span>`) || strings.Contains(document, `<span>＋</span>`) {
+		t.Fatal("htmlDocument still contains uncentered Unicode sidebar action icons")
 	}
 	if strings.Contains(document, `historyList`) {
 		t.Fatal("htmlDocument still contains historyList button-list UI")
@@ -246,6 +302,149 @@ func TestAppRoutesServeStatusAndHTML(t *testing.T) {
 	mux.ServeHTTP(execHistoryResponse, httptest.NewRequest(http.MethodGet, "/app/exec/history", nil))
 	if execHistoryResponse.Code != http.StatusOK || !strings.Contains(execHistoryResponse.Body.String(), `"entries"`) {
 		t.Fatalf("/app/exec/history code=%d body=%q", execHistoryResponse.Code, execHistoryResponse.Body.String())
+	}
+}
+
+func TestMultiAppControllerCreatesSelectsAndRemovesProjectsWithoutDeletingFiles(t *testing.T) {
+	root := t.TempDir()
+	firstRoot := filepath.Join(root, "first")
+	firstConfig := filepath.Join(root, "first-config.json")
+	first := config.Default()
+	first.SyncRoot = firstRoot
+	first.Port = freePort(t)
+	if err := config.Save(firstConfig, first); err != nil {
+		t.Fatalf("save first config: %v", err)
+	}
+
+	store := instances.NewStore(filepath.Join(root, "appdata", "instances.json"))
+	controller, err := newMultiAppController(context.Background(), store, serverapp.Options{
+		ConfigPath:   firstConfig,
+		PortOverride: -1,
+	})
+	if err != nil {
+		t.Fatalf("newMultiAppController: %v", err)
+	}
+	controller.forceExit = false
+	mux := http.NewServeMux()
+	controller.registerRoutes(mux)
+
+	secondRoot := filepath.Join(root, "second")
+	createBody, _ := json.Marshal(map[string]any{"name": "Second", "sync_root": secondRoot})
+	createResponse := httptest.NewRecorder()
+	mux.ServeHTTP(createResponse, httptest.NewRequest(http.MethodPost, "/app/instances", bytes.NewReader(createBody)))
+	if createResponse.Code != http.StatusOK {
+		t.Fatalf("create code=%d body=%s", createResponse.Code, createResponse.Body.String())
+	}
+	var created struct {
+		Instances          []map[string]any `json:"instances"`
+		SelectedInstanceID string           `json:"selected_instance_id"`
+	}
+	if err := json.Unmarshal(createResponse.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if len(created.Instances) != 2 || created.SelectedInstanceID == "" {
+		t.Fatalf("create response = %#v", created)
+	}
+	secondConfig := filepath.Join(secondRoot, config.MetadataDir, "sync_config.json")
+	if _, err := os.Stat(secondConfig); err != nil {
+		t.Fatalf("new project config was not created: %v", err)
+	}
+
+	duplicateBody, _ := json.Marshal(map[string]any{"name": "Duplicate", "sync_root": secondRoot})
+	duplicateResponse := httptest.NewRecorder()
+	mux.ServeHTTP(duplicateResponse, httptest.NewRequest(http.MethodPost, "/app/instances", bytes.NewReader(duplicateBody)))
+	if duplicateResponse.Code != http.StatusConflict {
+		t.Fatalf("duplicate code=%d body=%s", duplicateResponse.Code, duplicateResponse.Body.String())
+	}
+
+	marker := filepath.Join(secondRoot, "keep-me.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	removeBody, _ := json.Marshal(map[string]any{"id": created.SelectedInstanceID})
+	removeResponse := httptest.NewRecorder()
+	mux.ServeHTTP(removeResponse, httptest.NewRequest(http.MethodPost, "/app/instances/remove", bytes.NewReader(removeBody)))
+	if removeResponse.Code != http.StatusOK {
+		t.Fatalf("remove code=%d body=%s", removeResponse.Code, removeResponse.Body.String())
+	}
+	if body, err := os.ReadFile(marker); err != nil || string(body) != "keep" {
+		t.Fatalf("project marker was removed or changed: body=%q err=%v", body, err)
+	}
+	registry, _, err := store.Load()
+	if err != nil || len(registry.Instances) != 1 {
+		t.Fatalf("registry after remove=%#v err=%v", registry, err)
+	}
+}
+
+func TestMultiAppControllerDoesNotReimportSeedAfterValidRegistryWasEmptied(t *testing.T) {
+	root := t.TempDir()
+	store := instances.NewStore(filepath.Join(root, "appdata", "instances.json"))
+	if err := store.Save(instances.Registry{Version: instances.RegistryVersion, Instances: []instances.Entry{}}); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := newMultiAppController(context.Background(), store, serverapp.Options{
+		ConfigPath:   filepath.Join(root, "sync_config.json"),
+		PortOverride: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.registry.Instances) != 0 || len(controller.apps) != 0 {
+		t.Fatalf("valid empty registry was unexpectedly reseeded: %#v", controller.registry)
+	}
+}
+
+func TestMultiAppStartAllRunsTwoProjectsConcurrently(t *testing.T) {
+	root := t.TempDir()
+	portA := freePort(t)
+	portB := freePort(t)
+	for portB == portA {
+		portB = freePort(t)
+	}
+	entries := make([]instances.Entry, 0, 2)
+	for index, port := range []int{portA, portB} {
+		name := fmt.Sprintf("Project %d", index+1)
+		configPath := filepath.Join(root, fmt.Sprintf("project-%d.json", index+1))
+		cfg := config.Default()
+		cfg.SyncRoot = filepath.Join(root, fmt.Sprintf("game-%d", index+1))
+		cfg.Port = port
+		cfg.GitVersioningEnabled = false
+		if err := config.Save(configPath, cfg); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, instances.Entry{
+			ID:         fmt.Sprintf("project-%d", index+1),
+			Name:       name,
+			ConfigPath: configPath,
+		})
+	}
+	store := instances.NewStore(filepath.Join(root, "appdata", "instances.json"))
+	if err := store.Save(instances.Registry{
+		Version:            instances.RegistryVersion,
+		SelectedInstanceID: entries[0].ID,
+		Instances:          entries,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := newMultiAppController(context.Background(), store, serverapp.Options{PortOverride: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		controller.stopAll(stopCtx)
+	}()
+	response := httptest.NewRecorder()
+	controller.handleStartAll(response, httptest.NewRequest(http.MethodPost, "/app/start-all", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("start-all code=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, entry := range entries {
+		app, _, ok := controller.resolveApp(entry.ID)
+		if !ok || !app.runner.Status(1).Running {
+			t.Fatalf("%s was not running after Start All", entry.ID)
+		}
 	}
 }
 
@@ -707,11 +906,20 @@ func TestPluginUISimplifiedActions(t *testing.T) {
 	}
 	document := string(body)
 	for _, needle := range []string{
-		`snapshotButton.Text = "Resync"`,
-		`historyPanel.Visible = false`,
-		`metaFrame.Visible = false`,
-		`debugFrame.Visible = false`,
-		`connectionLayout.CellSize = UDim2.new(0.5, -4, 1, 0)`,
+		`local snapshotButton = button(actionGrid, "Resync"`,
+		`AutomaticCanvasSize = Enum.AutomaticSize.Y`,
+		`AutomaticSize = Enum.AutomaticSize.Y`,
+		`label(connectionPanel, "CONNECTION"`,
+		`profileEditor.Visible = false`,
+		`debugBody.Visible = false`,
+		`profileEditorToggleButton`,
+		`debugDisclosureButton`,
+		`value.Selectable = true`,
+		`UDim2.new(0, 104, 0, 40)`,
+		`listConnectionProfiles`,
+		`selectConnectionProfile`,
+		`upsertConnectionProfile`,
+		`removeConnectionProfile`,
 	} {
 		if !strings.Contains(document, needle) {
 			t.Fatalf("plugin UI missing %q", needle)
@@ -719,6 +927,9 @@ func TestPluginUISimplifiedActions(t *testing.T) {
 	}
 	if strings.Contains(document, `snapshotButton.Text = "Snapshot"`) {
 		t.Fatal("plugin still labels snapshot button as Snapshot")
+	}
+	if strings.Contains(document, `Instance.new("UIGradient")`) {
+		t.Fatal("plugin still contains beveled gradient controls")
 	}
 }
 
@@ -741,7 +952,7 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 	typeListDocument := string(typeListBody)
 	for _, needle := range []string{
 		`BootstrapPreview = "/bootstrap/preview"`,
-		`TypeList.VERSION = "3.9.0"`,
+		`TypeList.VERSION = "4.1.0"`,
 	} {
 		if !strings.Contains(typeListDocument, needle) {
 			t.Fatalf("TypeList missing %q", needle)
@@ -754,28 +965,89 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 		`TypeList.ENDPOINTS.BootstrapPreview`,
 		`pendingPullPreview`,
 		`self:pushStudioSnapshot(`,
+		`riftsync_connection_profiles_v1`,
+		`riftsync_place_profile_map_v1`,
+		`currentPlaceProfileKey`,
+		`listConnectionProfiles`,
+		`selectConnectionProfile`,
+		`upsertConnectionProfile`,
+		`removeConnectionProfile`,
 	} {
 		if !strings.Contains(apiDocument, needle) {
 			t.Fatalf("API missing %q", needle)
 		}
 	}
 	for _, needle := range []string{
-		`pullPreviewFrame`,
-		`Pull Studio preview`,
+		`pullPreviewPanel`,
+		`PULL STUDIO PREVIEW`,
 		`confirmPullButton`,
 		`cancelPullButton`,
 		`client:previewPullStudioToLocal()`,
 		`client:confirmPullStudioToLocal()`,
 		`client:cancelPullStudioToLocal()`,
-		`HTTP/server reachable`,
-		`connected to server`,
-		`token valid`,
-		`sync active`,
-		`exec active`,
+		`http_server_reachable`,
+		`connected_to_server`,
+		`token_valid`,
+		`sync_active`,
+		`exec_active`,
 		`edit mode`,
 	} {
 		if !strings.Contains(pluginDocument, needle) {
 			t.Fatalf("plugin UI missing %q", needle)
+		}
+	}
+}
+
+func TestPluginBroadPropertiesSchemaAndReferenceApply(t *testing.T) {
+	apiBody, err := os.ReadFile(filepath.Join("..", "..", "plugin", "API.lua"))
+	if err != nil {
+		t.Fatalf("read API: %v", err)
+	}
+	typeListBody, err := os.ReadFile(filepath.Join("..", "..", "plugin", "TypeList.lua"))
+	if err != nil {
+		t.Fatalf("read TypeList: %v", err)
+	}
+	apiDocument := string(apiBody)
+	typeListDocument := string(typeListBody)
+	for _, needle := range []string{
+		`Script = { "Enabled", "RunContext" }`,
+		`Terrain = {`,
+		`Atmosphere = {`,
+		`DepthOfFieldEffect = {`,
+		`IntValue = { "Value" }`,
+		`ObjectValue = { "Value" }`,
+		`AudioAnalyzer = { "SpectrumEnabled", "WindowSize" }`,
+		`ParticleEmitter = {`,
+		`WeldConstraint = { "Enabled", "Part0", "Part1" }`,
+		`TypeList.GEOMETRY_ANCESTOR_CLASSES`,
+		`TypeList.INSTANCE_REFERENCE_PROPERTIES`,
+	} {
+		if !strings.Contains(typeListDocument, needle) {
+			t.Fatalf("broad property schema missing %q", needle)
+		}
+	}
+	for _, forbidden := range []string{
+		`BasePart = {`,
+		`Model = {`,
+		`"Source",`,
+		`"FlipbookIncompatible",`,
+	} {
+		if strings.Contains(typeListDocument, forbidden) {
+			t.Fatalf("broad property schema contains excluded entry %q", forbidden)
+		}
+	}
+	for _, needle := range []string{
+		`rootInstance:GetDescendants()`,
+		`instance:IsA("BasePart") or instance:IsA("Model") or instance:IsA("Camera")`,
+		`["$type"] = "InstanceRef"`,
+		`["$type"] = "Ray"`,
+		`buildReferenceIndex(self.managedRoots)`,
+		`properties.Enabled == nil and legacyDisabled ~= nil`,
+		`Parent missing for metadata target`,
+		`hasGeometryAncestorLocalPath(change.local_path)`,
+	} {
+		if !strings.Contains(apiDocument, needle) {
+			t.Fatalf("broad property implementation missing %q", needle)
 		}
 	}
 }

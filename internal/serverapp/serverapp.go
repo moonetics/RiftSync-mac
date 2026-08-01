@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -18,7 +19,7 @@ import (
 	"riftsync/internal/watcher"
 )
 
-const Version = "3.9.0"
+const Version = "4.1.0"
 
 type Options struct {
 	ConfigPath            string
@@ -108,6 +109,16 @@ func (r *Runner) Start(parent context.Context) error {
 	if err := cfg.NormalizeAndValidate(); err != nil {
 		return fmt.Errorf("config error: %w", err)
 	}
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.Host, cfg.Port))
+	if err != nil {
+		return fmt.Errorf("listen on %s:%d: %w", cfg.Host, cfg.Port, err)
+	}
+	closeListener := true
+	defer func() {
+		if closeListener {
+			_ = listener.Close()
+		}
+	}()
 	executablePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("executable path error: %w", err)
@@ -169,7 +180,7 @@ func (r *Runner) Start(parent context.Context) error {
 	}
 	done := make(chan error, 1)
 	go func() {
-		err := server.ListenAndServe()
+		err := server.Serve(listener)
 		if err == http.ErrServerClosed {
 			err = nil
 		}
@@ -189,6 +200,7 @@ func (r *Runner) Start(parent context.Context) error {
 	r.running = true
 	r.startedAt = time.Now()
 	r.mu.Unlock()
+	closeListener = false
 	return nil
 }
 

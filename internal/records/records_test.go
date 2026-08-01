@@ -158,6 +158,43 @@ func TestUIPropertiesRecordDefaultsNameAndClass(t *testing.T) {
 	}
 }
 
+func TestBroadMetadataRecordNestedBelowGeometry(t *testing.T) {
+	source := `{
+  "id":"health-id",
+  "className":"ObjectValue",
+  "name":"HealthTarget",
+  "properties":{"Value":{"$type":"InstanceRef","stableId":"target-id","path":"game.Workspace.Map.Target"}},
+  "attributes":{"Purpose":"test"},
+  "tags":["metadata"]
+}`
+	record, err := NewUIRecord(
+		"Workspace/Map.Model/Trigger.Part/HealthTarget.ObjectValue/properties.init.json",
+		source,
+		managedServices,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewUIRecord returned error: %v", err)
+	}
+	if record == nil {
+		t.Fatal("record is nil")
+	}
+	if record.RbxPath != "game.Workspace.Map.Trigger.HealthTarget" {
+		t.Fatalf("RbxPath = %q, want nested path with geometry as anchors", record.RbxPath)
+	}
+	if record.ClassName != "ObjectValue" || record.StableID != "health-id" {
+		t.Fatalf("record class/id = %q/%q", record.ClassName, record.StableID)
+	}
+	properties, ok := record.Payload["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties = %#v, want object", record.Payload["properties"])
+	}
+	reference, ok := properties["Value"].(map[string]any)
+	if !ok || reference["$type"] != "InstanceRef" || reference["stableId"] != "target-id" {
+		t.Fatalf("Value = %#v, want preserved InstanceRef", properties["Value"])
+	}
+}
+
 func TestRojoInitMetaRecordNormalizesPayload(t *testing.T) {
 	record, err := NewRojoInitMetaRecord("StarterGui/Menu/init.meta.json", `{"$className":"ScreenGui","properties":{"ResetOnSpawn":false}}`, managedServices, nil)
 	if err != nil {

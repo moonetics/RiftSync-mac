@@ -18,11 +18,11 @@ import (
 	"time"
 
 	"riftsync/internal/config"
+	"riftsync/internal/debuglog"
 	"riftsync/internal/exechistory"
 	"riftsync/internal/records"
 	"riftsync/internal/scanner"
 	"riftsync/internal/serverapp"
-	"riftsync/internal/uiapp"
 )
 
 const (
@@ -89,12 +89,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var runErr error
-	if options.headless {
-		runErr = runHeadless(ctx, options, os.Stdout)
-	} else {
-		runErr = uiapp.Run(ctx, toServerOptions(options, os.Stdout))
-	}
+	runErr := runHeadless(ctx, options, os.Stdout)
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", runErr)
 		os.Exit(1)
@@ -114,7 +109,7 @@ func parseOptions(args []string) (cliOptions, error) {
 	flags.StringVar(&options.syncRootOverride, "sync-root", "", "override sync root path")
 	flags.BoolVar(&options.debug, "debug", false, "print verbose startup and runtime diagnostics")
 	flags.BoolVar(&options.legacyScan, "legacy-scan", false, "use periodic full scan instead of fsnotify watcher")
-	flags.BoolVar(&options.headless, "headless", false, "run console server without native UI")
+	flags.BoolVar(&options.headless, "headless", false, "run console server (default; retained for compatibility)")
 	if err := flags.Parse(args); err != nil {
 		return cliOptions{}, err
 	}
@@ -155,7 +150,7 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "Usage: riftsync-server [--headless] [--config sync_config.json] [--host 127.0.0.1] [--port 8765] [--sync-root src/game] [--debug] [--legacy-scan]")
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Flags:")
-	fmt.Fprintln(out, "  --headless     Run console server without native UI")
+	fmt.Fprintln(out, "  --headless     Run console server (already the default; retained for compatibility)")
 	fmt.Fprintln(out, "  --config       Path to sync_config.json (default sync_config.json)")
 	fmt.Fprintln(out, "  --host         Override local bind host")
 	fmt.Fprintln(out, "  --port         Override server port from config")
@@ -287,11 +282,12 @@ func hasTimeoutArg(args []string) bool {
 
 func runHeadless(ctx context.Context, options cliOptions, stdout io.Writer) error {
 	runner := serverapp.New(toServerOptions(options, stdout))
-	fmt.Fprintf(stdout, "RiftSync Go server %s\n", serverapp.Version)
+	fmt.Fprintf(stdout, "RiftSync server %s\n", serverapp.Version)
+	fmt.Fprintf(stdout, "[config] %s\n", options.configPath)
 	if err := runner.Start(ctx); err != nil {
 		return err
 	}
-	status := runner.Status(5)
+	status := runner.Status(100)
 	fmt.Fprintf(stdout, "[sync] server listening on http://%s:%d\n", status.Host, status.Port)
 	fmt.Fprintf(stdout, "[sync] sync root: %s\n", status.SyncRoot)
 	if status.LegacyScan {
@@ -299,10 +295,78 @@ func runHeadless(ctx context.Context, options cliOptions, stdout io.Writer) erro
 	} else {
 		fmt.Fprintln(stdout, "[sync] watcher active")
 	}
-	<-ctx.Done()
-	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return runner.Stop(stopCtx)
+	fmt.Fprintf(stdout, "[sync] indexed entries=%d scripts=%d ui=%d revision=%d\n", status.Counts.Entry, status.Counts.Script, status.Counts.UI, status.Revision)
+	fmt.Fprintf(stdout, "[sync] git=%s remote_exec=%t\n", status.Git.Status, status.RemoteExecEnabled)
+	fmt.Fprintln(stdout, "[sync] live event stream active; press Ctrl+C to stop")
+
+	lastEvent := ""
+	lastHeartbeat := time.Now()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Fprintln(stdout, "[sync] stopping...")
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := runner.Stop(stopCtx)
+			if err == nil {
+				fmt.Fprintln(stdout, "[sync] stopped")
+			}
+			return err
+		case now := <-ticker.C:
+			status = runner.Status(100)
+			lastEvent = printRuntimeEvents(stdout, status.Events, lastEvent)
+			interval := 15 * time.Second
+			if options.debug {
+				interval = 3 * time.Second
+			}
+			if now.Sub(lastHeartbeat) >= interval {
+				printRuntimeStatus(stdout, status, options.debug)
+				lastHeartbeat = now
+			}
+		}
+	}
+}
+
+func printRuntimeEvents(out io.Writer, events []debuglog.Event, lastEvent string) string {
+	start := 0
+	if lastEvent != "" {
+		start = len(events)
+		for index := len(events) - 1; index >= 0; index-- {
+			if runtimeEventKey(events[index]) == lastEvent {
+				start = index + 1
+				break
+			}
+		}
+	}
+	for _, event := range events[start:] {
+		stamp := time.UnixMilli(int64(event.TS * 1000)).Format("15:04:05.000")
+		fmt.Fprintf(out, "[%s] [%-9s] %s\n", stamp, event.Kind, event.Message)
+		lastEvent = runtimeEventKey(event)
+	}
+	return lastEvent
+}
+
+func runtimeEventKey(event debuglog.Event) string {
+	return fmt.Sprintf("%.3f\x00%s\x00%s", event.TS, event.Kind, event.Message)
+}
+
+func printRuntimeStatus(out io.Writer, status serverapp.Status, debug bool) {
+	uptime := time.Duration(0)
+	if !status.StartedAt.IsZero() {
+		uptime = time.Since(status.StartedAt).Round(time.Second)
+	}
+	fmt.Fprintf(out, "[status] uptime=%s revision=%d indexed=%d requests=%d handshakes=%d change_polls=%d git=%s\n",
+		uptime, status.Revision, status.Counts.Entry, status.Metrics.RequestCount, status.Metrics.HandshakeCount, status.Metrics.ChangesRequests, status.Git.Status)
+	if debug {
+		fmt.Fprintf(out, "[debug] scans=%d last_scan=%.3fs scripts=%d ui=%d cache_hits=%d cache_misses=%d payload=%dB\n",
+			status.Metrics.ScanCycles, status.Metrics.LastScanSec, status.Counts.Script, status.Counts.UI,
+			status.Metrics.LastCacheHitCount, status.Metrics.LastCacheMissCount, status.Metrics.LastPayloadBytes)
+	}
+	if status.LastError != "" {
+		fmt.Fprintf(out, "[error] %s\n", status.LastError)
+	}
 }
 
 type validateReport struct {
@@ -757,6 +821,7 @@ func recordExecHistory(syncRoot string, sourceRequest execSourceRequest, timeout
 		ResultState: result.State,
 		OK:          result.OK,
 		Error:       result.Error,
+		Traceback:   result.Traceback,
 		DurationMS:  result.DurationMS,
 		CommandID:   commandID,
 		RerunOfID:   sourceRequest.RerunOfID,

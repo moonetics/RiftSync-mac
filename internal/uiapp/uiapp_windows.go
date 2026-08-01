@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 
 	"riftsync/internal/config"
 	"riftsync/internal/exechistory"
+	"riftsync/internal/instances"
 	"riftsync/internal/serverapp"
 	"riftsync/internal/state"
 
@@ -57,8 +59,8 @@ const (
 	wmClose             = uintptr(0x0010)
 	wmNCLButtonDown     = uintptr(0x00A1)
 	htCaption           = uintptr(2)
-	defaultWindowWidth  = 1120
-	defaultWindowHeight = 760
+	defaultWindowWidth  = 1280
+	defaultWindowHeight = 720
 	coinitApartment     = uintptr(0x2)
 	rpcEChangedMode     = uintptr(0x80010106)
 	clsctxInprocServer  = uintptr(0x1)
@@ -130,11 +132,28 @@ type appController struct {
 	forceExit bool
 }
 
+type multiAppController struct {
+	ctx      context.Context
+	store    *instances.Store
+	window   *windowController
+	registry instances.Registry
+	apps     map[string]*appController
+
+	mu        sync.Mutex
+	quitOnce  sync.Once
+	quit      chan struct{}
+	terminate func()
+	forceExit bool
+	warning   string
+}
+
 type windowController struct {
 	hwnd uintptr
 }
 
 type statusPayload struct {
+	InstanceID           string  `json:"instance_id,omitempty"`
+	InstanceName         string  `json:"instance_name,omitempty"`
 	Running              bool    `json:"running"`
 	Starting             bool    `json:"starting"`
 	Status               string  `json:"status"`
@@ -189,6 +208,25 @@ type execRerunRequest struct {
 	TimeoutSec int    `json:"timeout_sec"`
 }
 
+type createInstanceRequest struct {
+	Name       string `json:"name"`
+	SyncRoot   string `json:"sync_root"`
+	ConfigPath string `json:"config_path"`
+}
+
+type instanceIDRequest struct {
+	ID string `json:"id"`
+}
+
+type updateInstanceRequest struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type sidebarRequest struct {
+	Pinned bool `json:"pinned"`
+}
+
 type appExecPrint struct {
 	Level string  `json:"level"`
 	Text  string  `json:"text"`
@@ -222,12 +260,13 @@ type appExecDetailResponse struct {
 // Run starts a tiny loopback control UI and displays it in an embedded WebView2 window.
 // The sync server itself remains stopped until the user clicks Start.
 func Run(ctx context.Context, options serverapp.Options) error {
-	controller := &appController{
-		runner:    serverapp.New(options),
-		options:   normalizeUIOptions(options),
-		ctx:       ctx,
-		quit:      make(chan struct{}),
-		forceExit: true,
+	registryPath, err := instances.DefaultPath()
+	if err != nil {
+		return err
+	}
+	controller, err := newMultiAppController(ctx, instances.NewStore(registryPath), options)
+	if err != nil {
+		return err
 	}
 	mux := http.NewServeMux()
 	controller.registerRoutes(mux)
@@ -259,6 +298,11 @@ func Run(ctx context.Context, options serverapp.Options) error {
 	window := &windowController{hwnd: uintptr(w.Window())}
 	controller.window = window
 	controller.terminate = w.Terminate
+	controller.mu.Lock()
+	for _, app := range controller.apps {
+		app.window = window
+	}
+	controller.mu.Unlock()
 	_ = window.makeFrameless()
 	_ = w.Bind("appDragWindow", func() error {
 		return window.drag()
@@ -288,7 +332,7 @@ func Run(ctx context.Context, options serverapp.Options) error {
 
 	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = controller.runner.Stop(stopCtx)
+	controller.stopAll(stopCtx)
 	_ = server.Shutdown(stopCtx)
 
 	var result error
@@ -304,6 +348,657 @@ func Run(ctx context.Context, options serverapp.Options) error {
 	case <-stopCtx.Done():
 	}
 	return result
+}
+
+func newMultiAppController(ctx context.Context, store *instances.Store, options serverapp.Options) (*multiAppController, error) {
+	_, registryStatErr := os.Stat(store.Path())
+	registryExisted := registryStatErr == nil
+	registry, warning, err := store.Load()
+	if err != nil {
+		return nil, err
+	}
+	seeded := false
+	if len(registry.Instances) == 0 && (!registryExisted || warning != "") {
+		registry, seeded, err = instances.EnsureSeed(registry, fallback(options.ConfigPath, "sync_config.json"))
+		if err != nil {
+			return nil, err
+		}
+	}
+	if seeded {
+		if err := store.Save(registry); err != nil {
+			return nil, err
+		}
+	}
+	controller := &multiAppController{
+		ctx:       ctx,
+		store:     store,
+		registry:  registry,
+		apps:      map[string]*appController{},
+		quit:      make(chan struct{}),
+		forceExit: true,
+		warning:   warning,
+	}
+	seedConfigAbs, _ := filepath.Abs(fallback(options.ConfigPath, "sync_config.json"))
+	for _, entry := range registry.Instances {
+		entryOptions := options
+		entryOptions.ConfigPath = entry.ConfigPath
+		if !strings.EqualFold(filepath.Clean(entry.ConfigPath), filepath.Clean(seedConfigAbs)) {
+			entryOptions.HostOverride = ""
+			entryOptions.PortOverride = -1
+			entryOptions.SyncRootOverride = ""
+		}
+		controller.apps[entry.ID] = controller.newInstanceController(entryOptions)
+	}
+	return controller, nil
+}
+
+func (m *multiAppController) newInstanceController(options serverapp.Options) *appController {
+	options = normalizeUIOptions(options)
+	return &appController{
+		runner:    serverapp.New(options),
+		options:   options,
+		ctx:       m.ctx,
+		window:    m.window,
+		quit:      m.quit,
+		forceExit: false,
+	}
+}
+
+func (m *multiAppController) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/app", m.handleApp)
+	mux.HandleFunc("/app/instances", m.handleInstances)
+	mux.HandleFunc("/app/instances/select", m.handleSelectInstance)
+	mux.HandleFunc("/app/instances/update", m.handleUpdateInstance)
+	mux.HandleFunc("/app/instances/remove", m.handleRemoveInstance)
+	mux.HandleFunc("/app/instances/pick-folder", m.handleGlobalPickFolder)
+	mux.HandleFunc("/app/sidebar", m.handleSidebar)
+	mux.HandleFunc("/app/start-all", m.handleStartAll)
+	mux.HandleFunc("/app/status", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleStatus(w, r) }))
+	mux.HandleFunc("/app/start", m.handleStartInstance)
+	mux.HandleFunc("/app/stop", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleStop(w, r) }))
+	mux.HandleFunc("/app/restart", m.handleScopedConfigMutation(true))
+	mux.HandleFunc("/app/config/apply", m.handleScopedConfigMutation(false))
+	mux.HandleFunc("/app/open-folder", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleOpenFolder(w, r) }))
+	mux.HandleFunc("/app/pick-folder", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handlePickFolder(w, r) }))
+	mux.HandleFunc("/app/history", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleHistory(w, r) }))
+	mux.HandleFunc("/app/exec/history", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExecHistory(w, r) }))
+	mux.HandleFunc("/app/exec/run", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExecRun(w, r) }))
+	mux.HandleFunc("/app/exec/rerun", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExecRerun(w, r) }))
+	mux.HandleFunc("/app/logs", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleLogs(w, r) }))
+	mux.HandleFunc("/app/window/minimize", m.handleWindowMinimize)
+	mux.HandleFunc("/app/window/close", m.handleWindowClose)
+	mux.HandleFunc("/app/quit", m.handleWindowClose)
+}
+
+func (m *multiAppController) handleApp(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(htmlDocument()))
+}
+
+func (m *multiAppController) delegate(handler func(*appController, http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		app, _, ok := m.resolveApp(r.URL.Query().Get("instance_id"))
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "error": "instance not found"})
+			return
+		}
+		handler(app, w, r)
+	}
+}
+
+func (m *multiAppController) resolveApp(id string) (*appController, instances.Entry, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = m.registry.SelectedInstanceID
+	}
+	app := m.apps[id]
+	for _, entry := range m.registry.Instances {
+		if entry.ID == id && app != nil {
+			return app, entry, true
+		}
+	}
+	return nil, instances.Entry{}, false
+}
+
+func (m *multiAppController) handleInstances(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		m.writeInstances(w)
+	case http.MethodPost:
+		m.createInstance(w, r)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+	}
+}
+
+func (m *multiAppController) handleGlobalPickFolder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	owner := uintptr(0)
+	if m.window != nil {
+		owner = m.window.hwnd
+	}
+	path, selected, err := pickFolder(owner)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "selected": selected, "path": path})
+}
+
+func (m *multiAppController) writeInstances(w http.ResponseWriter) {
+	m.mu.Lock()
+	registry := m.registry
+	warning := m.warning
+	type pair struct {
+		entry instances.Entry
+		app   *appController
+	}
+	pairs := make([]pair, 0, len(registry.Instances))
+	for _, entry := range registry.Instances {
+		pairs = append(pairs, pair{entry: entry, app: m.apps[entry.ID]})
+	}
+	m.mu.Unlock()
+
+	items := make([]map[string]any, 0, len(pairs))
+	for _, item := range pairs {
+		status := item.app.status()
+		status.InstanceID = item.entry.ID
+		status.InstanceName = item.entry.Name
+		items = append(items, map[string]any{
+			"id":          item.entry.ID,
+			"name":        item.entry.Name,
+			"config_path": item.entry.ConfigPath,
+			"app":         status,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":               "ok",
+		"instances":            items,
+		"selected_instance_id": registry.SelectedInstanceID,
+		"sidebar_pinned":       registry.SidebarPinned,
+		"warning":              warning,
+	})
+}
+
+func (m *multiAppController) createInstance(w http.ResponseWriter, r *http.Request) {
+	var request createInstanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	syncRoot := strings.TrimSpace(request.SyncRoot)
+	configPath := strings.TrimSpace(request.ConfigPath)
+	if syncRoot == "" && configPath == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "sync_root or config_path is required"})
+		return
+	}
+	if syncRoot != "" {
+		abs, err := filepath.Abs(syncRoot)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		syncRoot = filepath.Clean(abs)
+	}
+	if configPath == "" {
+		configPath = filepath.Join(syncRoot, config.MetadataDir, "sync_config.json")
+	}
+	configAbs, err := filepath.Abs(configPath)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	configPath = filepath.Clean(configAbs)
+
+	_, statErr := os.Stat(configPath)
+	configExists := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": statErr.Error()})
+		return
+	}
+	cfg := config.Default()
+	if configExists {
+		cfg, err = config.Load(configPath)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+	} else {
+		cfg = config.Default()
+	}
+	if !configExists {
+		cfg.SyncRoot = syncRoot
+		cfg.Port = m.nextAvailablePort()
+		cfg.RemoteExecEnabled = true
+		if _, err := config.EnsureRemoteExecToken(&cfg); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		if err := config.Save(configPath, cfg); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+	} else {
+		if syncRoot == "" {
+			syncRoot = cfg.SyncRootAbs
+		} else if !strings.EqualFold(filepath.Clean(syncRoot), filepath.Clean(cfg.SyncRootAbs)) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"status": "error",
+				"error":  "selected sync root does not match the existing config sync_root",
+			})
+			return
+		}
+	}
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+
+	name := strings.TrimSpace(request.Name)
+	if name == "" {
+		name = filepath.Base(filepath.Clean(syncRoot))
+	}
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		name = "Project"
+	}
+	entry := instances.Entry{ID: instances.NewID(), Name: name, ConfigPath: configPath}
+	if err := m.addEntry(entry, cfg); err != nil {
+		if !configExists {
+			// Keep the project folder and config recoverable; only report the registry conflict.
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	m.writeInstances(w)
+}
+
+func (m *multiAppController) handleScopedConfigMutation(restart bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+			return
+		}
+		app, entry, ok := m.resolveApp(r.URL.Query().Get("instance_id"))
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "error": "instance not found"})
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		var request restartRequest
+		if err := json.Unmarshal(body, &request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+			return
+		}
+		requestConfigAbs, err := filepath.Abs(fallback(request.ConfigPath, entry.ConfigPath))
+		if err != nil || !strings.EqualFold(filepath.Clean(requestConfigAbs), filepath.Clean(entry.ConfigPath)) {
+			writeJSON(w, http.StatusConflict, map[string]any{"status": "error", "error": "registered config path cannot be changed; import it as another project"})
+			return
+		}
+		next, err := optionsFromInput(app.runner.Options(), entry.ConfigPath, request.SyncRoot, request.Host, request.Port, request.GitEnabled, request.Debug, request.LegacyScan)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		if err := m.validateOptionsUnique(entry.ID, next); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if restart {
+			app.handleRestart(w, r)
+		} else {
+			app.handleConfigApply(w, r)
+		}
+	}
+}
+
+func (m *multiAppController) validateOptionsUnique(instanceID string, options serverapp.Options) error {
+	cfg, err := config.Load(options.ConfigPath)
+	if err != nil {
+		return err
+	}
+	if options.HostOverride != "" {
+		cfg.Host = options.HostOverride
+	}
+	if options.PortOverride > 0 {
+		cfg.Port = options.PortOverride
+	}
+	if options.SyncRootOverride != "" {
+		cfg.SyncRoot = options.SyncRootOverride
+	}
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	entries := append([]instances.Entry{}, m.registry.Instances...)
+	m.mu.Unlock()
+	for _, entry := range entries {
+		if entry.ID == instanceID {
+			continue
+		}
+		other, err := config.Load(entry.ConfigPath)
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(other.SyncRootAbs, cfg.SyncRootAbs) {
+			return fmt.Errorf("sync root is already used by %s", entry.Name)
+		}
+		if other.Host == cfg.Host && other.Port == cfg.Port {
+			return fmt.Errorf("port %d is already configured by %s", cfg.Port, entry.Name)
+		}
+	}
+	return nil
+}
+
+func (m *multiAppController) addEntry(entry instances.Entry, cfg config.Config) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.registry.Instances {
+		if strings.EqualFold(filepath.Clean(existing.ConfigPath), filepath.Clean(entry.ConfigPath)) {
+			return fmt.Errorf("config path is already registered by %s", existing.Name)
+		}
+		existingCfg, err := config.Load(existing.ConfigPath)
+		if err == nil {
+			if strings.EqualFold(existingCfg.SyncRootAbs, cfg.SyncRootAbs) {
+				return fmt.Errorf("sync root is already registered by %s", existing.Name)
+			}
+			if existingCfg.Host == cfg.Host && existingCfg.Port == cfg.Port {
+				return fmt.Errorf("port %d is already configured by %s", cfg.Port, existing.Name)
+			}
+		}
+	}
+	next := m.registry
+	next.Instances = append(append([]instances.Entry{}, next.Instances...), entry)
+	next.SelectedInstanceID = entry.ID
+	if err := m.store.Save(next); err != nil {
+		return err
+	}
+	options := serverapp.Options{ConfigPath: entry.ConfigPath, PortOverride: -1}
+	m.apps[entry.ID] = m.newInstanceController(options)
+	m.registry = next
+	return nil
+}
+
+func (m *multiAppController) nextAvailablePort() int {
+	m.mu.Lock()
+	used := map[int]bool{}
+	for _, entry := range m.registry.Instances {
+		if cfg, err := config.Load(entry.ConfigPath); err == nil {
+			used[cfg.Port] = true
+		}
+	}
+	m.mu.Unlock()
+	for port := 8765; port <= 65535; port++ {
+		if used[port] {
+			continue
+		}
+		listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			_ = listener.Close()
+			return port
+		}
+	}
+	return 8765
+}
+
+func (m *multiAppController) handleSelectInstance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var request instanceIDRequest
+	if json.NewDecoder(r.Body).Decode(&request) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	m.mu.Lock()
+	if m.apps[strings.TrimSpace(request.ID)] == nil {
+		m.mu.Unlock()
+		writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "error": "instance not found"})
+		return
+	}
+	next := m.registry
+	next.SelectedInstanceID = strings.TrimSpace(request.ID)
+	if err := m.store.Save(next); err != nil {
+		m.mu.Unlock()
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	m.registry = next
+	m.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "selected_instance_id": request.ID})
+}
+
+func (m *multiAppController) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var request updateInstanceRequest
+	if json.NewDecoder(r.Body).Decode(&request) != nil || strings.TrimSpace(request.Name) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "id and name are required"})
+		return
+	}
+	m.mu.Lock()
+	next := m.registry
+	found := false
+	for index := range next.Instances {
+		if next.Instances[index].ID == strings.TrimSpace(request.ID) {
+			next.Instances[index].Name = strings.TrimSpace(request.Name)
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.mu.Unlock()
+		writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "error": "instance not found"})
+		return
+	}
+	if err := m.store.Save(next); err != nil {
+		m.mu.Unlock()
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	m.registry = next
+	m.mu.Unlock()
+	m.writeInstances(w)
+}
+
+func (m *multiAppController) handleRemoveInstance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var request instanceIDRequest
+	if json.NewDecoder(r.Body).Decode(&request) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	id := strings.TrimSpace(request.ID)
+	m.mu.Lock()
+	app := m.apps[id]
+	if app == nil {
+		m.mu.Unlock()
+		writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "error": "instance not found"})
+		return
+	}
+	if app.configLocked() {
+		m.mu.Unlock()
+		writeJSON(w, http.StatusConflict, map[string]any{"status": "error", "error": "stop this instance before removing it"})
+		return
+	}
+	next := m.registry
+	filtered := make([]instances.Entry, 0, len(next.Instances)-1)
+	for _, entry := range next.Instances {
+		if entry.ID != id {
+			filtered = append(filtered, entry)
+		}
+	}
+	next.Instances = filtered
+	if next.SelectedInstanceID == id {
+		next.SelectedInstanceID = ""
+		if len(filtered) > 0 {
+			next.SelectedInstanceID = filtered[0].ID
+		}
+	}
+	if err := m.store.Save(next); err != nil {
+		m.mu.Unlock()
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	delete(m.apps, id)
+	m.registry = next
+	m.mu.Unlock()
+	m.writeInstances(w)
+}
+
+func (m *multiAppController) handleSidebar(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var request sidebarRequest
+	if json.NewDecoder(r.Body).Decode(&request) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	m.mu.Lock()
+	next := m.registry
+	next.SidebarPinned = request.Pinned
+	if err := m.store.Save(next); err != nil {
+		m.mu.Unlock()
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	m.registry = next
+	m.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "sidebar_pinned": request.Pinned})
+}
+
+func (m *multiAppController) handleStartAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	m.mu.Lock()
+	apps := make(map[string]*appController, len(m.apps))
+	for id, app := range m.apps {
+		apps[id] = app
+	}
+	m.mu.Unlock()
+	results := map[string]any{}
+	var resultsMu sync.Mutex
+	var group sync.WaitGroup
+	for id, app := range apps {
+		group.Add(1)
+		go func(id string, app *appController) {
+			defer group.Done()
+			options := app.runner.Options()
+			err := m.validateOptionsUnique(id, options)
+			if err == nil {
+				err = ensureRemoteExecConfig(options)
+			}
+			if err == nil {
+				err = app.start(m.ctx)
+			}
+			resultsMu.Lock()
+			if err != nil {
+				results[id] = map[string]any{"status": "error", "error": err.Error(), "app": app.status()}
+			} else {
+				results[id] = map[string]any{"status": "ok", "app": app.status()}
+			}
+			resultsMu.Unlock()
+		}(id, app)
+	}
+	group.Wait()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "results": results})
+}
+
+func (m *multiAppController) handleStartInstance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	app, entry, ok := m.resolveApp(r.URL.Query().Get("instance_id"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "error": "instance not found"})
+		return
+	}
+	if err := m.validateOptionsUnique(entry.ID, app.runner.Options()); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"status": "error", "error": err.Error(), "app": app.status()})
+		return
+	}
+	app.handleStart(w, r)
+}
+
+func (m *multiAppController) handleWindowMinimize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	if m.window != nil {
+		_ = m.window.minimize()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (m *multiAppController) handleWindowClose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	m.requestQuit()
+}
+
+func (m *multiAppController) requestQuit() {
+	m.quitOnce.Do(func() {
+		close(m.quit)
+		if m.window != nil {
+			_ = m.window.close()
+		}
+		if m.terminate != nil {
+			go m.terminate()
+		}
+		if m.forceExit {
+			time.AfterFunc(1500*time.Millisecond, func() { os.Exit(0) })
+		}
+	})
+}
+
+func (m *multiAppController) stopAll(ctx context.Context) {
+	m.mu.Lock()
+	apps := make([]*appController, 0, len(m.apps))
+	for _, app := range m.apps {
+		apps = append(apps, app)
+	}
+	m.mu.Unlock()
+	var group sync.WaitGroup
+	for _, app := range apps {
+		group.Add(1)
+		go func(app *appController) {
+			defer group.Done()
+			_ = app.runner.Stop(ctx)
+		}(app)
+	}
+	group.Wait()
 }
 
 func (a *appController) registerRoutes(mux *http.ServeMux) {
@@ -667,6 +1362,8 @@ func (a *appController) runExecAndWrite(w http.ResponseWriter, source string, ti
 		ResultState: result.State,
 		OK:          result.OK,
 		Error:       result.Error,
+		Output:      formatAppExecOutput(result),
+		Traceback:   result.Traceback,
 		DurationMS:  result.DurationMS,
 		CommandID:   fallback(commandID, result.ID),
 		RerunOfID:   rerunOfID,
@@ -1480,7 +2177,7 @@ func formatGitShort(short string) string {
 	return " [" + short + "]"
 }
 
-func htmlDocument() string {
+func legacyHTMLDocument() string {
 	return `<!doctype html>
 <html lang="en">
 <head>

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"riftsync/internal/config"
+	"riftsync/internal/records"
 	"riftsync/internal/scanner"
 	"riftsync/internal/state"
 )
@@ -528,6 +529,11 @@ func calculateBootstrapPreview(cfg config.Config, mode string, files []any) boot
 			continue
 		}
 		relPosix := filepath.ToSlash(relative)
+		source, err = normalizeBootstrapFileSource(relPosix, source)
+		if err != nil {
+			preview.Errors = append(preview.Errors, fmt.Sprintf("Invalid metadata JSON %s: %v", relPosix, err))
+			continue
+		}
 		incoming[relPosix] = source
 
 		info, statErr := os.Stat(target)
@@ -548,7 +554,11 @@ func calculateBootstrapPreview(cfg config.Config, mode string, files []any) boot
 			preview.Errors = append(preview.Errors, fmt.Sprintf("Failed reading existing %s: %v", relPosix, readErr))
 			continue
 		}
-		if normalizePullText(string(existingSource)) == normalizePullText(source) {
+		existingText, normalizeErr := normalizeBootstrapFileSource(relPosix, string(existingSource))
+		if normalizeErr != nil {
+			existingText = string(existingSource)
+		}
+		if normalizePullText(existingText) == normalizePullText(source) {
 			preview.UnchangedCount++
 			continue
 		}
@@ -643,6 +653,11 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 			writeErrors = append(writeErrors, fmt.Sprintf("Invalid local_path %s", localPath))
 			continue
 		}
+		source, err = normalizeBootstrapFileSource(localPath, source)
+		if err != nil {
+			writeErrors = append(writeErrors, fmt.Sprintf("Invalid metadata JSON %s: %v", localPath, err))
+			continue
+		}
 
 		targetExists := false
 		if info, err := os.Stat(target); err == nil && !info.IsDir() {
@@ -654,7 +669,11 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 				writeErrors = append(writeErrors, fmt.Sprintf("Failed reading existing %s: %v", localPath, err))
 				continue
 			}
-			if normalizePullText(string(existingSource)) == normalizePullText(source) {
+			existingText, normalizeErr := normalizeBootstrapFileSource(localPath, string(existingSource))
+			if normalizeErr != nil {
+				existingText = string(existingSource)
+			}
+			if normalizePullText(existingText) == normalizePullText(source) {
 				unchangedCount++
 				continue
 			}
@@ -1050,6 +1069,23 @@ func isPreservedRootEntry(name string) bool {
 func normalizePullText(value string) string {
 	value = strings.ReplaceAll(value, "\r\n", "\n")
 	return strings.ReplaceAll(value, "\r", "\n")
+}
+
+func normalizeBootstrapFileSource(localPath, source string) (string, error) {
+	filename := strings.ToLower(filepath.Base(filepath.ToSlash(localPath)))
+	if filename != records.UIPropertiesFilename && filename != records.UIInitMetaFilename && !strings.HasSuffix(filename, records.UIModelJSONSuffix) {
+		return source, nil
+	}
+
+	var payload any
+	if err := json.Unmarshal([]byte(source), &payload); err != nil {
+		return "", err
+	}
+	body, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(body) + "\n", nil
 }
 
 func firstWarnings(warnings []string, limit int) []string {

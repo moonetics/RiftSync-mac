@@ -35,6 +35,8 @@ type Entry struct {
 	ResultState   string        `json:"result_state"`
 	OK            bool          `json:"ok"`
 	Error         string        `json:"error,omitempty"`
+	Output        string        `json:"output,omitempty"`
+	Traceback     string        `json:"traceback,omitempty"`
 	DurationMS    float64       `json:"duration_ms,omitempty"`
 	CommandID     string        `json:"command_id,omitempty"`
 	RerunOfID     string        `json:"rerun_of_id,omitempty"`
@@ -127,6 +129,8 @@ func NormalizeEntry(entry Entry) Entry {
 	entry.FilePath = strings.TrimSpace(entry.FilePath)
 	entry.ResultState = strings.TrimSpace(entry.ResultState)
 	entry.Error = strings.TrimSpace(entry.Error)
+	entry.Output = strings.TrimSpace(entry.Output)
+	entry.Traceback = strings.TrimSpace(entry.Traceback)
 	entry.CommandID = strings.TrimSpace(entry.CommandID)
 	entry.RerunOfID = strings.TrimSpace(entry.RerunOfID)
 	if entry.SourceSummary == (SourceSummary{}) {
