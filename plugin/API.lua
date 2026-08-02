@@ -514,8 +514,38 @@ local function buildErrorSummary(prefix : string, errors : {string}, maxItems : 
 end
 
 local function warnErrorList(context : string, errors : {string})
-	for index, message in ipairs(errors) do
-		warn("[RiftSync] " .. context .. " [" .. tostring(index) .. "] " .. message)
+	local categories = {}
+	for _, message in ipairs(errors) do
+		local lowered = string.lower(tostring(message))
+		local category = "other"
+		if string.find(lowered, "parent missing", 1, true) or string.find(lowered, "orphan", 1, true) then
+			category = "missing_parent"
+		elseif string.find(lowered, "property", 1, true) then
+			category = "property"
+		elseif string.find(lowered, "instanceref", 1, true) then
+			category = "instance_reference"
+		end
+		categories[category] = (categories[category] or 0) + 1
+	end
+	local categoryParts = {}
+	for category, count in pairs(categories) do
+		table.insert(categoryParts, category .. "=" .. tostring(count))
+	end
+	table.sort(categoryParts)
+	warn(
+		"[RiftSync] "
+			.. context
+			.. " summary: "
+			.. tostring(#errors)
+			.. " error(s)"
+			.. (#categoryParts > 0 and (" [" .. table.concat(categoryParts, ", ") .. "]") or "")
+	)
+	local limit = math.min(#errors, 10)
+	for index = 1, limit do
+		warn("[RiftSync] " .. context .. " sample [" .. tostring(index) .. "] " .. tostring(errors[index]))
+	end
+	if #errors > limit then
+		warn("[RiftSync] " .. context .. " +" .. tostring(#errors - limit) .. " error serupa disembunyikan")
 	end
 end
 
@@ -942,9 +972,12 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 	self.strictPropertyWhitelist = TypeList.DEFAULT_STRICT_PROPERTY_WHITELIST == true
 	self.extraAllowedProperties = TypeList.normaliseExtraAllowedProperties
 			and TypeList.normaliseExtraAllowedProperties(TypeList.DEFAULT_EXTRA_ALLOWED_PROPERTIES or {})
-		or {}
+			or {}
+	self.propertyCandidateCache = {}
 	self.startMode = TypeList.normaliseStartMode(tostring(configuredStartMode or ""))
-self.serverIndexedCount = 0
+	self.serverIndexedCount = 0
+	self.serverSyncRootEmpty = false
+	self.serverSyncRootInitialized = false
 	self.changeEncoding = TypeList.CHANGE_ENCODINGS and TypeList.CHANGE_ENCODINGS.Compact or "compact-json-v1"
 	self.debugEnabled = getPluginSetting(pluginInstance, "DebugEnabled") == true
 	self.remoteExecEnabled = false
@@ -1280,6 +1313,9 @@ function SyncAPI:publishSyncHistory(historyEvents : {any}?)
 			kind = "history",
 			events = historyEvents,
 			revision = self.lastAppliedRevision,
+			operation = "sync",
+			phase = "complete",
+			progress = 100,
 		})
 	end)
 end
@@ -1364,7 +1400,10 @@ function SyncAPI:reportActivity(text : any, isError : boolean?, meta : any?)
 	if textValue == "" then
 		return
 	end
-	local progress = tonumber(string.match(textValue, "%((%d+)%%%)")) or 0
+	local metaValue = typeof(meta) == "table" and meta or {}
+	local progress = tonumber(metaValue.progress)
+		or tonumber(string.match(textValue, "%((%d+)%%%)"))
+		or 0
 	local loweredForThrottle = string.lower(textValue)
 	local isTerminalActivity = progress >= 100
 		or string.find(loweredForThrottle, "idle", 1, true) ~= nil
@@ -1372,20 +1411,10 @@ function SyncAPI:reportActivity(text : any, isError : boolean?, meta : any?)
 		or string.find(loweredForThrottle, "synced", 1, true) ~= nil
 		or string.find(loweredForThrottle, "resynced", 1, true) ~= nil
 		or string.find(loweredForThrottle, "pulled", 1, true) ~= nil
-	local nowClock = os.clock()
-	if isError ~= true and isTerminalActivity ~= true and self.lastActivityReportAt ~= nil then
-		local elapsed = nowClock - self.lastActivityReportAt
-		if elapsed < 0.15 then
-			return
-		end
-		if elapsed < 0.35 and textValue == self.lastActivityText then
-			return
-		end
-	end
 
 	local operation = ""
-	if typeof(meta) == "table" and typeof(meta.operation) == "string" then
-		operation = meta.operation
+	if typeof(metaValue.operation) == "string" then
+		operation = metaValue.operation
 	else
 		local lowered = string.lower(textValue)
 		if string.find(lowered, "pull", 1, true) then
@@ -1402,13 +1431,49 @@ function SyncAPI:reportActivity(text : any, isError : boolean?, meta : any?)
 			operation = "idle"
 		end
 	end
+	local phase = typeof(metaValue.phase) == "string" and metaValue.phase or operation
+	if isTerminalActivity and progress < 100 then
+		progress = 100
+	end
+	progress = math.clamp(math.floor(progress + 0.5), 0, 100)
+	if operation == self.lastActivityOperation
+		and isTerminalActivity ~= true
+		and isError ~= true
+		and progress < (tonumber(self.lastActivityProgress) or 0)
+	then
+		progress = tonumber(self.lastActivityProgress) or progress
+	end
+
+	local current = math.max(0, math.floor(tonumber(metaValue.current) or 0))
+	local total = math.max(0, math.floor(tonumber(metaValue.total) or 0))
+	if total > 0 then
+		current = math.min(current, total)
+	end
+	local indeterminate = metaValue.indeterminate == true
+	local nowClock = os.clock()
+	local materialChange = operation ~= self.lastActivityOperation
+		or phase ~= self.lastActivityPhase
+		or progress > (tonumber(self.lastActivityProgress) or -1)
+		or indeterminate ~= (self.lastActivityIndeterminate == true)
+		or isError == true
+		or isTerminalActivity == true
+	if not materialChange and self.lastActivityReportAt ~= nil then
+		local elapsed = nowClock - self.lastActivityReportAt
+		if elapsed < 0.35 or textValue == self.lastActivityText then
+			return
+		end
+	end
 
 	local payload = {
 		client_id = self.clientId,
 		text = textValue,
 		error = isError == true,
 		operation = operation,
+		phase = phase,
 		progress = progress,
+		current = current,
+		total = total,
+		indeterminate = indeterminate,
 		revision = tonumber(self.lastAppliedRevision) or 0,
 	}
 
@@ -1432,6 +1497,10 @@ function SyncAPI:reportActivity(text : any, isError : boolean?, meta : any?)
 	end)
 	self.lastActivityReportAt = nowClock
 	self.lastActivityText = textValue
+	self.lastActivityOperation = operation
+	self.lastActivityPhase = phase
+	self.lastActivityProgress = progress
+	self.lastActivityIndeterminate = indeterminate
 end
 
 function SyncAPI:requestJson(method : string, endpoint : string, payload : {[string]: any}?, queryParams : {[string]: string | number}?)
@@ -1686,8 +1755,29 @@ function SyncAPI:pushStudioSnapshot()
 	end
 
 	local serverErrors = response.errors
-	if typeof(serverErrors) == "table" and #serverErrors > 0 then
-		warn("Bootstrap server errors: " .. table.concat(serverErrors, " | "))
+	local serverErrorCount = tonumber(response.error_count) or (typeof(serverErrors) == "table" and #serverErrors or 0)
+	if serverErrorCount > 0 then
+		local errorText = "Bootstrap completed with " .. tostring(serverErrorCount) .. " server errors"
+		if typeof(serverErrors) == "table" and #serverErrors > 0 then
+			errorText ..= ": " .. table.concat(serverErrors, " | ")
+		end
+		self:setDebugError(errorText)
+		return false, errorText
+	end
+
+	local acceptedRevision = tonumber(response.server_rev) or self.lastAppliedRevision
+	if typeof(skipInfo) == "table" and typeof(skipInfo.ownership) == "table" then
+		for _, entry in ipairs(skipInfo.ownership) do
+			if typeof(entry) == "table" and typeof(entry.instance) == "Instance" and entry.instance.Parent ~= nil then
+				markManagedInstance(
+					entry.instance,
+					entry.localPath,
+					acceptedRevision,
+					entry.stableId,
+					entry.entityKind
+				)
+			end
+		end
 	end
 
 	local pushedCount = tonumber(response.written_count) or #files
@@ -1731,7 +1821,15 @@ function SyncAPI:applyUpsert(change : {[string]: any}, revision : number)
 		return false, "Unsupported class in upsert: " .. className
 	end
 
-	local parent, targetName, parentError = ensureParentPath(rbxPath)
+	local parent, targetName, _, parentError = resolveLocalChangeParent(
+		change,
+		INSTANCE_KINDS.Script,
+		className,
+		false
+	)
+	if not parent and parentError == nil then
+		parent, targetName, parentError = ensureParentPath(rbxPath)
+	end
 	if not parent then
 		return false, parentError
 	end
@@ -1797,7 +1895,14 @@ function SyncAPI:applyRename(change : {[string]: any}, revision : number)
 		return true
 	end
 
-	local existing = resolvePath(oldPath)
+	local indexes = buildManagedIndexes(self.managedRoots)
+	local existing = nil
+	if typeof(change.old_local_path) == "string" and change.old_local_path ~= "" then
+		existing = indexes.byLocalPath[change.old_local_path]
+	end
+	if not existing then
+		existing = resolvePath(oldPath)
+	end
 	if not existing then
 		if typeof(change.source) == "string" then
 			return self:applyUpsert(change, revision)
@@ -1809,7 +1914,15 @@ function SyncAPI:applyRename(change : {[string]: any}, revision : number)
 		return false, "Refused to rename unmanaged instance at " .. oldPath
 	end
 
-	local newParent, newName, parentError = ensureParentPath(newPath)
+	local newParent, newName, _, parentError = resolveLocalChangeParent(
+		change,
+		INSTANCE_KINDS.Script,
+		existing.ClassName,
+		false
+	)
+	if not newParent and parentError == nil then
+		newParent, newName, parentError = ensureParentPath(newPath)
+	end
 	if not newParent then
 		return false, parentError
 	end
@@ -1837,6 +1950,9 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 		return true, {}, {}, {
 			total = 0,
 			applied = 0,
+			skipped = 0,
+			warnings = 0,
+			errors = 0,
 		}
 	end
 
@@ -1891,6 +2007,7 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 	local notices = {}
 	local noticeSeen = {}
 	local appliedCount = 0
+	local skippedCount = 0
 
 	for _, change in ipairs(orderedChanges) do
 		local operation = change.op
@@ -1948,9 +2065,25 @@ function SyncAPI:fetchSnapshot()
 	end
 
 	local changes = expandCompactChanges(response.changes or {}, response.change_encoding)
+	if response.authoritative == true and typeof(response.deletion_tombstones) == "table" then
+		for _, tombstone in ipairs(response.deletion_tombstones) do
+			if typeof(tombstone) == "table" then
+				table.insert(changes, {
+					op = "delete",
+					entity = tombstone.entity,
+					local_path = tombstone.local_path,
+					rbx_path = tombstone.rbx_path,
+					class_name = tombstone.class_name,
+					stable_id = tombstone.stable_id,
+					repair_tombstone = true,
+				})
+			end
+		end
+	end
 	local serverRevision = tonumber(response.server_rev) or self.lastAppliedRevision
 	self.debugState.lastServerRev = serverRevision
 	local ok, errors, notices, applyStats = self:applyChanges(changes, serverRevision)
+	self.lastApplyStats = applyStats
 	if not ok then
 		if typeof(applyStats) == "table" then
 			self:publishSyncHistory(applyStats.history)
@@ -1968,6 +2101,22 @@ function SyncAPI:fetchSnapshot()
 	end
 	self:appendDebugEvent("Snapshot apply sukses, rev " .. tostring(self.lastAppliedRevision), false)
 	if typeof(applyStats) == "table" then
+		if typeof(applyStats.repair) == "table" then
+			local repair = applyStats.repair
+			self:appendDebugEvent(
+				"Delete repair: deleted="
+					.. tostring(tonumber(repair.deleted) or 0)
+					.. ", alreadyMissing="
+					.. tostring(tonumber(repair.already_missing) or 0)
+					.. ", protected="
+					.. tostring(tonumber(repair.protected) or 0)
+					.. ", skipped="
+					.. tostring(tonumber(repair.skipped) or 0)
+					.. ", errors="
+					.. tostring(tonumber(repair.errors) or 0),
+				false
+			)
+		end
 		self:publishSyncHistory(applyStats.history)
 	end
 	self:pushDebugUpdate()
@@ -2067,6 +2216,7 @@ function SyncAPI:pollChanges()
 	local changes = incomingChanges
 	local hadChanges = #changes > 0
 	local applied, errors, notices, applyStats = self:applyChanges(changes, targetRevision)
+	self.lastApplyStats = applyStats
 
 	if #notices > 0 then
 		self:appendDebugEvent(buildErrorSummary("Delta notice", notices, 3), false)
@@ -2375,56 +2525,108 @@ end
 function SyncAPI:runLoop(runToken : number)
 	self:resetDebugState()
 	self:appendDebugEvent("Run loop dimulai (mode=" .. tostring(self.startMode) .. ")", false)
+	local function acceptBootstrapRevision(response : {[string]: any})
+		local revision = tonumber(response.server_rev) or self.lastAppliedRevision
+		self.lastAppliedRevision = revision
+		self.debugState.lastServerRev = revision
+		self.plugin:SetSetting(SETTING_KEYS.LastRevision, revision)
+		self:sendAck("ok")
+		return revision
+	end
 
 	while self.running and self.runToken == runToken do
-		self.updateStatus("Connecting to server... (10%)", false)
+		self.updateStatus("Connecting to server... (10%)", false, {
+			operation = "connect",
+			phase = "handshake",
+			progress = 10,
+			indeterminate = true,
+		})
 		local didHandshake, handshakeError = self:performHandshake()
 		if not didHandshake then
 			self:waitBeforeReconnect(runToken, handshakeError)
 			continue
 		end
 
-		local readyForSnapshot = true
+		local readyForPolling = true
+		local initialStatusText = nil
 		if self.startMode == TypeList.START_MODES.StudioToFolder then
-			self.updateStatus("Syncing Studio snapshot... (25%)", false)
-			local didBootstrap, bootstrapError = self:pushStudioSnapshot()
+			self.updateStatus("Preparing Studio snapshot... (15%)", false, {
+				operation = "studio_to_folder",
+				phase = "enumerating",
+				progress = 15,
+				indeterminate = true,
+			})
+			local didBootstrap, bootstrapResponse = self:pushStudioSnapshot()
 			if not didBootstrap then
-				readyForSnapshot = false
-				self:waitBeforeReconnect(runToken, "bootstrap failed: " .. tostring(bootstrapError))
+				readyForPolling = false
+				self:waitBeforeReconnect(runToken, "bootstrap failed: " .. tostring(bootstrapResponse))
+			else
+				local revision = acceptBootstrapRevision(bootstrapResponse)
+				initialStatusText = "Studio snapshot uploaded - rev " .. tostring(revision)
 			end
 		else
-			if self.serverIndexedCount <= 0 then
-				self.updateStatus("Syncing initial Studio snapshot... (25%)", false)
-				local didBootstrap, bootstrapError = self:pushStudioSnapshot()
+			if self.serverSyncRootEmpty == true and self.serverSyncRootInitialized ~= true then
+				self.updateStatus("Local folder is empty - pulling Studio automatically... (15%)", false, {
+					operation = "studio_to_folder",
+					phase = "auto_pull",
+					progress = 15,
+					indeterminate = true,
+				})
+				local didBootstrap, bootstrapResponse = self:pushStudioSnapshot("replace", "Auto Pull Studio")
 				if not didBootstrap then
-					readyForSnapshot = false
-					self:waitBeforeReconnect(runToken, "initial bootstrap failed: " .. tostring(bootstrapError))
+					readyForPolling = false
+					self:waitBeforeReconnect(runToken, "auto pull failed: " .. tostring(bootstrapResponse))
+				else
+					local revision = acceptBootstrapRevision(bootstrapResponse)
+					initialStatusText = "Local folder seeded automatically from Studio - rev " .. tostring(revision)
 				end
 			else
-				self.updateStatus("Syncing local folder to Studio... (35%)", false)
+				self.updateStatus("Fetching local snapshot... (35%)", false, {
+					operation = "folder_to_studio",
+					phase = "fetching",
+					progress = 35,
+					indeterminate = true,
+				})
+				self.initialSyncInProgress = true
+				local didSnapshot, snapshotError = self:fetchSnapshot()
+				self.initialSyncInProgress = false
+				if not didSnapshot then
+					local snapshotText = tostring(snapshotError)
+					if string.find(string.lower(snapshotText), "apply gagal", 1, true) then
+						self.running = false
+						self.updateStatus("Not synced - snapshot failed: " .. snapshotText, true, {
+							operation = "folder_to_studio",
+							phase = "error",
+							progress = 100,
+						})
+						return
+					end
+					readyForPolling = false
+					self:waitBeforeReconnect(runToken, "snapshot failed: " .. snapshotText)
+				else
+					local stats = self.lastApplyStats or {}
+					initialStatusText = "Synced rev "
+						.. tostring(self.lastAppliedRevision)
+						.. " - "
+						.. tostring(stats.applied or 0)
+						.. " applied, "
+						.. tostring(stats.skipped or 0)
+						.. " skipped, "
+						.. tostring(stats.warnings or 0)
+						.. " warnings"
+				end
 			end
 		end
 
-		if not readyForSnapshot then
+		if not readyForPolling then
 			continue
 		end
 
-		self.updateStatus("Syncing snapshot... (55%)", false)
-		self.initialSyncInProgress = true
-		local didSnapshot, snapshotError = self:fetchSnapshot()
-		self.initialSyncInProgress = false
-		if not didSnapshot then
-			local snapshotText = tostring(snapshotError)
-			if string.find(string.lower(snapshotText), "apply gagal", 1, true) then
-				self.running = false
-				self.updateStatus("Not synced - snapshot failed: " .. snapshotText, true)
-				return
-			end
-			self:waitBeforeReconnect(runToken, "snapshot failed: " .. snapshotText)
-			continue
-		end
-
-		self.updateStatus("Idle - synced rev " .. tostring(self.lastAppliedRevision), false)
+		self.updateStatus(initialStatusText or ("Idle - synced rev " .. tostring(self.lastAppliedRevision)), false, {
+			operation = self.startMode,
+			phase = "complete",
+			progress = 100,
+		})
 		self:startRemoteExecLoop(runToken)
 
 		while self.running and self.runToken == runToken do
@@ -2467,7 +2669,12 @@ function SyncAPI:start()
 		end
 	end
 	local currentToken = self.runToken
-	self.updateStatus("Connecting to " .. self.baseUrl .. "... (5%)", false)
+	self.updateStatus("Connecting to " .. self.baseUrl .. "... (5%)", false, {
+		operation = "connect",
+		phase = "connecting",
+		progress = 5,
+		indeterminate = true,
+	})
 	self.debugState.lastError = ""
 	self:appendDebugEvent("Start sync ke " .. self.baseUrl, false)
 	self:pushDebugUpdate()
@@ -2484,7 +2691,11 @@ function SyncAPI:stop()
 	self.initialSyncInProgress = false
 	self.remoteExecBusy = false
 	self.lastExecStatus = "Exec disabled"
-	self.updateStatus("Idle - sync stopped", false)
+	self.updateStatus("Idle - sync stopped", false, {
+		operation = "stop",
+		phase = "stopped",
+		progress = 100,
+	})
 	self:appendDebugEvent("Sync berhenti", false)
 	self:pushDebugUpdate()
 end
@@ -2686,6 +2897,111 @@ local function splitBySlash(value : string)
 	return segments
 end
 
+local SCRIPT_LOCAL_SUFFIX = {
+	Script = ".server.luau",
+	LocalScript = ".client.luau",
+	ModuleScript = ".module.luau",
+}
+
+local function parseLocalInstanceSegment(segment : string)
+	local encodedName, className = string.match(segment, "^(.*)%.([^%.]+)$")
+	if not encodedName or encodedName == "" or not className or className == "" then
+		return nil, nil
+	end
+	return decodeLocalSegment(encodedName), className
+end
+
+local function resolveLocalChangeParent(change : {[string]: any}, entity : string, className : string, useOldPath : boolean?)
+	local key = useOldPath == true and "old_local_path" or "local_path"
+	local localPath = change[key]
+	if typeof(localPath) ~= "string" or localPath == "" then
+		return nil, nil, false, nil
+	end
+	local parts = splitBySlash(localPath)
+	if #parts < 2 then
+		return nil, nil, false, "Invalid local path: " .. localPath
+	end
+
+	local serviceName = decodeLocalSegment(parts[1])
+	local service = getServiceByName(serviceName)
+	if not service then
+		return nil, nil, false, "Service not found for local path: " .. serviceName
+	end
+
+	local targetIndex
+	local targetName
+	if entity == INSTANCE_KINDS.UIInstance then
+		if parts[#parts] ~= UI_PROPERTIES_FILENAME then
+			return nil, nil, false, "Invalid metadata local path: " .. localPath
+		end
+		targetIndex = #parts - 1
+		if targetIndex == 1 then
+			return nil, service, true, nil
+		end
+		local declaredClass
+		targetName, declaredClass = parseLocalInstanceSegment(parts[targetIndex])
+		if not targetName then
+			return nil, nil, false, "Invalid metadata target segment: " .. tostring(parts[targetIndex])
+		end
+		if className ~= "" and declaredClass ~= className then
+			return nil, nil, false,
+				"Metadata class mismatch in local path: " .. tostring(declaredClass) .. " ~= " .. className
+		end
+	else
+		targetIndex = #parts
+		local suffix = SCRIPT_LOCAL_SUFFIX[className]
+		local filename = parts[targetIndex]
+		if not suffix or string.sub(filename, -#suffix) ~= suffix then
+			return nil, nil, false, "Invalid script local path: " .. localPath
+		end
+		targetName = decodeLocalSegment(string.sub(filename, 1, #filename - #suffix))
+	end
+
+	local current = service
+	for index = 2, targetIndex - 1 do
+		local childName, expectedClass = parseLocalInstanceSegment(parts[index])
+		if not childName then
+			return nil, nil, false, "Invalid parent segment in local path: " .. tostring(parts[index])
+		end
+		local child = current:FindFirstChild(childName)
+		if not child then
+			return nil, nil, false,
+				"ORPHAN_PARENT: missing " .. childName .. "." .. expectedClass .. " for " .. localPath
+		end
+		if child.ClassName ~= expectedClass then
+			return nil, nil, false,
+				"ORPHAN_PARENT: class mismatch "
+					.. child:GetFullName()
+					.. " ("
+					.. child.ClassName
+					.. " ~= "
+					.. expectedClass
+					.. ")"
+		end
+		current = child
+	end
+
+	return current, targetName, false, nil
+end
+
+local function resolveLocalChangeTarget(change : {[string]: any}, entity : string, className : string)
+	local parent, targetNameOrService, isRootService = resolveLocalChangeParent(change, entity, className, false)
+	if isRootService and typeof(targetNameOrService) == "Instance" then
+		return targetNameOrService
+	end
+	if not parent or typeof(targetNameOrService) ~= "string" then
+		return nil
+	end
+	if parent.Name == targetNameOrService and (className == "" or parent.ClassName == className) then
+		return parent
+	end
+	local target = parent:FindFirstChild(targetNameOrService)
+	if target and (className == "" or target.ClassName == className) then
+		return target
+	end
+	return nil
+end
+
 local function isManagedInstance(instance : Instance)
 	return instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged) == true
 end
@@ -2803,13 +3119,21 @@ local function isRemoteSyncCandidate(instance : Instance)
 	return REMOTE_SYNC_CLASSES[className] == true or REMOTE_SYNC_CONTAINER_CLASSES[className] == true
 end
 
-local function isBroadPropertySyncCandidate(instance : Instance)
+local function isBroadPropertySyncCandidate(instance : Instance, characterRoots : {Instance}?)
 	if instance:IsA("BasePart") or instance:IsA("Model") or instance:IsA("Camera") then
 		return false
 	end
-	for _, player in ipairs(playersService:GetPlayers()) do
-		local character = player.Character
-		if character and (instance == character or instance:IsDescendantOf(character)) then
+	local roots = characterRoots
+	if typeof(roots) ~= "table" then
+		roots = {}
+		for _, player in ipairs(playersService:GetPlayers()) do
+			if player.Character then
+				table.insert(roots, player.Character)
+			end
+		end
+	end
+	for _, character in ipairs(roots) do
+		if instance == character or instance:IsDescendantOf(character) then
 			return false
 		end
 	end
@@ -2834,11 +3158,11 @@ local function shouldTraverseRemoteScopeChild(child : Instance)
 	return REMOTE_SYNC_CLASSES[className] == true or REMOTE_SYNC_CONTAINER_CLASSES[className] == true
 end
 
-local function shouldTrackPropertyInstance(instance : Instance)
+local function shouldTrackPropertyInstance(instance : Instance, characterRoots : {Instance}?)
 	if isGuiSyncCandidate(instance) then
 		return true
 	end
-	return isBroadPropertySyncCandidate(instance)
+	return isBroadPropertySyncCandidate(instance, characterRoots)
 end
 
 local function shouldTraversePropertyChild(rootServiceName : string, child : Instance)
@@ -3577,6 +3901,38 @@ local function buildPropertyCandidateList(self, className : string, instance : I
 	return candidates, schemaKnown, extraAllowed
 end
 
+local function isActualInstanceProperty(instance : Instance, propertyName : string)
+	local ok = pcall(function()
+		instance:GetPropertyChangedSignal(propertyName)
+	end)
+	return ok
+end
+
+local function getValidatedPropertyCandidates(self, instance : Instance)
+	local className = instance.ClassName
+	local cache = self and self.propertyCandidateCache or nil
+	if typeof(cache) == "table" and typeof(cache[className]) == "table" then
+		return cache[className]
+	end
+
+	local validated = {}
+	local candidates = buildPropertyCandidateList(self, className, instance)
+	for _, propertyName in ipairs(candidates) do
+		if propertyName ~= "Name"
+			and propertyName ~= "Parent"
+			and propertyName ~= "ClassName"
+			and propertyName ~= "Source"
+			and isActualInstanceProperty(instance, propertyName)
+		then
+			table.insert(validated, propertyName)
+		end
+	end
+	if typeof(cache) == "table" then
+		cache[className] = validated
+	end
+	return validated
+end
+
 local function isReferenceProperty(className : string, propertyName : string)
 	if propertyName == "Value" then
 		return className == "ObjectValue"
@@ -3616,22 +3972,20 @@ end
 local function serialiseUiProperties(self, instance : Instance, ensureReferenceStableId)
 	local result = {}
 	local className = instance.ClassName
-	local candidates = buildPropertyCandidateList(self, className, instance)
+	local candidates = getValidatedPropertyCandidates(self, instance)
 	for _, propertyName in ipairs(candidates) do
-		if propertyName ~= "Name" and propertyName ~= "Parent" and propertyName ~= "ClassName" and propertyName ~= "Source" then
-			local ok, value = pcall(function()
-				return (instance :: any)[propertyName]
-			end)
-			if ok then
-				local encoded
-				if typeof(value) == "Instance" or (value == nil and isReferenceProperty(className, propertyName)) then
-					encoded = serialiseInstanceReference(self, value, ensureReferenceStableId)
-				else
-					encoded = serializeValue(value)
-				end
-				if encoded ~= nil then
-					result[propertyName] = encoded
-				end
+		local ok, value = pcall(function()
+			return (instance :: any)[propertyName]
+		end)
+		if ok then
+			local encoded
+			if typeof(value) == "Instance" or (value == nil and isReferenceProperty(className, propertyName)) then
+				encoded = serialiseInstanceReference(self, value, ensureReferenceStableId)
+			else
+				encoded = serializeValue(value)
+			end
+			if encoded ~= nil then
+				result[propertyName] = encoded
 			end
 		end
 	end
@@ -3801,8 +4155,50 @@ function SyncAPI:collectStudioSnapshot()
 	local skipDetails = {}
 	local seenLocalPath = {}
 	local seenPropertyStableIds = {}
-	local scriptCandidates = {}
-	local scriptLookup = {}
+	local snapshotCandidates = {}
+	local visitedInstances = {}
+	local ownershipEntries = {}
+	local ownershipByInstance = {}
+	local runtimeCharacterRoots = {}
+	for _, player in ipairs(playersService:GetPlayers()) do
+		if player.Character then
+			table.insert(runtimeCharacterRoots, player.Character)
+		end
+	end
+	local snapshotRunToken = self.runToken
+	local cancelled = false
+	local lastYieldAt = os.clock()
+	local lastProgressAt = 0
+
+	local function publishSnapshotProgress(phase : string, progress : number, current : number, total : number, indeterminate : boolean?)
+		local nowClock = os.clock()
+		if nowClock - lastYieldAt >= 0.016 then
+			task.wait()
+			lastYieldAt = os.clock()
+			nowClock = lastYieldAt
+		end
+		if not self.running or self.runToken ~= snapshotRunToken then
+			cancelled = true
+			return false
+		end
+		if current == total or nowClock - lastProgressAt >= 0.2 then
+			lastProgressAt = nowClock
+			local countText = total > 0 and (tostring(current) .. "/" .. tostring(total)) or tostring(current)
+			self.updateStatus(
+				phase .. "... " .. countText,
+				false,
+				{
+					operation = "studio_to_folder",
+					phase = string.lower(string.gsub(phase, "%s+", "_")),
+					progress = progress,
+					current = current,
+					total = total,
+					indeterminate = indeterminate == true,
+				}
+			)
+		end
+		return true
+	end
 
 	local function noteSkip(reason : string, sample : string?)
 		skippedCount += 1
@@ -3824,24 +4220,73 @@ function SyncAPI:collectStudioSnapshot()
 		return true, nil
 	end
 
+	local function registerOwnership(instance : Instance, localPath : string, stableId : string, entityKind : string)
+		local existing = ownershipByInstance[instance]
+		if existing and existing.entityKind == INSTANCE_KINDS.Script then
+			return
+		end
+		local entry = {
+			instance = instance,
+			localPath = localPath,
+			stableId = stableId,
+			entityKind = entityKind,
+		}
+		if existing then
+			for index, candidate in ipairs(ownershipEntries) do
+				if candidate == existing then
+					ownershipEntries[index] = entry
+					break
+				end
+			end
+		else
+			table.insert(ownershipEntries, entry)
+		end
+		ownershipByInstance[instance] = entry
+	end
+
+	self.updateStatus("Enumerating Studio instances...", false, {
+		operation = "studio_to_folder",
+		phase = "enumerating",
+		progress = 15,
+		indeterminate = true,
+	})
 	for _, rootPath in ipairs(self.managedRoots) do
 		local rootInstance = resolvePath(rootPath)
 		if rootInstance then
-			local candidates = rootInstance:GetDescendants()
-			if isScriptClass(rootInstance.ClassName) then
-				table.insert(candidates, rootInstance)
-			end
-
-			for _, candidate in ipairs(candidates) do
-				if isScriptClass(candidate.ClassName) and not scriptLookup[candidate] then
-					scriptLookup[candidate] = true
-					table.insert(scriptCandidates, candidate)
+			local stack = { rootInstance }
+			while #stack > 0 do
+				local candidate = table.remove(stack)
+				if not visitedInstances[candidate] then
+					visitedInstances[candidate] = true
+					table.insert(snapshotCandidates, candidate)
+					for _, child in ipairs(candidate:GetChildren()) do
+						table.insert(stack, child)
+					end
+					if not publishSnapshotProgress("Enumerating Studio instances", 20, #snapshotCandidates, 0, true) then
+						break
+					end
 				end
 			end
 		end
+		if cancelled then
+			break
+		end
 	end
 
-	for _, candidate in ipairs(scriptCandidates) do
+	for candidateIndex, candidate in ipairs(snapshotCandidates) do
+		if not isScriptClass(candidate.ClassName) then
+			local shouldContinue = publishSnapshotProgress(
+				"Serializing scripts",
+				20 + math.floor((candidateIndex / math.max(#snapshotCandidates, 1)) * 15),
+				candidateIndex,
+				#snapshotCandidates,
+				false
+			)
+			if not shouldContinue then
+				break
+			end
+			continue
+		end
 		local className = candidate.ClassName
 		local sourceFilename = buildScriptSourceFilename(candidate)
 		if not sourceFilename then
@@ -3877,13 +4322,25 @@ function SyncAPI:collectStudioSnapshot()
 			continue
 		end
 
+		local stableId = ensureStableId(candidate)
 		table.insert(files, {
 			entity = INSTANCE_KINDS.Script,
 			local_path = localPath,
 			rbx_path = gamePath,
 			class_name = className,
+			stable_id = stableId,
 			source = source,
 		})
+		registerOwnership(candidate, localPath, stableId, INSTANCE_KINDS.Script)
+		if not publishSnapshotProgress(
+			"Serializing scripts",
+			20 + math.floor((candidateIndex / math.max(#snapshotCandidates, 1)) * 15),
+			candidateIndex,
+			#snapshotCandidates,
+			false
+		) then
+			break
+		end
 	end
 
 	local function ensureSnapshotStableId(instance : Instance)
@@ -3899,7 +4356,7 @@ function SyncAPI:collectStudioSnapshot()
 	end
 
 	local function exportPropertyNode(instance : Instance)
-		if not shouldTrackPropertyInstance(instance) then
+		if not shouldTrackPropertyInstance(instance, runtimeCharacterRoots) then
 			return
 		end
 
@@ -3950,19 +4407,20 @@ function SyncAPI:collectStudioSnapshot()
 			stable_id = stableId,
 			source = source,
 		})
+		registerOwnership(instance, localPath, stableId, INSTANCE_KINDS.UIInstance)
 	end
 
-	local visitedInstances = {}
-	for _, rootPath in ipairs(self.managedRoots) do
-		local rootInstance = resolvePath(rootPath)
-		if rootInstance then
-			local candidates = rootInstance:GetDescendants()
-			table.insert(candidates, 1, rootInstance)
-			for _, candidate in ipairs(candidates) do
-				if not visitedInstances[candidate] then
-					visitedInstances[candidate] = true
-					exportPropertyNode(candidate)
-				end
+	if not cancelled then
+		for candidateIndex, candidate in ipairs(snapshotCandidates) do
+			exportPropertyNode(candidate)
+			if not publishSnapshotProgress(
+				"Serializing properties",
+				35 + math.floor((candidateIndex / math.max(#snapshotCandidates, 1)) * 30),
+				candidateIndex,
+				#snapshotCandidates,
+				false
+			) then
+				break
 			end
 		end
 	end
@@ -3971,6 +4429,8 @@ function SyncAPI:collectStudioSnapshot()
 		breakdown = skipBreakdown,
 		samples = skipSamples,
 		details = skipDetails,
+		cancelled = cancelled,
+		ownership = ownershipEntries,
 	}
 end
 
@@ -3990,6 +4450,9 @@ function SyncAPI:pushStudioSnapshot(
 		skipInfo = precomputedSkipInfo
 	else
 		files, skippedCount, sourceReadFailedCount, skipInfo = self:collectStudioSnapshot()
+	end
+	if typeof(skipInfo) == "table" and skipInfo.cancelled == true then
+		return false, "Studio snapshot cancelled"
 	end
 	local mode = bootstrapMode == "merge" and "merge" or "replace"
 
@@ -4011,6 +4474,18 @@ function SyncAPI:pushStudioSnapshot(
 		mode = mode,
 		files = files,
 	}
+	self.updateStatus(
+		"Uploading and indexing Studio snapshot... " .. tostring(#files) .. " files",
+		false,
+		{
+			operation = "studio_to_folder",
+			phase = "uploading",
+			progress = 67,
+			current = #files,
+			total = #files,
+			indeterminate = true,
+		}
+	)
 
 	local response, requestError = self:requestJson("POST", TypeList.ENDPOINTS.Bootstrap, payload, nil)
 	if not response then
@@ -4024,8 +4499,29 @@ function SyncAPI:pushStudioSnapshot(
 	end
 
 	local serverErrors = response.errors
-	if typeof(serverErrors) == "table" and #serverErrors > 0 then
-		warn("Bootstrap server errors: " .. table.concat(serverErrors, " | "))
+	local serverErrorCount = tonumber(response.error_count) or (typeof(serverErrors) == "table" and #serverErrors or 0)
+	if serverErrorCount > 0 then
+		local errorText = "Bootstrap completed with " .. tostring(serverErrorCount) .. " server errors"
+		if typeof(serverErrors) == "table" and #serverErrors > 0 then
+			errorText ..= ": " .. table.concat(serverErrors, " | ")
+		end
+		self:setDebugError(errorText)
+		return false, errorText
+	end
+
+	local acceptedRevision = tonumber(response.server_rev) or self.lastAppliedRevision
+	if typeof(skipInfo) == "table" and typeof(skipInfo.ownership) == "table" then
+		for _, entry in ipairs(skipInfo.ownership) do
+			if typeof(entry) == "table" and typeof(entry.instance) == "Instance" and entry.instance.Parent ~= nil then
+				markManagedInstance(
+					entry.instance,
+					entry.localPath,
+					acceptedRevision,
+					entry.stableId,
+					entry.entityKind
+				)
+			end
+	end
 	end
 
 	local pushedCount = tonumber(response.written_count) or #files
@@ -4050,7 +4546,14 @@ function SyncAPI:pushStudioSnapshot(
 			.. ")"
 			.. changeSummaryText
 			.. skipSummaryText,
-		false
+		false,
+		{
+			operation = "studio_to_folder",
+			phase = "complete",
+			progress = 100,
+			current = #files,
+			total = #files,
+		}
 	)
 	self:appendDebugEvent(
 		actionLabel
@@ -4252,11 +4755,20 @@ local function resolveInstanceReference(encodedValue : {[string]: any}, referenc
 	return false, nil, "Unresolved InstanceRef stableId=" .. stableId .. " path=" .. pathValue
 end
 
+local LEGACY_CHILD_SHADOW_PROPERTIES = {
+	UICorner = true,
+	UIScale = true,
+}
+
 local function applyUiProperties(self, instance : Instance, payload : {[string]: any}, referenceIndex)
 	local errors = {}
 	local notices = {}
 	local className = tostring(payload.className or instance.ClassName)
 	local candidates, schemaKnown = buildPropertyCandidateList(self, className, instance)
+	local candidateSet = {}
+	for _, propertyName in ipairs(candidates) do
+		candidateSet[propertyName] = true
+	end
 	local allowedSet = nil
 	if schemaKnown then
 		allowedSet = {}
@@ -4292,6 +4804,19 @@ local function applyUiProperties(self, instance : Instance, payload : {[string]:
 				table.insert(
 					notices,
 					"Skip protected property " .. tostring(propertyName) .. " @ " .. instance:GetFullName()
+				)
+				continue
+			end
+
+			if not isActualInstanceProperty(instance, propertyName)
+				and (candidateSet[propertyName] == true or LEGACY_CHILD_SHADOW_PROPERTIES[propertyName] == true)
+			then
+				table.insert(
+					notices,
+					"Ignored legacy child-shadow property "
+						.. tostring(propertyName)
+						.. " @ "
+						.. instance:GetFullName()
 				)
 				continue
 			end
@@ -4596,11 +5121,20 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 		return true, ""
 	end
 
-	local parent, targetNameOrService, isRootService, parentError = parseRobloxPath(targetPath)
+	local parent, targetNameOrService, isRootService, parentError = resolveLocalChangeParent(
+		change,
+		INSTANCE_KINDS.UIInstance,
+		payload.className,
+		false
+	)
+	if not parent and not isRootService and parentError == nil then
+		parent, targetNameOrService, isRootService, parentError = parseRobloxPath(targetPath)
+	end
 	if parentError then
 		if isRemoteScopePath(targetPath)
 			and isRemoteOrContainerClass(payload.className)
 			and not hasGeometryAncestorLocalPath(change.local_path)
+			and string.sub(parentError, 1, 14) ~= "ORPHAN_PARENT"
 		then
 			local ensuredParent, ensuredName, ensureError = ensureParentPath(targetPath)
 			if not ensuredParent then
@@ -4611,7 +5145,7 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 			isRootService = false
 			parentError = nil
 		else
-			return false, "Parent missing for metadata target " .. targetPath .. ": " .. tostring(parentError)
+			return false, "ORPHAN_PARENT: metadata target " .. targetPath .. ": " .. tostring(parentError)
 		end
 	end
 
@@ -4774,6 +5308,16 @@ local function applyScriptPayload(self, scriptInstance : Instance, className : s
 	return true
 end
 
+local function getScriptStableId(change : {[string]: any})
+	if typeof(change.stable_id) == "string" and change.stable_id ~= "" then
+		return change.stable_id
+	end
+	if typeof(change.payload) == "table" and typeof(change.payload.id) == "string" then
+		return change.payload.id
+	end
+	return ""
+end
+
 local function applyScriptUpsert(self, change : {[string]: any}, revision : number)
 	local rbxPath = change.rbx_path
 	local className = change.class_name
@@ -4810,7 +5354,7 @@ local function applyScriptUpsert(self, change : {[string]: any}, revision : numb
 		return false, "Failed to update source for " .. scriptInstance:GetFullName()
 	end
 
-	markManagedInstance(scriptInstance, localPath, revision, nil, INSTANCE_KINDS.Script)
+	markManagedInstance(scriptInstance, localPath, revision, getScriptStableId(change), INSTANCE_KINDS.Script)
 	return applyScriptPayload(self, scriptInstance, className, targetName, change.payload)
 end
 
@@ -4857,7 +5401,7 @@ local function applyScriptRename(self, change : {[string]: any}, revision : numb
 			return false, "Failed to update source for " .. existing:GetFullName()
 		end
 	end
-	markManagedInstance(existing, change.local_path, revision, nil, INSTANCE_KINDS.Script)
+	markManagedInstance(existing, change.local_path, revision, getScriptStableId(change), INSTANCE_KINDS.Script)
 	return applyScriptPayload(self, existing, existing.ClassName, newName, change.payload)
 end
 
@@ -4871,20 +5415,36 @@ function SyncAPI:applyDelete(change : {[string]: any})
 		return false, "Invalid delete payload"
 	end
 	if isIgnoredPath(targetPath, self.ignoredRbxPaths) then
-		return true
+		return true, "Skip delete ignored path " .. targetPath
 	end
 	if TypeList.isRootServicePath and TypeList.isRootServicePath(targetPath) then
 		return true, "Skip delete root service at " .. targetPath
 	end
 
 	local indexes = buildManagedIndexes(self.managedRoots)
-	local target = findExistingManagedTarget(change, indexes)
+	local expectedClass = typeof(change.class_name) == "string" and change.class_name or ""
+	local localPathTarget = resolveLocalChangeTarget(change, entity, expectedClass)
+	local target = localPathTarget
+	if not target then
+		target = findExistingManagedTarget(change, indexes)
+	end
+	local incomingStableId = typeof(change.stable_id) == "string" and change.stable_id or ""
+	if not target and incomingStableId ~= "" then
+		local referenceIndex = buildReferenceIndex(self.managedRoots)
+		target = referenceIndex.byStableId[incomingStableId]
+	end
 	if not target then
 		return true, "Delete target not found at " .. targetPath
 	end
 
+	if expectedClass ~= "" and target.ClassName ~= expectedClass then
+		return false, "Delete target class mismatch at " .. targetPath .. ": " .. target.ClassName .. " ~= " .. expectedClass
+	end
 	if entity == INSTANCE_KINDS.Script and not isScriptClass(target.ClassName) then
 		return false, "Delete target class mismatch for script: " .. target.ClassName
+	end
+	if target:IsA("BasePart") or target:IsA("Model") then
+		return true, "Skip delete protected geometry at " .. targetPath
 	end
 	if target:IsA("Terrain") then
 		return true, "Skip delete protected Terrain at " .. targetPath
@@ -4893,12 +5453,35 @@ function SyncAPI:applyDelete(change : {[string]: any})
 		return true, "Skip delete root service instance " .. target:GetFullName()
 	end
 
+	local repairedLegacyOwnership = false
 	if not isManagedInstance(target) then
-		return true, "Skipped unmanaged delete at " .. targetPath
+		local targetStableId = target:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+		local hasExactStableId = incomingStableId ~= ""
+			and typeof(targetStableId) == "string"
+			and targetStableId == incomingStableId
+		local isLegacyScriptMatch = entity == INSTANCE_KINDS.Script
+			and isScriptClass(target.ClassName)
+			and typeof(targetStableId) == "string"
+			and targetStableId ~= ""
+			and (localPathTarget == target or resolvePath(targetPath) == target)
+		if not hasExactStableId and not isLegacyScriptMatch then
+			return false, "Refused unmanaged delete without exact RiftSync ownership at " .. targetPath
+		end
+		markManagedInstance(
+			target,
+			typeof(change.local_path) == "string" and change.local_path or nil,
+			typeof(change.revision) == "number" and change.revision or nil,
+			typeof(targetStableId) == "string" and targetStableId or incomingStableId,
+			entity
+		)
+		repairedLegacyOwnership = true
 	end
 
 	removeFromIndexesRecursive(indexes, target)
 	target:Destroy()
+	if repairedLegacyOwnership then
+		return true, "Repaired legacy delete at " .. targetPath
+	end
 	return true
 end
 
@@ -4998,6 +5581,9 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 		return true, {}, {}, {
 			total = 0,
 			applied = 0,
+			skipped = 0,
+			warnings = 0,
+			errors = 0,
 		}
 	end
 
@@ -5058,22 +5644,35 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 	local errorSeen = {}
 	local noticeSeen = {}
 	local appliedCount = 0
+	local skippedCount = 0
 	local syncHistoryEvents = {}
+	local repairStats = { deleted = 0, already_missing = 0, protected = 0, skipped = 0, errors = 0 }
 	local uiPrepared = {}
 	local deleteQueue = {}
 	local totalChanges = #orderedChanges
+	local lastProgressAt = 0
+	local lastYieldAt = os.clock()
 
 	local function publishProgress(currentIndex : number, phase : string?)
 		if self.initialSyncInProgress ~= true then
 			return
 		end
-
-		local percent = 100
+		local nowClock = os.clock()
+		if nowClock - lastYieldAt >= 0.016 then
+			task.wait()
+			lastYieldAt = os.clock()
+			nowClock = lastYieldAt
+		end
+		if currentIndex < totalChanges and nowClock - lastProgressAt < 0.2 then
+			return
+		end
+		lastProgressAt = nowClock
+		local percent = 55
 		if totalChanges > 0 then
-			percent = math.floor((currentIndex / totalChanges) * 100 + 0.5)
+			percent += math.floor((currentIndex / totalChanges) * 30 + 0.5)
 		end
 		self.updateStatus(
-			"Syncing files... "
+			"Preparing instances... "
 				.. tostring(currentIndex)
 				.. "/"
 				.. tostring(totalChanges)
@@ -5081,7 +5680,14 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 				.. tostring(percent)
 				.. "%)"
 				.. (phase and (" - " .. phase) or ""),
-			false
+			false,
+			{
+				operation = "folder_to_studio",
+				phase = phase or "preparing_instances",
+				progress = percent,
+				current = currentIndex,
+				total = totalChanges,
+			}
 		)
 	end
 
@@ -5102,8 +5708,12 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 		end
 	end
 
+	local function isOrphanMessage(message : any)
+		return string.find(tostring(message), "ORPHAN_PARENT:", 1, true) ~= nil
+	end
+
 	for changeIndex, change in ipairs(orderedChanges) do
-		publishProgress(changeIndex, tostring(change.op or "apply"))
+		publishProgress(changeIndex, "preparing_instances")
 
 		local op = tostring(change.op)
 		local entity = getEntityKind(change)
@@ -5121,7 +5731,12 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 
 			local ok, resultOrError = prepareUiUpsert(self, change, targetRevision, indexes)
 			if not ok then
-				pushError(tostring(resultOrError))
+				if isOrphanMessage(resultOrError) then
+					skippedCount += 1
+					pushNotice(tostring(resultOrError))
+				else
+					pushError(tostring(resultOrError))
+				end
 			else
 				appliedCount += 1
 				if shouldRecordSyncHistory(self, change, resultOrError) then
@@ -5156,16 +5771,27 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 					pushNotice(resultOrError)
 				end
 			else
-				pushError(tostring(resultOrError))
+				if isOrphanMessage(resultOrError) then
+					skippedCount += 1
+					pushNotice(tostring(resultOrError))
+				else
+					pushError(tostring(resultOrError))
+				end
 			end
 		end
 	end
 
 	if #uiPrepared > 0 and self.initialSyncInProgress == true then
-		self.updateStatus("Syncing properties... (90%)", false)
+		self.updateStatus("Applying properties... (85%)", false, {
+			operation = "folder_to_studio",
+			phase = "properties",
+			progress = 85,
+			current = 0,
+			total = #uiPrepared,
+		})
 	end
 	local referenceIndex = buildReferenceIndex(self.managedRoots)
-	for _, prepared in ipairs(uiPrepared) do
+	for preparedIndex, prepared in ipairs(uiPrepared) do
 		local propertyErrors, propertyNotices = applyUiProperties(
 			self,
 			prepared.instance,
@@ -5178,12 +5804,32 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 		for _, noticeMessage in ipairs(propertyNotices) do
 			pushNotice(noticeMessage)
 		end
+		if self.initialSyncInProgress == true and (preparedIndex == #uiPrepared or preparedIndex % 100 == 0) then
+			self.updateStatus(
+				"Applying properties... " .. tostring(preparedIndex) .. "/" .. tostring(#uiPrepared),
+				false,
+				{
+					operation = "folder_to_studio",
+					phase = "properties",
+					progress = 85 + math.floor((preparedIndex / #uiPrepared) * 7),
+					current = preparedIndex,
+					total = #uiPrepared,
+				}
+			)
+			task.wait()
+		end
 	end
 
 	if #uiPrepared > 0 and self.initialSyncInProgress == true then
-		self.updateStatus("Syncing metadata... (95%)", false)
+		self.updateStatus("Applying attributes and tags... (92%)", false, {
+			operation = "folder_to_studio",
+			phase = "metadata",
+			progress = 92,
+			current = 0,
+			total = #uiPrepared,
+		})
 	end
-	for _, prepared in ipairs(uiPrepared) do
+	for preparedIndex, prepared in ipairs(uiPrepared) do
 		local metadataErrors, metadataNotices = applyUiAttributesAndTags(prepared.instance, prepared.payload)
 		for _, errorMessage in ipairs(metadataErrors) do
 			pushError(errorMessage)
@@ -5191,15 +5837,47 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 		for _, noticeMessage in ipairs(metadataNotices) do
 			pushNotice(noticeMessage)
 		end
+		if self.initialSyncInProgress == true and (preparedIndex == #uiPrepared or preparedIndex % 100 == 0) then
+			self.updateStatus(
+				"Applying attributes and tags... " .. tostring(preparedIndex) .. "/" .. tostring(#uiPrepared),
+				false,
+				{
+					operation = "folder_to_studio",
+					phase = "metadata",
+					progress = 92 + math.floor((preparedIndex / #uiPrepared) * 4),
+					current = preparedIndex,
+					total = #uiPrepared,
+				}
+			)
+			task.wait()
+		end
 	end
 
 	if #deleteQueue > 0 and self.initialSyncInProgress == true then
-		self.updateStatus("Syncing deletes... (98%)", false)
+		self.updateStatus("Applying deletes... (96%)", false, {
+			operation = "folder_to_studio",
+			phase = "deletes",
+			progress = 96,
+			current = 0,
+			total = #deleteQueue,
+		})
 	end
-	for _, change in ipairs(deleteQueue) do
+	for deleteIndex, change in ipairs(deleteQueue) do
 		local ok, resultOrError = self:applyDelete(change)
 		if ok then
 			appliedCount += 1
+			if change.repair_tombstone == true then
+				local resultText = tostring(resultOrError or "")
+				if string.find(resultText, "target not found", 1, true) then
+					repairStats.already_missing += 1
+				elseif string.find(resultText, "ignored path", 1, true) then
+					repairStats.skipped += 1
+				elseif string.find(resultText, "protected", 1, true) or string.find(resultText, "root service", 1, true) then
+					repairStats.protected += 1
+				else
+					repairStats.deleted += 1
+				end
+			end
 			if shouldRecordSyncHistory(self, change, resultOrError) then
 				table.insert(syncHistoryEvents, formatSyncHistoryEvent(change, resultOrError))
 			end
@@ -5207,7 +5885,24 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 				pushNotice(resultOrError)
 			end
 		else
+			if change.repair_tombstone == true then
+				repairStats.errors += 1
+			end
 			pushError(tostring(resultOrError))
+		end
+		if self.initialSyncInProgress == true and (deleteIndex == #deleteQueue or deleteIndex % 100 == 0) then
+			self.updateStatus(
+				"Applying deletes... " .. tostring(deleteIndex) .. "/" .. tostring(#deleteQueue),
+				false,
+				{
+					operation = "folder_to_studio",
+					phase = "deletes",
+					progress = 96 + math.floor((deleteIndex / #deleteQueue) * 3),
+					current = deleteIndex,
+					total = #deleteQueue,
+				}
+			)
+			task.wait()
 		end
 	end
 
@@ -5220,7 +5915,11 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 	return wasSuccessful, errors, notices, {
 		total = #orderedChanges,
 		applied = appliedCount,
+		skipped = skippedCount,
+		warnings = #notices,
+		errors = #errors,
 		history = summariseSyncHistoryEvents(syncHistoryEvents),
+		repair = repairStats,
 	}
 end
 
@@ -5267,10 +5966,13 @@ function SyncAPI:performHandshake()
 	elseif typeof(response.extra_allowed_properties) == "table" then
 		self.extraAllowedProperties = response.extra_allowed_properties
 	end
+	self.propertyCandidateCache = {}
 
 	self.serverIndexedCount = tonumber(response.indexed_entry_count)
 		or tonumber(response.indexed_script_count)
 		or 0
+	self.serverSyncRootEmpty = response.sync_root_empty == true
+	self.serverSyncRootInitialized = response.sync_root_initialized == true
 	self.debugState.handshake = true
 	self.debugState.lastServerRev = tonumber(response.server_rev) or self.debugState.lastServerRev
 	self.debugState.lastError = ""

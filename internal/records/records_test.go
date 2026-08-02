@@ -5,6 +5,17 @@ import (
 	"testing"
 )
 
+func TestApplyScriptPayloadCopiesStableID(t *testing.T) {
+	record := buildScriptRecord("ServerScriptService/Foo.Script/Foo.server.luau", "game.ServerScriptService.Foo", "Script", "print(1)")
+	payload := map[string]any{"id": "script-stable-id", "className": "Script", "name": "Foo"}
+	if err := record.ApplyScriptPayload(payload); err != nil {
+		t.Fatalf("ApplyScriptPayload returned error: %v", err)
+	}
+	if record.StableID != "script-stable-id" {
+		t.Fatalf("StableID = %q, want script-stable-id", record.StableID)
+	}
+}
+
 var managedServices = map[string]bool{
 	"ServerScriptService": true,
 	"StarterGui":          true,

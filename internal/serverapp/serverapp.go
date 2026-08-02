@@ -19,7 +19,7 @@ import (
 	"riftsync/internal/watcher"
 )
 
-const Version = "4.1.0"
+const Version = "4.1.2"
 
 type Options struct {
 	ConfigPath            string
@@ -142,6 +142,9 @@ func (r *Runner) Start(parent context.Context) error {
 	appState.SetSnapshot(snapshot.Records, snapshot.Warnings, len(snapshot.InvalidPaths))
 	if err := appState.LoadHistory(); err != nil && options.Debug && options.Stdout != nil {
 		fmt.Fprintf(options.Stdout, "[debug] load history error: %v\n", err)
+	}
+	if err := appState.LoadProjectState(); err != nil && options.Debug && options.Stdout != nil {
+		fmt.Fprintf(options.Stdout, "[debug] load project state error: %v\n", err)
 	}
 	appState.RecordPerformance(0, 0, time.Since(scanStarted), 0, snapshot.CacheHits, snapshot.CacheMisses)
 	if err := config.WriteGuidebookStatus(cfg, config.ScaffoldOptions{

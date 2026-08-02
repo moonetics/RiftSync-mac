@@ -82,9 +82,44 @@ func TestOptionsFromInputRejectsInvalidHost(t *testing.T) {
 }
 
 func TestMakeStatusPayloadStarting(t *testing.T) {
-	payload := makeStatusPayload(serverapp.Status{Host: "127.0.0.1", Port: 8765}, true, "")
-	if !payload.Starting || payload.Address != "127.0.0.1:8765" {
+	payload := makeStatusPayload(serverapp.Status{
+		Host: "127.0.0.1",
+		Port: 8765,
+		Activity: state.Activity{
+			Phase:         "properties",
+			Progress:      88,
+			Current:       44,
+			Total:         50,
+			Indeterminate: true,
+		},
+	}, true, "")
+	if !payload.Starting || payload.Syncing || payload.Status != "Starting" || payload.Address != "127.0.0.1:8765" {
 		t.Fatalf("payload = %#v", payload)
+	}
+	if payload.LastError != "" {
+		t.Fatalf("last error = %q, want empty healthy state", payload.LastError)
+	}
+	if payload.ActivityPhase != "properties" ||
+		payload.ActivityProgress != 88 ||
+		payload.ActivityCurrent != 44 ||
+		payload.ActivityTotal != 50 ||
+		!payload.ActivityIndeterminate {
+		t.Fatalf("activity payload = %#v", payload)
+	}
+}
+
+func TestMakeStatusPayloadSyncing(t *testing.T) {
+	payload := makeStatusPayload(serverapp.Status{
+		Running: true,
+		Activity: state.Activity{
+			Phase:    "writing",
+			Progress: 76,
+			Current:  5500,
+			Total:    16595,
+		},
+	}, false, "")
+	if !payload.Syncing || payload.Status != "Syncing" {
+		t.Fatalf("payload = %#v, want syncing status", payload)
 	}
 }
 
@@ -166,7 +201,21 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`logsModal`,
 		`/app/logs`,
 		`activityText`,
+		`activityProgress`,
+		`activity_indeterminate`,
+		`role="progressbar"`,
+		`activity-slide`,
 		`errorText`,
+		`✓ No issues`,
+		`activity-notice success`,
+		`.lamp.syncing`,
+		`app&&app.syncing?"syncing"`,
+		`.toast.success`,
+		`.toast.error`,
+		`.toast.warning`,
+		`.toast.info`,
+		`aria-atomic="true"`,
+		`ok?"success":"error"`,
 		`syncRootPickerBtn`,
 		`historyDetail`,
 		`execSourceInput`,
@@ -220,6 +269,9 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 	}
 	if strings.Contains(document, `background:linear-gradient`) || strings.Contains(document, `box-shadow:inset`) {
 		t.Fatal("htmlDocument still contains beveled control styling")
+	}
+	if strings.Contains(document, `Clear`) {
+		t.Fatal("htmlDocument still exposes the internal Clear sentinel")
 	}
 	if strings.Contains(document, `MULTI-INSTANCE`) {
 		t.Fatal("htmlDocument still contains the implementation-focused brand subtitle")
@@ -812,14 +864,46 @@ func TestQuitRoutesSignalClose(t *testing.T) {
 }
 
 func TestStatusText(t *testing.T) {
-	if statusText(statusPayload{}) != "Stopped" {
-		t.Fatalf("stopped text = %q", statusText(statusPayload{}))
+	cases := []struct {
+		name    string
+		payload statusPayload
+		want    string
+	}{
+		{name: "stopped", payload: statusPayload{}, want: "Stopped"},
+		{name: "error", payload: statusPayload{LastError: "bind failed"}, want: "Error"},
+		{name: "running before error", payload: statusPayload{Running: true, LastError: "previous warning"}, want: "Running"},
+		{name: "syncing before running", payload: statusPayload{Running: true, Syncing: true}, want: "Syncing"},
+		{name: "starting before syncing", payload: statusPayload{Running: true, Starting: true, Syncing: true}, want: "Starting"},
 	}
-	if statusText(statusPayload{Starting: true}) != "Starting" {
-		t.Fatalf("starting text = %q", statusText(statusPayload{Starting: true}))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusText(tc.payload); got != tc.want {
+				t.Fatalf("statusText = %q, want %q", got, tc.want)
+			}
+		})
 	}
-	if statusText(statusPayload{Running: true}) != "Running" {
-		t.Fatalf("running text = %q", statusText(statusPayload{Running: true}))
+}
+
+func TestSyncingStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload statusPayload
+		want    bool
+	}{
+		{name: "determinate", payload: statusPayload{Running: true, ActivityPhase: "properties", ActivityProgress: 85}, want: true},
+		{name: "indeterminate", payload: statusPayload{Running: true, ActivityPhase: "uploading", ActivityIndeterminate: true}, want: true},
+		{name: "complete", payload: statusPayload{Running: true, ActivityPhase: "complete", ActivityProgress: 100, ActivityIndeterminate: true}, want: false},
+		{name: "activity error", payload: statusPayload{Running: true, ActivityPhase: "properties", ActivityProgress: 85, ActivityError: true}, want: false},
+		{name: "error phase", payload: statusPayload{Running: true, ActivityPhase: "error", ActivityProgress: 90, ActivityIndeterminate: true}, want: false},
+		{name: "stopped", payload: statusPayload{ActivityPhase: "uploading", ActivityIndeterminate: true}, want: false},
+		{name: "starting", payload: statusPayload{Running: true, Starting: true, ActivityPhase: "uploading", ActivityIndeterminate: true}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := syncingStatus(tc.payload); got != tc.want {
+				t.Fatalf("syncingStatus = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -952,10 +1036,24 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 	typeListDocument := string(typeListBody)
 	for _, needle := range []string{
 		`BootstrapPreview = "/bootstrap/preview"`,
-		`TypeList.VERSION = "4.1.0"`,
+		`TypeList.VERSION = "4.1.2"`,
 	} {
 		if !strings.Contains(typeListDocument, needle) {
 			t.Fatalf("TypeList missing %q", needle)
+		}
+	}
+	latestPushStart := strings.LastIndex(apiDocument, "function SyncAPI:pushStudioSnapshot")
+	if latestPushStart < 0 {
+		t.Fatal("latest pushStudioSnapshot implementation not found")
+	}
+	latestPush := apiDocument[latestPushStart:]
+	for _, needle := range []string{
+		`Bootstrap completed with`,
+		`skipInfo.ownership`,
+		`markManagedInstance(`,
+	} {
+		if !strings.Contains(latestPush, needle) {
+			t.Fatalf("latest pushStudioSnapshot missing %q", needle)
 		}
 	}
 	for _, needle := range []string{
@@ -972,6 +1070,12 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 		`selectConnectionProfile`,
 		`upsertConnectionProfile`,
 		`removeConnectionProfile`,
+		`serverSyncRootInitialized`,
+		`response.deletion_tombstones`,
+		`repair_tombstone = true`,
+		`Repaired legacy delete`,
+		`Refused unmanaged delete without exact RiftSync ownership`,
+		`skipInfo.ownership`,
 	} {
 		if !strings.Contains(apiDocument, needle) {
 			t.Fatalf("API missing %q", needle)
@@ -991,10 +1095,17 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 		`sync_active`,
 		`exec_active`,
 		`edit mode`,
+		`progressTrack`,
+		`progressFill`,
+		`updateProgress`,
+		`TweenInfo.new`,
 	} {
 		if !strings.Contains(pluginDocument, needle) {
 			t.Fatalf("plugin UI missing %q", needle)
 		}
+	}
+	if strings.Contains(pluginDocument, `table.insert(bits, string.gsub`) {
+		t.Fatal("plugin passes string.gsub's second return value into table.insert")
 	}
 }
 
@@ -1031,6 +1142,8 @@ func TestPluginBroadPropertiesSchemaAndReferenceApply(t *testing.T) {
 		`Model = {`,
 		`"Source",`,
 		`"FlipbookIncompatible",`,
+		`"UICorner",`,
+		`"UIScale",`,
 	} {
 		if strings.Contains(typeListDocument, forbidden) {
 			t.Fatalf("broad property schema contains excluded entry %q", forbidden)
@@ -1043,12 +1156,49 @@ func TestPluginBroadPropertiesSchemaAndReferenceApply(t *testing.T) {
 		`["$type"] = "Ray"`,
 		`buildReferenceIndex(self.managedRoots)`,
 		`properties.Enabled == nil and legacyDisabled ~= nil`,
-		`Parent missing for metadata target`,
+		`ORPHAN_PARENT: metadata target`,
 		`hasGeometryAncestorLocalPath(change.local_path)`,
+		`resolveLocalChangeParent`,
+		`isActualInstanceProperty`,
+		`propertyCandidateCache`,
+		`Local folder is empty - pulling Studio automatically`,
+		`self:pushStudioSnapshot("replace", "Auto Pull Studio")`,
 	} {
 		if !strings.Contains(apiDocument, needle) {
 			t.Fatalf("broad property implementation missing %q", needle)
 		}
+	}
+	runLoopStart := strings.Index(apiDocument, "function SyncAPI:runLoop")
+	if runLoopStart < 0 {
+		t.Fatal("runLoop implementation not found")
+	}
+	runLoopEnd := strings.Index(apiDocument[runLoopStart:], "function SyncAPI:start")
+	if runLoopEnd < 0 {
+		t.Fatal("runLoop end not found")
+	}
+	runLoop := apiDocument[runLoopStart : runLoopStart+runLoopEnd]
+	if strings.Count(runLoop, "self:pushStudioSnapshot()") != 1 {
+		t.Fatal("runLoop must keep exactly one direct StudioToFolder bootstrap")
+	}
+	if !strings.Contains(runLoop, `self:pushStudioSnapshot("replace", "Auto Pull Studio")`) ||
+		strings.Count(runLoop, "acceptBootstrapRevision(bootstrapResponse)") != 2 {
+		t.Fatal("empty FolderToStudio must auto-seed and both bootstrap paths must accept the response directly")
+	}
+	if !strings.Contains(runLoop, `self.serverSyncRootEmpty == true and self.serverSyncRootInitialized ~= true`) {
+		t.Fatal("empty initialized projects must remain local-authoritative instead of auto-pulling Studio")
+	}
+	if strings.Contains(runLoop, "use Pull Studio to export Studio explicitly") {
+		t.Fatal("empty FolderToStudio still requires a manual Pull Studio")
+	}
+	lastApplyStart := strings.LastIndex(apiDocument, "function SyncAPI:applyChanges")
+	if lastApplyStart < 0 {
+		t.Fatal("latest applyChanges implementation not found")
+	}
+	latestApply := apiDocument[lastApplyStart:]
+	declaration := strings.Index(latestApply, "local skippedCount = 0")
+	firstIncrement := strings.Index(latestApply, "skippedCount += 1")
+	if declaration < 0 || firstIncrement < 0 || declaration > firstIncrement {
+		t.Fatal("latest applyChanges must initialize skippedCount before orphan handling")
 	}
 }
 

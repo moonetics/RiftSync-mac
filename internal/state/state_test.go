@@ -35,6 +35,28 @@ func testRecord(localPath, name, source string) records.SyncRecord {
 	}
 }
 
+func TestRecordActivityNormalizesStructuredProgress(t *testing.T) {
+	appState := testState(t, 8)
+	got := appState.RecordActivity(Activity{
+		Text:          "  Applying properties  ",
+		Operation:     " folder_to_studio ",
+		Phase:         " properties ",
+		Progress:      140,
+		Current:       80,
+		Total:         50,
+		Indeterminate: true,
+	})
+	if got.Text != "Applying properties" ||
+		got.Operation != "folder_to_studio" ||
+		got.Phase != "properties" ||
+		got.Progress != 100 ||
+		got.Current != 50 ||
+		got.Total != 50 ||
+		!got.Indeterminate {
+		t.Fatalf("activity = %#v", got)
+	}
+}
+
 func TestApplySnapshotBumpsRevisionOnChange(t *testing.T) {
 	appState := testState(t, 10)
 	record := testRecord("ServerScriptService/A.server.luau", "A", "print(1)")
@@ -265,5 +287,112 @@ func TestCorruptedHistoryIsIgnored(t *testing.T) {
 	}
 	if appState.Revision() != 0 || len(appState.RevisionSummaries(10)) != 0 {
 		t.Fatalf("corrupted history changed state: rev=%d summaries=%#v", appState.Revision(), appState.RevisionSummaries(10))
+	}
+}
+
+func TestProjectStatePersistsInitializationAndDeletionTombstone(t *testing.T) {
+	appState := testState(t, 10)
+	if err := appState.SetSyncRootInitialized(true); err != nil {
+		t.Fatalf("SetSyncRootInitialized returned error: %v", err)
+	}
+	record := testRecord("ServerScriptService/A.server.luau", "A", "print(1)")
+	record.StableID = "stable-a"
+	appState.ApplySnapshot(map[string]records.SyncRecord{record.LocalPath: record}, nil, nil)
+	appState.ApplySnapshot(map[string]records.SyncRecord{}, nil, nil)
+
+	reloaded := New(appState.Config())
+	reloaded.SetSnapshot(map[string]records.SyncRecord{}, nil, 0)
+	if err := reloaded.LoadHistory(); err != nil {
+		t.Fatalf("LoadHistory returned error: %v", err)
+	}
+	if err := reloaded.LoadProjectState(); err != nil {
+		t.Fatalf("LoadProjectState returned error: %v", err)
+	}
+	if !reloaded.SyncRootInitialized() {
+		t.Fatal("SyncRootInitialized = false, want true")
+	}
+	tombstones := reloaded.DeletionTombstones()
+	if len(tombstones) != 1 || tombstones[0].StableID != "stable-a" || tombstones[0].RbxPath != record.RbxPath {
+		t.Fatalf("tombstones = %#v, want stable-a delete", tombstones)
+	}
+}
+
+func TestProjectStateRecreatedIdentityClearsTombstone(t *testing.T) {
+	appState := testState(t, 10)
+	record := testRecord("ServerScriptService/A.server.luau", "A", "print(1)")
+	record.StableID = "stable-a"
+	appState.ApplySnapshot(map[string]records.SyncRecord{record.LocalPath: record}, nil, nil)
+	appState.ApplySnapshot(map[string]records.SyncRecord{}, nil, nil)
+	if len(appState.DeletionTombstones()) != 1 {
+		t.Fatalf("tombstones before recreate = %#v, want one", appState.DeletionTombstones())
+	}
+	record.Source = "print(2)"
+	record.ContentHash = records.ContentDigest(record.Source)
+	appState.ApplySnapshot(map[string]records.SyncRecord{record.LocalPath: record}, nil, nil)
+	if len(appState.DeletionTombstones()) != 0 {
+		t.Fatalf("tombstones after recreate = %#v, want none", appState.DeletionTombstones())
+	}
+}
+
+func TestProjectStateMigratesInitializationAndTombstonesFromHistory(t *testing.T) {
+	appState := testState(t, 10)
+	record := testRecord("ServerScriptService/Legacy.server.luau", "Legacy", "print(1)")
+	record.StableID = "legacy-id"
+	appState.ApplySnapshot(map[string]records.SyncRecord{record.LocalPath: record}, nil, nil)
+	appState.ApplySnapshot(map[string]records.SyncRecord{}, nil, nil)
+	projectStatePath := filepath.Join(appState.Config().SyncRootAbs, config.MetadataDir, "project-state.json")
+	if err := os.Remove(projectStatePath); err != nil {
+		t.Fatalf("remove project state: %v", err)
+	}
+
+	reloaded := New(appState.Config())
+	reloaded.SetSnapshot(map[string]records.SyncRecord{}, nil, 0)
+	if err := reloaded.LoadHistory(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reloaded.LoadProjectState(); err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.SyncRootInitialized() {
+		t.Fatal("history migration did not mark project initialized")
+	}
+	tombstones := reloaded.DeletionTombstones()
+	if len(tombstones) != 1 || tombstones[0].StableID != "legacy-id" {
+		t.Fatalf("migrated tombstones = %#v, want legacy-id", tombstones)
+	}
+}
+
+func TestCorruptedProjectStateRecoversFromExistingLocalContent(t *testing.T) {
+	appState := testState(t, 10)
+	root := appState.Config().SyncRootAbs
+	if err := os.MkdirAll(filepath.Join(root, config.MetadataDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, config.MetadataDir, "project-state.json"), []byte("{broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "ServerScriptService"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "ServerScriptService", "A.server.luau"), []byte("print(1)"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := appState.LoadProjectState(); err != nil {
+		t.Fatalf("LoadProjectState returned error: %v", err)
+	}
+	if !appState.SyncRootInitialized() {
+		t.Fatal("recovered project should be initialized")
+	}
+	matches, err := filepath.Glob(filepath.Join(root, config.MetadataDir, "project-state.json.corrupt-*"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("corrupt backup matches=%#v err=%v, want one", matches, err)
+	}
+}
+
+func TestSnapshotAuthoritativeRejectsInvalidPaths(t *testing.T) {
+	appState := testState(t, 10)
+	appState.SetSnapshot(map[string]records.SyncRecord{}, []string{"invalid"}, 1)
+	if appState.SnapshotAuthoritative() {
+		t.Fatal("SnapshotAuthoritative = true with invalid paths")
 	}
 }

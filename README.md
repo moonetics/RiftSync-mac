@@ -1,6 +1,6 @@
 # RiftSync Plugin (One-Way + Properties Tree)
 
-Versi: `4.1.0`
+Versi: `4.1.2`
 Protocol sync: `rbxsync/2.0.0`
 
 One-way sync untuk Roblox Studio:
@@ -90,6 +90,14 @@ ServerScriptService/
 ```
 
 `Enabled` adalah property canonical untuk `Script` dan `LocalScript`; metadata lama dengan `Disabled` tetap diterima saat import. Jika keduanya ada, `Enabled` menang. `Source` tetap ditulis di file `.server.luau`/`.client.luau`/`.module.luau`, bukan di `properties.init.json`.
+
+### Initial Sync dan Delete
+
+- Project yang benar-benar baru dan belum memiliki file sync otomatis menjalankan `Studio -> Folder` satu kali.
+- Setelah project pernah diinisialisasi, folder lokal tetap menjadi sumber utama meskipun seluruh file sync sengaja dihapus. RiftSync tidak menarik ulang object lama dari Studio.
+- Delete lokal disimpan sebagai tombstone di `.rblxsync/project-state.json` agar Studio yang baru tersambung tetap dapat membersihkan instance lama secara aman.
+- RiftSync hanya menghapus instance dengan bukti ownership yang cocok. Service root, Terrain, BasePart, Model, ignored path, dan instance unmanaged tetap dilindungi.
+- Orphan `properties.init.json` milik script dan folder canonical `<Name>.<ClassName>` yang benar-benar kosong dipangkas otomatis. Folder nonempty tidak dihapus secara rekursif.
 
 ### Format Folder UI
 
@@ -303,6 +311,12 @@ Build dengan icon Windows:
 .\scripts\build-windows.ps1
 ```
 
+Build paket plugin Studio dengan Rojo:
+
+```powershell
+.\scripts\build-plugin.ps1 -Output .\RiftSyncPlugin.rbxm
+```
+
 Script ini membuat asset dari `assets/brand/riftsync-logo.png`, menghasilkan:
 
 - `assets/brand/riftsync-icon-512.png`
@@ -476,7 +490,7 @@ git diff --check
 4. Pilih mode `Start` di widget:
    - `Folder -> Studio` jika source of truth ada di folder lokal.
    - `Studio -> Folder` jika mau override folder lokal dari Studio.
-   - Jika pilih `Folder -> Studio` tapi folder masih kosong, plugin akan auto seed dari Studio sekali dulu.
+   - Jika pilih `Folder -> Studio` dan index folder lokal masih kosong, plugin otomatis menjalankan Pull Studio sekali untuk membuat snapshot awal. Snapshot hasil upload tidak diterapkan kembali ke Studio.
 5. Klik `Start`.
 6. Save file di VS Code, perubahan akan otomatis muncul di Studio.
 7. Jika ada error, status bar tampil ringkas dan detail lengkap muncul di panel `Output` Studio.
@@ -513,6 +527,9 @@ Widget menampilkan hint pendek untuk error umum:
 
 ### Troubleshooting Server
 
+- Progress berhenti di fase **Uploading/indexing**: request Roblox masih berjalan sebagai satu HTTP request; desktop menampilkan progres penulisan server dan Studio memakai indikator indeterminate sampai respons kembali.
+- Folder lokal kosong pada mode **Folder -> Studio** otomatis di-seed dari Studio. Gunakan **Pull Studio** manual hanya jika ingin melihat preview perubahan pada project yang sudah berisi data.
+- Metadata di bawah Model/Part yang belum ada di Studio dilewati sebagai warning teragregasi; RiftSync tidak membuat geometry pengganti.
 - Port sudah dipakai: jalankan dengan `--port 8766`, lalu samakan port di widget Studio.
 - HTTP Requests belum aktif: buka `Game Settings -> Security -> Allow HTTP Requests`.
 - Firewall/security prompt Windows: izinkan local server untuk private network jika diminta.

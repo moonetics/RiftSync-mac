@@ -255,12 +255,123 @@ func (s *Service) processBatch(batch map[string]fsnotify.Op) {
 	}
 
 	parseDuration := time.Since(parseStarted)
+	deletedRecords := removedRecords(s.state.RecordsCopy(), nextRecords)
+	cleanupWarnings := s.cleanupDeletedRecordPaths(deletedRecords)
+	warnings = append(warnings, cleanupWarnings...)
 	publishStarted := time.Now()
 	snapshot := scanner.NormalizeRecords(nextRecords, warnings, invalidPaths)
 	s.state.ApplySnapshot(snapshot.Records, snapshot.Warnings, snapshot.InvalidPaths)
 	publishDuration := time.Since(publishStarted)
 	s.state.RecordPerformance(len(batch), s.debounce, parseDuration, publishDuration, cacheHits, cacheMisses)
 	_ = batchStarted
+}
+
+func (s *Service) cleanupDeletedRecordPaths(deleted []records.SyncRecord) []string {
+	warnings := []string{}
+	directories := map[string]bool{}
+	nonEmptyCount := 0
+	nonEmptySamples := []string{}
+
+	for _, record := range deleted {
+		if record.Entity == records.EntityScript {
+			propertiesPath, ok, pathErr := records.ScriptPropertiesPathForSourcePath(record.LocalPath)
+			if pathErr != nil {
+				warnings = append(warnings, "cleanup script metadata path: "+pathErr.Error())
+			} else if ok {
+				sourceAbs, sourceErr := s.cfg.ResolveInsideSyncRoot(record.LocalPath)
+				propertiesAbs, propertiesErr := s.cfg.ResolveInsideSyncRoot(propertiesPath)
+				if sourceErr == nil && propertiesErr == nil {
+					if _, statErr := os.Stat(sourceAbs); errors.Is(statErr, os.ErrNotExist) {
+						if removeErr := os.Remove(propertiesAbs); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+							warnings = append(warnings, fmt.Sprintf("cleanup orphan metadata %s: %v", propertiesPath, removeErr))
+						} else {
+							s.cache.Invalidate(propertiesPath)
+						}
+					}
+				}
+			}
+		}
+
+		localDir := strings.Trim(strings.ReplaceAll(record.LocalDir, "\\", "/"), "/")
+		for localDir != "" && strings.Contains(localDir, "/") {
+			if !looksLikeTypedDirectory(filepath.Base(filepath.FromSlash(localDir))) {
+				break
+			}
+			directories[localDir] = true
+			localDir = strings.Trim(strings.ReplaceAll(filepath.ToSlash(filepath.Dir(filepath.FromSlash(localDir))), "\\", "/"), "/")
+		}
+	}
+
+	ordered := make([]string, 0, len(directories))
+	for localDir := range directories {
+		ordered = append(ordered, localDir)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		leftDepth := strings.Count(ordered[i], "/")
+		rightDepth := strings.Count(ordered[j], "/")
+		if leftDepth != rightDepth {
+			return leftDepth > rightDepth
+		}
+		return ordered[i] > ordered[j]
+	})
+
+	for _, localDir := range ordered {
+		absDir, resolveErr := s.cfg.ResolveInsideSyncRoot(localDir)
+		if resolveErr != nil {
+			warnings = append(warnings, fmt.Sprintf("cleanup typed folder %s: %v", localDir, resolveErr))
+			continue
+		}
+		removeErr := os.Remove(absDir)
+		switch {
+		case removeErr == nil:
+			s.removeWatchesUnder(absDir)
+			s.cache.InvalidateSubtree(localDir)
+		case errors.Is(removeErr, os.ErrNotExist):
+			continue
+		default:
+			entries, readErr := os.ReadDir(absDir)
+			if readErr == nil && len(entries) > 0 {
+				nonEmptyCount++
+				if len(nonEmptySamples) < 10 {
+					nonEmptySamples = append(nonEmptySamples, localDir)
+				}
+				continue
+			}
+			warnings = append(warnings, fmt.Sprintf("cleanup typed folder %s: %v", localDir, removeErr))
+		}
+	}
+	if nonEmptyCount > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"cleanup preserved %d non-empty typed folders (examples: %s)",
+			nonEmptyCount,
+			strings.Join(nonEmptySamples, ", "),
+		))
+	}
+	return warnings
+}
+
+func removedRecords(previous, next map[string]records.SyncRecord) []records.SyncRecord {
+	deleted := []records.SyncRecord{}
+	for localPath, record := range previous {
+		if _, exists := next[localPath]; !exists {
+			deleted = append(deleted, record)
+		}
+	}
+	return deleted
+}
+
+func looksLikeTypedDirectory(name string) bool {
+	dot := strings.LastIndex(name, ".")
+	if dot <= 0 || dot == len(name)-1 {
+		return false
+	}
+	className := name[dot+1:]
+	for _, char := range className {
+		if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) processWarnings(warnings []string) {

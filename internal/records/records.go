@@ -747,6 +747,7 @@ func (r *SyncRecord) ApplyScriptPayload(payload map[string]any) error {
 		return err
 	}
 	r.Payload = payload
+	r.StableID = StableID(payload)
 	r.ContentHash = ContentDigest(r.Source + "\x00" + canonical)
 	return nil
 }

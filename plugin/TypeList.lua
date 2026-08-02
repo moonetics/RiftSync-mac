@@ -1,6 +1,6 @@
 local TypeList = {}
 
-TypeList.VERSION = "4.1.0"
+TypeList.VERSION = "4.1.2"
 TypeList.PROTOCOL = "rbxsync/2.0.0"
 TypeList.PLUGIN_ICON = "rbxassetid://72034413544662"
 TypeList.CHANGE_ENCODINGS = {
@@ -201,9 +201,7 @@ TypeList.UI_PROPERTY_CANDIDATES = {
 	"TextYAlignment",
 	"TileSize",
 	"Transparency",
-	"UICorner",
 	"UIOffset",
-	"UIScale",
 	"VerticalAlignment",
 	"Visible",
 	"Volume",

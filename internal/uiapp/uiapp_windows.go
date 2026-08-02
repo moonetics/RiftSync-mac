@@ -152,40 +152,45 @@ type windowController struct {
 }
 
 type statusPayload struct {
-	InstanceID           string  `json:"instance_id,omitempty"`
-	InstanceName         string  `json:"instance_name,omitempty"`
-	Running              bool    `json:"running"`
-	Starting             bool    `json:"starting"`
-	Status               string  `json:"status"`
-	Address              string  `json:"address"`
-	Host                 string  `json:"host"`
-	Port                 int     `json:"port"`
-	ConfigPath           string  `json:"config_path"`
-	SyncRoot             string  `json:"sync_root"`
-	Mode                 string  `json:"mode"`
-	Debug                bool    `json:"debug"`
-	LegacyScan           bool    `json:"legacy_scan"`
-	Revision             int     `json:"revision"`
-	Indexed              int     `json:"indexed"`
-	Scripts              int     `json:"scripts"`
-	UI                   int     `json:"ui"`
-	RequestCount         int     `json:"request_count"`
-	Polls                int     `json:"polls"`
-	GitEnabled           bool    `json:"git_enabled"`
-	GitStatus            string  `json:"git_status"`
-	ActivityText         string  `json:"activity_text"`
-	ActivityOp           string  `json:"activity_operation"`
-	ActivityError        bool    `json:"activity_error"`
-	ActivityProgress     int     `json:"activity_progress"`
-	ActivityClientID     string  `json:"activity_client_id"`
-	ActivityRevision     int     `json:"activity_revision"`
-	ActivityAt           float64 `json:"activity_at"`
-	LastError            string  `json:"last_error"`
-	Uptime               string  `json:"uptime"`
-	RemoteExecEnabled    bool    `json:"remote_exec_enabled"`
-	RemoteExecConfigured bool    `json:"remote_exec_configured"`
-	RemoteExecAvailable  bool    `json:"remote_exec_available"`
-	RemoteExecToken      string  `json:"remote_exec_token"`
+	InstanceID            string  `json:"instance_id,omitempty"`
+	InstanceName          string  `json:"instance_name,omitempty"`
+	Running               bool    `json:"running"`
+	Starting              bool    `json:"starting"`
+	Syncing               bool    `json:"syncing"`
+	Status                string  `json:"status"`
+	Address               string  `json:"address"`
+	Host                  string  `json:"host"`
+	Port                  int     `json:"port"`
+	ConfigPath            string  `json:"config_path"`
+	SyncRoot              string  `json:"sync_root"`
+	Mode                  string  `json:"mode"`
+	Debug                 bool    `json:"debug"`
+	LegacyScan            bool    `json:"legacy_scan"`
+	Revision              int     `json:"revision"`
+	Indexed               int     `json:"indexed"`
+	Scripts               int     `json:"scripts"`
+	UI                    int     `json:"ui"`
+	RequestCount          int     `json:"request_count"`
+	Polls                 int     `json:"polls"`
+	GitEnabled            bool    `json:"git_enabled"`
+	GitStatus             string  `json:"git_status"`
+	ActivityText          string  `json:"activity_text"`
+	ActivityOp            string  `json:"activity_operation"`
+	ActivityPhase         string  `json:"activity_phase"`
+	ActivityError         bool    `json:"activity_error"`
+	ActivityProgress      int     `json:"activity_progress"`
+	ActivityCurrent       int     `json:"activity_current"`
+	ActivityTotal         int     `json:"activity_total"`
+	ActivityIndeterminate bool    `json:"activity_indeterminate"`
+	ActivityClientID      string  `json:"activity_client_id"`
+	ActivityRevision      int     `json:"activity_revision"`
+	ActivityAt            float64 `json:"activity_at"`
+	LastError             string  `json:"last_error"`
+	Uptime                string  `json:"uptime"`
+	RemoteExecEnabled     bool    `json:"remote_exec_enabled"`
+	RemoteExecConfigured  bool    `json:"remote_exec_configured"`
+	RemoteExecAvailable   bool    `json:"remote_exec_available"`
+	RemoteExecToken       string  `json:"remote_exec_token"`
 }
 
 type restartRequest struct {
@@ -1765,38 +1770,43 @@ func makeStatusPayload(status serverapp.Status, starting bool, lastError string)
 		uptime = time.Since(status.StartedAt).Round(time.Second).String()
 	}
 	payload := statusPayload{
-		Running:              status.Running,
-		Starting:             starting,
-		Address:              address,
-		Host:                 host,
-		Port:                 port,
-		ConfigPath:           fallback(status.ConfigPath, "sync_config.json"),
-		SyncRoot:             status.SyncRoot,
-		Mode:                 mode,
-		Debug:                status.Debug,
-		LegacyScan:           status.LegacyScan,
-		Revision:             status.Revision,
-		Indexed:              status.Counts.Entry,
-		Scripts:              status.Counts.Script,
-		UI:                   status.Counts.UI,
-		RequestCount:         status.Metrics.RequestCount,
-		Polls:                status.Metrics.ChangesRequests,
-		GitEnabled:           status.Git.Enabled,
-		GitStatus:            gitStatus,
-		ActivityText:         fallback(status.Activity.Text, "No Studio activity yet."),
-		ActivityOp:           status.Activity.Operation,
-		ActivityError:        status.Activity.Error,
-		ActivityProgress:     status.Activity.Progress,
-		ActivityClientID:     status.Activity.ClientID,
-		ActivityRevision:     status.Activity.Revision,
-		ActivityAt:           status.Activity.At,
-		LastError:            fallback(lastError, "Clear"),
-		Uptime:               uptime,
-		RemoteExecEnabled:    status.RemoteExecEnabled,
-		RemoteExecConfigured: strings.TrimSpace(status.RemoteExecToken) != "",
-		RemoteExecAvailable:  status.RemoteExecEnabled && strings.TrimSpace(status.RemoteExecToken) != "",
-		RemoteExecToken:      status.RemoteExecToken,
+		Running:               status.Running,
+		Starting:              starting,
+		Address:               address,
+		Host:                  host,
+		Port:                  port,
+		ConfigPath:            fallback(status.ConfigPath, "sync_config.json"),
+		SyncRoot:              status.SyncRoot,
+		Mode:                  mode,
+		Debug:                 status.Debug,
+		LegacyScan:            status.LegacyScan,
+		Revision:              status.Revision,
+		Indexed:               status.Counts.Entry,
+		Scripts:               status.Counts.Script,
+		UI:                    status.Counts.UI,
+		RequestCount:          status.Metrics.RequestCount,
+		Polls:                 status.Metrics.ChangesRequests,
+		GitEnabled:            status.Git.Enabled,
+		GitStatus:             gitStatus,
+		ActivityText:          fallback(status.Activity.Text, "No Studio activity yet."),
+		ActivityOp:            status.Activity.Operation,
+		ActivityPhase:         status.Activity.Phase,
+		ActivityError:         status.Activity.Error,
+		ActivityProgress:      status.Activity.Progress,
+		ActivityCurrent:       status.Activity.Current,
+		ActivityTotal:         status.Activity.Total,
+		ActivityIndeterminate: status.Activity.Indeterminate,
+		ActivityClientID:      status.Activity.ClientID,
+		ActivityRevision:      status.Activity.Revision,
+		ActivityAt:            status.Activity.At,
+		LastError:             strings.TrimSpace(lastError),
+		Uptime:                uptime,
+		RemoteExecEnabled:     status.RemoteExecEnabled,
+		RemoteExecConfigured:  strings.TrimSpace(status.RemoteExecToken) != "",
+		RemoteExecAvailable:   status.RemoteExecEnabled && strings.TrimSpace(status.RemoteExecToken) != "",
+		RemoteExecToken:       status.RemoteExecToken,
 	}
+	payload.Syncing = syncingStatus(payload)
 	payload.Status = statusText(payload)
 	return payload
 }
@@ -1840,10 +1850,28 @@ func statusText(payload statusPayload) string {
 	if payload.Starting {
 		return "Starting"
 	}
+	if payload.Syncing {
+		return "Syncing"
+	}
 	if payload.Running {
 		return "Running"
 	}
+	if strings.TrimSpace(payload.LastError) != "" {
+		return "Error"
+	}
 	return "Stopped"
+}
+
+func syncingStatus(payload statusPayload) bool {
+	if !payload.Running || payload.Starting || payload.ActivityError {
+		return false
+	}
+	phase := strings.ToLower(strings.TrimSpace(payload.ActivityPhase))
+	switch phase {
+	case "complete", "error", "stopped", "idle":
+		return false
+	}
+	return payload.ActivityIndeterminate || (payload.ActivityProgress > 0 && payload.ActivityProgress < 100)
 }
 
 func optionsFromInput(current serverapp.Options, configPath, syncRoot, host, portRaw string, gitEnabled, debug, legacyScan bool) (serverapp.Options, error) {

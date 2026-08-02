@@ -92,13 +92,17 @@ const (
 )
 
 type Activity struct {
-	Text      string  `json:"text"`
-	Operation string  `json:"operation"`
-	Error     bool    `json:"error"`
-	Progress  int     `json:"progress"`
-	ClientID  string  `json:"client_id"`
-	Revision  int     `json:"revision"`
-	At        float64 `json:"at"`
+	Text          string  `json:"text"`
+	Operation     string  `json:"operation"`
+	Phase         string  `json:"phase,omitempty"`
+	Error         bool    `json:"error"`
+	Progress      int     `json:"progress"`
+	Current       int     `json:"current,omitempty"`
+	Total         int     `json:"total,omitempty"`
+	Indeterminate bool    `json:"indeterminate,omitempty"`
+	ClientID      string  `json:"client_id"`
+	Revision      int     `json:"revision"`
+	At            float64 `json:"at"`
 }
 
 type RemoteExecState string
@@ -220,6 +224,8 @@ type AppState struct {
 	execLastCommandAt    float64
 	execLastResultStatus string
 	listeners            []func(RevisionEvent)
+	projectInitialized   bool
+	tombstones           map[string]DeletionTombstone
 }
 
 type persistentHistory struct {
@@ -239,6 +245,7 @@ func New(cfg config.Config) *AppState {
 		changed:      make(chan struct{}),
 		execCommands: map[string]*RemoteExecCommand{},
 		execChanged:  make(chan struct{}),
+		tombstones:   map[string]DeletionTombstone{},
 		metrics: Metrics{
 			LastChanges: map[string]any{},
 		},
@@ -305,6 +312,7 @@ func (s *AppState) ApplySnapshot(snapshotRecords map[string]records.SyncRecord, 
 
 	s.revision++
 	event := buildRevisionEvent(s.revision, changes)
+	s.applyChangesToTombstonesLocked(changes, s.revision)
 	s.changeLog = append(s.changeLog, event)
 	if len(s.changeLog) > s.cfg.ChangeRetention {
 		s.changeLog = s.changeLog[len(s.changeLog)-s.cfg.ChangeRetention:]
@@ -312,12 +320,16 @@ func (s *AppState) ApplySnapshot(snapshotRecords map[string]records.SyncRecord, 
 	s.metrics.LastRevisionBumpAt = nowSeconds()
 	s.metrics.LastRevisionChangeCount = len(changes)
 	persistErr := s.saveHistoryLocked()
+	projectStateErr := s.saveProjectStateLocked()
 	listeners := append([]func(RevisionEvent){}, s.listeners...)
 	s.broadcastLocked()
 	s.mu.Unlock()
 
 	if persistErr != nil {
 		s.events.Add("history", persistErr.Error())
+	}
+	if projectStateErr != nil {
+		s.events.Add("project-state", projectStateErr.Error())
 	}
 	s.events.Add("revision", "revision "+strconv.Itoa(event.Rev)+" changes="+strconv.Itoa(event.ChangeCount))
 	for _, listener := range listeners {
@@ -683,12 +695,22 @@ func (s *AppState) Activity() Activity {
 func (s *AppState) RecordActivity(activity Activity) Activity {
 	activity.Text = strings.TrimSpace(activity.Text)
 	activity.Operation = strings.TrimSpace(activity.Operation)
+	activity.Phase = strings.TrimSpace(activity.Phase)
 	activity.ClientID = strings.TrimSpace(activity.ClientID)
 	if activity.Progress < 0 {
 		activity.Progress = 0
 	}
 	if activity.Progress > 100 {
 		activity.Progress = 100
+	}
+	if activity.Current < 0 {
+		activity.Current = 0
+	}
+	if activity.Total < 0 {
+		activity.Total = 0
+	}
+	if activity.Total > 0 && activity.Current > activity.Total {
+		activity.Current = activity.Total
 	}
 	if activity.At == 0 {
 		activity.At = nowSeconds()

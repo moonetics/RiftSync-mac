@@ -1,11 +1,12 @@
 --------------------------------------------------------------------------------------------
--- RiftSyncPlugin v4.1.0
+-- RiftSyncPlugin v4.1.2
 -- Multi-profile Roblox Studio client for RiftSync.
 --------------------------------------------------------------------------------------------
 
 local apiModule = script:WaitForChild("API")
 local SyncAPI = require(apiModule)
 local TypeList = require(apiModule:WaitForChild("TypeList"))
+local TweenService = game:GetService("TweenService")
 
 if not plugin then
 	warn("[RiftSync] Plugin context is unavailable.")
@@ -351,6 +352,24 @@ local statusPanel = panel(scroll, 3)
 label(statusPanel, "PROJECT STATUS", 12, COLORS.Muted, true)
 local statusHeadline = wrappedLabel(statusPanel, "● Stopped", 16, COLORS.Text, true)
 local statusDetail = wrappedLabel(statusPanel, "Choose a profile and start sync.", 13, COLORS.Muted, false)
+local progressTrack = Instance.new("Frame")
+progressTrack.Name = "SyncProgress"
+progressTrack.Size = UDim2.new(1, 0, 0, 8)
+progressTrack.BackgroundColor3 = COLORS.Well
+progressTrack.BorderSizePixel = 0
+progressTrack.Visible = false
+progressTrack.Parent = statusPanel
+corner(progressTrack, 4)
+stroke(progressTrack, COLORS.Border, 1)
+local progressFill = Instance.new("Frame")
+progressFill.Name = "Fill"
+progressFill.Size = UDim2.new(0, 0, 1, 0)
+progressFill.BackgroundColor3 = COLORS.Cyan
+progressFill.BorderSizePixel = 0
+progressFill.Parent = progressTrack
+corner(progressFill, 4)
+local progressCaption = label(statusPanel, "", 12, COLORS.Muted, false)
+progressCaption.Visible = false
 
 local historyPanel = panel(scroll, 6)
 label(historyPanel, "RECENT SYNC ACTIVITY", 10, COLORS.Muted, true)
@@ -384,6 +403,7 @@ local profiles = {}
 local selectedProfileIndex = 1
 local historyLines = {}
 local MAX_HISTORY_LINES = 12
+local progressTween = nil
 
 local function setProfileEditorVisible(visible)
 	profileEditor.Visible = visible == true
@@ -546,12 +566,52 @@ local function appendHistory(meta)
 	historyLabel.Text = #historyLines > 0 and table.concat(historyLines, "\n") or "No sync activity yet."
 end
 
+local function updateProgress(meta, isError)
+	local value = typeof(meta) == "table" and math.clamp(tonumber(meta.progress) or 0, 0, 100) or 0
+	local indeterminate = typeof(meta) == "table" and meta.indeterminate == true
+	local phase = typeof(meta) == "table" and tostring(meta.phase or "") or ""
+	local current = typeof(meta) == "table" and math.max(0, math.floor(tonumber(meta.current) or 0)) or 0
+	local total = typeof(meta) == "table" and math.max(0, math.floor(tonumber(meta.total) or 0)) or 0
+	if progressTween then
+		progressTween:Cancel()
+		progressTween = nil
+	end
+	progressTrack.Visible = indeterminate or value > 0
+	progressCaption.Visible = progressTrack.Visible
+	progressFill.BackgroundColor3 = isError and COLORS.Red or COLORS.Cyan
+	progressFill.Position = UDim2.new(0, 0, 0, 0)
+	if indeterminate then
+		progressFill.Size = UDim2.new(0.34, 0, 1, 0)
+		progressTween = TweenService:Create(
+			progressFill,
+			TweenInfo.new(1.1, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false),
+			{ Position = UDim2.new(0.66, 0, 0, 0) }
+		)
+		progressTween:Play()
+	else
+		progressFill.Size = UDim2.new(value / 100, 0, 1, 0)
+	end
+	local bits = {}
+	if phase ~= "" then
+		local phaseLabel = string.gsub(phase, "_", " ")
+		table.insert(bits, phaseLabel)
+	end
+	if total > 0 then
+		table.insert(bits, tostring(current) .. "/" .. tostring(total))
+	end
+	if not indeterminate and value > 0 then
+		table.insert(bits, tostring(math.floor(value + 0.5)) .. "%")
+	end
+	progressCaption.Text = table.concat(bits, "  ·  ")
+end
+
 local function updateStatus(text, isError, meta)
 	local raw = tostring(text or "")
 	statusHeadline.Text = isError and "● Issue" or (client and client:isRunning() and "● Connected" or "● Ready")
 	statusHeadline.TextColor3 = isError and COLORS.Red or (client and client:isRunning() and COLORS.Green or COLORS.Text)
 	statusDetail.Text = raw
 	statusDetail.TextColor3 = isError and COLORS.Red or COLORS.Muted
+	updateProgress(meta, isError)
 	appendHistory(meta)
 	if isError then
 		warn("[RiftSync] " .. raw)

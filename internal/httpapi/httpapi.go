@@ -98,6 +98,8 @@ func (a *API) method(method string, handler http.HandlerFunc) http.HandlerFunc {
 func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 	cfg := a.state.Config()
 	counts := a.state.IndexedCounts()
+	rootFiles, rootFilesError := listSyncRootFiles(cfg.SyncRootAbs)
+	syncRootEmpty := rootFilesError == nil && len(rootFiles) == 0
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                    "ok",
 		"version":                   a.version,
@@ -108,6 +110,8 @@ func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 		"indexed_script_count":      counts.Script,
 		"indexed_ui_count":          counts.UI,
 		"indexed_props_count":       counts.UI,
+		"sync_root_empty":           syncRootEmpty,
+		"sync_root_initialized":     a.state.SyncRootInitialized(),
 		"strict_property_whitelist": cfg.StrictPropertyWhitelist,
 		"extra_allowed_class_count": len(cfg.ExtraAllowedProperties),
 		"git":                       a.state.GitState(),
@@ -136,6 +140,8 @@ func (a *API) handshake(w http.ResponseWriter, r *http.Request) {
 
 	cfg := a.state.Config()
 	counts := a.state.IndexedCounts()
+	rootFiles, rootFilesError := listSyncRootFiles(cfg.SyncRootAbs)
+	syncRootEmpty := rootFilesError == nil && len(rootFiles) == 0
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                     "ok",
 		"version":                    a.version,
@@ -152,6 +158,8 @@ func (a *API) handshake(w http.ResponseWriter, r *http.Request) {
 		"indexed_ui_count":           counts.UI,
 		"indexed_props_count":        counts.UI,
 		"indexed_entry_count":        counts.Entry,
+		"sync_root_empty":            syncRootEmpty,
+		"sync_root_initialized":      a.state.SyncRootInitialized(),
 		"strict_property_whitelist":  cfg.StrictPropertyWhitelist,
 		"extra_allowed_properties":   cfg.ExtraAllowedProperties,
 	})
@@ -170,6 +178,12 @@ func (a *API) ack(w http.ResponseWriter, r *http.Request) {
 	statusText, _ := payload["status"].(string)
 	if statusText == "" {
 		statusText = "ok"
+	}
+	if statusText == "ok" {
+		if err := a.state.SetSyncRootInitialized(true); err != nil {
+			writeError(w, http.StatusInternalServerError, "Unable to persist initialized project state: "+err.Error())
+			return
+		}
 	}
 	a.state.RecordAck(clientID, statusText, payload["applied_rev"], sanitizeErrors(payload["errors"]))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -191,12 +205,16 @@ func (a *API) activity(w http.ResponseWriter, r *http.Request) {
 	}
 
 	activity := a.state.RecordActivity(state.Activity{
-		Text:      text,
-		Operation: stringValue(payload["operation"]),
-		Error:     boolValue(payload["error"]),
-		Progress:  intValue(payload["progress"], 0),
-		ClientID:  stringValue(payload["client_id"]),
-		Revision:  intValue(payload["revision"], 0),
+		Text:          text,
+		Operation:     stringValue(payload["operation"]),
+		Phase:         stringValue(payload["phase"]),
+		Error:         boolValue(payload["error"]),
+		Progress:      intValue(payload["progress"], 0),
+		Current:       intValue(payload["current"], 0),
+		Total:         intValue(payload["total"], 0),
+		Indeterminate: boolValue(payload["indeterminate"]),
+		ClientID:      stringValue(payload["client_id"]),
+		Revision:      intValue(payload["revision"], 0),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "activity": activity})
 }
@@ -346,10 +364,12 @@ func (a *API) snapshot(w http.ResponseWriter, r *http.Request) {
 		changes = a.state.SnapshotUpserts()
 	}
 	payload := map[string]any{
-		"status":          "ok",
-		"server_rev":      a.state.Revision(),
-		"change_encoding": encoding,
-		"changes":         changes,
+		"status":              "ok",
+		"server_rev":          a.state.Revision(),
+		"change_encoding":     encoding,
+		"changes":             changes,
+		"authoritative":       a.state.SnapshotAuthoritative(),
+		"deletion_tombstones": a.state.DeletionTombstones(),
 	}
 	payloadBytes := encodedPayloadBytes(payload)
 	a.state.RecordSnapshotRequest(len(changes), encoding, payloadBytes)
@@ -607,6 +627,20 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := a.state.Config()
+	clientID := stringValue(payload["client_id"])
+	recordBootstrapActivity := func(text, phase string, progress, current int, indeterminate bool) {
+		a.state.RecordActivity(state.Activity{
+			Text:          text,
+			Operation:     "studio_to_folder",
+			Phase:         phase,
+			Progress:      progress,
+			Current:       current,
+			Total:         len(files),
+			Indeterminate: indeterminate,
+			ClientID:      clientID,
+			Revision:      a.state.Revision(),
+		})
+	}
 	writeErrors := []string{}
 	writtenCount := 0
 	newCount := 0
@@ -617,6 +651,7 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	backupCount := 0
 
 	a.state.LockReconciliation()
+	recordBootstrapActivity("Preparing local snapshot...", "preparing", 68, 0, true)
 	if mode == "replace" {
 		path, count, err := createReplaceBackup(cfg.SyncRootAbs, time.Now())
 		if err != nil {
@@ -636,7 +671,21 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 		deletedCount = count
 	}
 
-	for _, rawItem := range files {
+	for fileIndex, rawItem := range files {
+		current := fileIndex + 1
+		if current == len(files) || current%100 == 0 {
+			progress := 70
+			if len(files) > 0 {
+				progress += current * 20 / len(files)
+			}
+			recordBootstrapActivity(
+				fmt.Sprintf("Processing local snapshot... %d/%d", current, len(files)),
+				"writing",
+				progress,
+				current,
+				false,
+			)
+		}
 		item, ok := rawItem.(map[string]any)
 		if !ok {
 			writeErrors = append(writeErrors, "Invalid file payload entry")
@@ -709,6 +758,7 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.state.LockReconciliation()
+	recordBootstrapActivity("Indexing local snapshot...", "indexing", 94, len(files), true)
 	scanStarted := time.Now()
 	snapshot, scanErr := a.scanCache.Scan(cfg)
 	if scanErr != nil {
@@ -722,7 +772,19 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		writeErrors = append(writeErrors, fmt.Sprintf("Failed writing guidebook status: %v", err))
 	}
+	if len(writeErrors) == 0 {
+		if err := a.state.SetSyncRootInitialized(true); err != nil {
+			writeErrors = append(writeErrors, "Failed persisting initialized project state: "+err.Error())
+		}
+	}
 	a.state.RecordBootstrap(writtenCount, updatedCount, unchangedCount, deletedCount, len(writeErrors))
+	recordBootstrapActivity(
+		fmt.Sprintf("Local snapshot ready: %d written, %d unchanged", writtenCount, unchangedCount),
+		"complete",
+		100,
+		len(files),
+		false,
+	)
 	a.state.UnlockReconciliation()
 
 	writeJSON(w, http.StatusOK, map[string]any{

@@ -216,3 +216,45 @@ func TestSyncTreeAddsFoldersCreatedWithoutFsnotifyEvent(t *testing.T) {
 		t.Fatalf("watch count = %d, want at least %d (SyncTree added=%d)", service.WatchCount(), initialCount+3, result.Added)
 	}
 }
+
+func TestDeleteScriptPrunesOrphanMetadataAndEmptyTypedFolder(t *testing.T) {
+	root := t.TempDir()
+	service, appState := newTestService(t, root)
+	source := writeFile(t, root, "ServerScriptService/Foo.Script/Foo.server.luau", "print(1)")
+	properties := writeFile(t, root, "ServerScriptService/Foo.Script/properties.init.json", `{"id":"foo-id","className":"Script","name":"Foo","properties":{},"attributes":{},"tags":[]}`)
+
+	service.processBatch(map[string]fsnotify.Op{source: fsnotify.Create, properties: fsnotify.Create})
+	if len(appState.RecordsCopy()) != 1 {
+		t.Fatalf("records before delete = %#v, want one merged script", appState.RecordsCopy())
+	}
+	if err := os.Remove(source); err != nil {
+		t.Fatal(err)
+	}
+	service.processBatch(map[string]fsnotify.Op{source: fsnotify.Remove})
+	if _, err := os.Stat(properties); !os.IsNotExist(err) {
+		t.Fatalf("orphan properties still exists, err=%v", err)
+	}
+	typedDir := filepath.Dir(source)
+	if _, err := os.Stat(typedDir); !os.IsNotExist(err) {
+		t.Fatalf("empty typed folder still exists, err=%v", err)
+	}
+}
+
+func TestDeleteScriptPreservesNonEmptyTypedFolder(t *testing.T) {
+	root := t.TempDir()
+	service, _ := newTestService(t, root)
+	source := writeFile(t, root, "ServerScriptService/Foo.Script/Foo.server.luau", "print(1)")
+	properties := writeFile(t, root, "ServerScriptService/Foo.Script/properties.init.json", `{"id":"foo-id","className":"Script","name":"Foo","properties":{},"attributes":{},"tags":[]}`)
+	keep := writeFile(t, root, "ServerScriptService/Foo.Script/notes.txt", "keep")
+	service.processBatch(map[string]fsnotify.Op{source: fsnotify.Create, properties: fsnotify.Create})
+	if err := os.Remove(source); err != nil {
+		t.Fatal(err)
+	}
+	service.processBatch(map[string]fsnotify.Op{source: fsnotify.Remove})
+	if _, err := os.Stat(properties); !os.IsNotExist(err) {
+		t.Fatalf("orphan properties still exists, err=%v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("non-empty typed folder content was removed: %v", err)
+	}
+}

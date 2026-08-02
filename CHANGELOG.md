@@ -2,6 +2,23 @@
 
 Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
+## 4.1.2 - 2026-08-02
+
+- Fixed Studio deletes being silently skipped for instances exported by Auto Pull Studio.
+- Added persistent initialized-project state and deletion tombstones so intentionally empty local projects remain authoritative.
+- Added exact legacy delete repair through stable ID or RiftSync-owned script path/class proof.
+- Added safe cleanup for orphan script metadata and empty canonical `Name.ClassName` folders.
+- Bootstrap errors now prevent ownership adoption and revision acknowledgement instead of reporting partial writes as successful.
+
+## 4.1.1 - 2026-08-01
+
+- Added structured, accessible sync progress bars to the desktop dashboard and Studio widget.
+- Fixed Studio snapshot exports mistaking same-named children such as `UICorner` for properties.
+- Fixed dotted Roblox names such as `Cube.004` by resolving apply targets from typed local-path segments.
+- Removed the redundant Studio -> Folder fetch/apply-back pass and automatically seed an empty Folder -> Studio project from Studio once.
+- Added cooperative snapshot yields, per-class property caching, tolerant orphan metadata handling, and capped error samples.
+- Added an accessible `Syncing` desktop state, neutral stopped indicators, healthy `No issues` feedback, and semantic success/warning/error/info toasts.
+
 ## 4.1.0 - 2026-08-01
 
 - Expanded `Studio -> Folder` metadata snapshots to scripts, ValueBase, Workspace/Terrain/Lighting effects, UI, audio, animation, visual effects, prompts, tools, attachments, constraints, and other curated non-geometry classes.

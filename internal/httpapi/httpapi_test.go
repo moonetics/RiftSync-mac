@@ -145,6 +145,90 @@ func TestHandshake(t *testing.T) {
 	if !ok || len(ignored) == 0 {
 		t.Fatalf("ignored_rbx_paths = %#v, want non-empty array", payload["ignored_rbx_paths"])
 	}
+	if payload["sync_root_empty"] != true {
+		t.Fatalf("sync_root_empty = %#v, want true", payload["sync_root_empty"])
+	}
+	if payload["sync_root_initialized"] != false {
+		t.Fatalf("sync_root_initialized = %#v, want false", payload["sync_root_initialized"])
+	}
+}
+
+func TestBootstrapMarksEmptyProjectInitializedOnlyAfterSuccess(t *testing.T) {
+	handler, appState := newTestHandlerWithState(t)
+	recorder := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"mode":"replace","client_id":"studio","files":[]}`)
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap", body))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q, want 200", recorder.Code, recorder.Body.String())
+	}
+	payload := decodeResponse(t, recorder)
+	if payload["error_count"] != float64(0) || !appState.SyncRootInitialized() {
+		t.Fatalf("payload=%#v initialized=%v, want successful initialization", payload, appState.SyncRootInitialized())
+	}
+}
+
+func TestBootstrapWithWriteErrorDoesNotMarkProjectInitialized(t *testing.T) {
+	handler, appState := newTestHandlerWithState(t)
+	recorder := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"mode":"replace","client_id":"studio","files":[{"local_path":"../escape.server.luau","source":"print(1)"}]}`)
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/bootstrap", body))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q, want 200 with error_count", recorder.Code, recorder.Body.String())
+	}
+	payload := decodeResponse(t, recorder)
+	if payload["error_count"] == float64(0) || appState.SyncRootInitialized() {
+		t.Fatalf("payload=%#v initialized=%v, want failed initialization", payload, appState.SyncRootInitialized())
+	}
+}
+
+func TestSnapshotIncludesAuthoritativeDeletionTombstones(t *testing.T) {
+	handler, appState := newTestHandlerWithState(t)
+	record := records.SyncRecord{
+		Entity:      records.EntityUIInstance,
+		LocalPath:   "StarterGui/Old.Frame/properties.init.json",
+		LocalDir:    "StarterGui/Old.Frame",
+		RbxPath:     "game.StarterGui.Old",
+		ClassName:   "Frame",
+		StableID:    "old-frame",
+		Source:      `{}`,
+		ContentHash: records.ContentDigest(`{}`),
+	}
+	appState.SetSnapshot(map[string]records.SyncRecord{record.LocalPath: record}, nil, 0)
+	appState.ApplySnapshot(map[string]records.SyncRecord{}, nil, nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/snapshot", nil))
+	payload := decodeResponse(t, recorder)
+	if payload["authoritative"] != true {
+		t.Fatalf("authoritative=%#v, want true", payload["authoritative"])
+	}
+	tombstones, ok := payload["deletion_tombstones"].([]any)
+	if !ok || len(tombstones) != 1 {
+		t.Fatalf("deletion_tombstones=%#v, want one", payload["deletion_tombstones"])
+	}
+	tombstone, ok := tombstones[0].(map[string]any)
+	if !ok || tombstone["stable_id"] != "old-frame" || tombstone["class_name"] != "Frame" {
+		t.Fatalf("tombstone=%#v, want old-frame Frame", tombstones[0])
+	}
+}
+
+func TestHandshakeDoesNotTreatUnsupportedLocalContentAsEmpty(t *testing.T) {
+	cfg := config.Default()
+	cfg.SyncRoot = t.TempDir()
+	writeFile(t, cfg.SyncRoot, "notes.txt", "keep me")
+	handler, _ := newTestHandlerWithConfig(t, cfg)
+	recorder := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"protocol":"rbxsync/2.0.0","client_id":"test-client"}`)
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/handshake", body))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%q, want 200", recorder.Code, recorder.Body.String())
+	}
+	payload := decodeResponse(t, recorder)
+	if payload["indexed_entry_count"] != float64(0) {
+		t.Fatalf("indexed_entry_count = %#v, want 0", payload["indexed_entry_count"])
+	}
+	if payload["sync_root_empty"] != false {
+		t.Fatalf("sync_root_empty = %#v, want false for unsupported local content", payload["sync_root_empty"])
+	}
 }
 
 func TestHandshakeLegacyProtocolUsesVerbose(t *testing.T) {
@@ -210,9 +294,22 @@ func TestAckAndDebugMetrics(t *testing.T) {
 	}
 }
 
+func TestSuccessfulAckMarksProjectInitialized(t *testing.T) {
+	handler, appState := newTestHandlerWithState(t)
+	recorder := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"client_id":"studio","status":"ok","applied_rev":0}`)
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/ack", body))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q, want 200", recorder.Code, recorder.Body.String())
+	}
+	if !appState.SyncRootInitialized() {
+		t.Fatal("successful ack did not mark project initialized")
+	}
+}
+
 func TestActivityEndpointAndDebugState(t *testing.T) {
 	handler, appState := newTestHandlerWithState(t)
-	body := bytes.NewBufferString(`{"client_id":"studio-1","text":"Syncing snapshot... (55%)","operation":"sync","progress":55,"revision":7}`)
+	body := bytes.NewBufferString(`{"client_id":"studio-1","text":"Applying properties...","operation":"folder_to_studio","phase":"properties","progress":87,"current":120,"total":500,"indeterminate":false,"revision":7}`)
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/activity", body))
 	if recorder.Code != http.StatusOK {
@@ -220,7 +317,14 @@ func TestActivityEndpointAndDebugState(t *testing.T) {
 	}
 
 	activity := appState.Activity()
-	if activity.Text != "Syncing snapshot... (55%)" || activity.Operation != "sync" || activity.Progress != 55 || activity.Revision != 7 {
+	if activity.Text != "Applying properties..." ||
+		activity.Operation != "folder_to_studio" ||
+		activity.Phase != "properties" ||
+		activity.Progress != 87 ||
+		activity.Current != 120 ||
+		activity.Total != 500 ||
+		activity.Indeterminate ||
+		activity.Revision != 7 {
 		t.Fatalf("activity = %#v", activity)
 	}
 
@@ -228,7 +332,11 @@ func TestActivityEndpointAndDebugState(t *testing.T) {
 	handler.ServeHTTP(debugRecorder, httptest.NewRequest(http.MethodGet, "/debug/state", nil))
 	debugPayload := decodeResponse(t, debugRecorder)
 	debugActivity, ok := debugPayload["activity"].(map[string]any)
-	if !ok || debugActivity["text"] != "Syncing snapshot... (55%)" {
+	if !ok ||
+		debugActivity["text"] != "Applying properties..." ||
+		debugActivity["phase"] != "properties" ||
+		debugActivity["current"] != float64(120) ||
+		debugActivity["total"] != float64(500) {
 		t.Fatalf("debug activity = %#v", debugPayload["activity"])
 	}
 }
