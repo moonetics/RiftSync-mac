@@ -19,7 +19,7 @@ import (
 	"riftsync/internal/watcher"
 )
 
-const Version = "4.1.2"
+const Version = "4.1.3"
 
 type Options struct {
 	ConfigPath            string

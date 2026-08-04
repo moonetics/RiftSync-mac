@@ -143,3 +143,46 @@ func TestNotifyRevisionDebouncedCommit(t *testing.T) {
 	}
 	t.Fatalf("revision did not receive git commit; git state=%#v", appState.GitState())
 }
+
+func TestTransientGitAddErrorDetection(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "short read while indexing",
+			err:  errString("git add -A: error: short read while indexing .rblxsync/project-state.json error: .rblxsync/project-state.json: failed to insert into database error: unable to index file '.rblxsync/project-state.json' fatal: updating files failed"),
+			want: true,
+		},
+		{
+			name: "index lock",
+			err:  errString("git add -A: fatal: Unable to create '.git/index.lock': File exists."),
+			want: true,
+		},
+		{
+			name: "ordinary pathspec error",
+			err:  errString("git add -A: fatal: pathspec 'missing' did not match any files"),
+			want: false,
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTransientGitAddError(tc.err); got != tc.want {
+				t.Fatalf("isTransientGitAddError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+type errString string
+
+func (e errString) Error() string {
+	return string(e)
+}

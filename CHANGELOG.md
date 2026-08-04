@@ -2,6 +2,10 @@
 
 Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
+## 4.1.3 - 2026-08-04
+
+- Fixed transient Git indexing failures during automatic revision commits by retrying `git add -A` when project state files are still settling.
+
 ## 4.1.2 - 2026-08-02
 
 - Fixed Studio deletes being silently skipped for instances exported by Auto Pull Studio.

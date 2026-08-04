@@ -17,6 +17,8 @@ import (
 const (
 	defaultDebounce       = 2 * time.Second
 	defaultCommandTimeout = 20 * time.Second
+	gitAddMaxAttempts     = 4
+	gitAddRetryDelay      = 350 * time.Millisecond
 )
 
 type Options struct {
@@ -237,7 +239,7 @@ func (s *Service) EnsureRepository(ctx context.Context) (state.GitState, error) 
 		if strings.TrimSpace(status) != "" {
 			gitState.Status = state.GitStatusInitialCommit
 			s.state.SetGitState(gitState)
-			if _, _, err := s.runGit(ctx, "add", "-A"); err != nil {
+			if err := s.addAll(ctx); err != nil {
 				gitState.Status = state.GitStatusError
 				gitState.LastError = err.Error()
 				s.state.SetGitState(gitState)
@@ -268,7 +270,7 @@ func (s *Service) commitRevision(ctx context.Context, request revisionRequest) {
 	current.Enabled = true
 	current.RepoPath = s.cfg.SyncRootAbs
 	s.state.SetGitState(current)
-	if _, _, err := s.runGit(ctx, "add", "-A"); err != nil {
+	if err := s.addAll(ctx); err != nil {
 		s.setError(err)
 		return
 	}
@@ -295,6 +297,35 @@ func (s *Service) ensureConfig(ctx context.Context, key, fallback string) error 
 		return nil
 	}
 	return s.setConfig(ctx, key, fallback)
+}
+
+func (s *Service) addAll(ctx context.Context) error {
+	var lastErr error
+	for attempt := 1; attempt <= gitAddMaxAttempts; attempt++ {
+		if _, _, err := s.runGit(ctx, "add", "-A"); err != nil {
+			lastErr = err
+			if attempt == gitAddMaxAttempts || !isTransientGitAddError(err) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * gitAddRetryDelay):
+			}
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func isTransientGitAddError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "short read while indexing") ||
+		strings.Contains(message, "index.lock")
 }
 
 func (s *Service) setConfig(ctx context.Context, key, value string) error {

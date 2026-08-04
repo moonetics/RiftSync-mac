@@ -1,6 +1,6 @@
 # RiftSync Plugin (One-Way + Properties Tree)
 
-Versi: `4.1.2`
+Versi: `4.1.3`
 Protocol sync: `rbxsync/2.0.0`
 
 One-way sync untuk Roblox Studio:
