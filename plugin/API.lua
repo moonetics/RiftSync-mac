@@ -1348,7 +1348,7 @@ function SyncAPI:setDebugError(message : string)
 	self:pushDebugUpdate()
 end
 
-function SyncAPI:refreshServerDebugState(force : boolean?)
+function SyncAPI:refreshServerDebugState(force : boolean?, quiet : boolean?)
 	local nowClock = os.clock()
 	if not force and (nowClock - self.lastServerDebugPullAt) < SERVER_DEBUG_PULL_INTERVAL then
 		return
@@ -1357,13 +1357,19 @@ function SyncAPI:refreshServerDebugState(force : boolean?)
 
 	local response, requestError = self:requestJson("GET", TypeList.ENDPOINTS.DebugState, nil, {
 		limit = 10,
+	}, {
+		quiet = quiet == true,
 	})
 	if not response then
-		self:appendDebugEvent("Fetch /debug/state gagal: " .. tostring(requestError), true)
+		if quiet ~= true then
+			self:appendDebugEvent("Fetch /debug/state gagal: " .. tostring(requestError), true)
+		end
 		return
 	end
 	if response.status ~= "ok" then
-		self:appendDebugEvent("Fetch /debug/state status: " .. tostring(response.status), true)
+		if quiet ~= true then
+			self:appendDebugEvent("Fetch /debug/state status: " .. tostring(response.status), true)
+		end
 		return
 	end
 
@@ -1503,15 +1509,16 @@ function SyncAPI:reportActivity(text : any, isError : boolean?, meta : any?)
 	self.lastActivityIndeterminate = indeterminate
 end
 
-function SyncAPI:requestJson(method : string, endpoint : string, payload : {[string]: any}?, queryParams : {[string]: string | number}?)
-	return self:requestJsonWithHeaders(method, endpoint, payload, queryParams, nil)
+function SyncAPI:requestJson(method : string, endpoint : string, payload : {[string]: any}?, queryParams : {[string]: string | number}?, options : {[string]: any}?)
+	return self:requestJsonWithHeaders(method, endpoint, payload, queryParams, nil, options)
 end
 
-function SyncAPI:requestJsonWithHeaders(method : string, endpoint : string, payload : {[string]: any}?, queryParams : {[string]: string | number}?, extraHeaders : {[string]: string}?)
+function SyncAPI:requestJsonWithHeaders(method : string, endpoint : string, payload : {[string]: any}?, queryParams : {[string]: string | number}?, extraHeaders : {[string]: string}?, options : {[string]: any}?)
 	local url = self.baseUrl .. endpoint
 	if queryParams then
 		url ..= "?" .. buildQuery(queryParams)
 	end
+	local quiet = typeof(options) == "table" and options.quiet == true
 
 	local headers = {
 		["Content-Type"] = "application/json"
@@ -1534,7 +1541,9 @@ function SyncAPI:requestJsonWithHeaders(method : string, endpoint : string, payl
 	end
 
 	local requestStarted = os.clock()
-	self:appendDebugEvent("HTTP " .. method .. " " .. endpoint, false)
+	if not quiet then
+		self:appendDebugEvent("HTTP " .. method .. " " .. endpoint, false)
+	end
 
 	local response
 	local success, requestError = pcall(function()
@@ -1543,25 +1552,33 @@ function SyncAPI:requestJsonWithHeaders(method : string, endpoint : string, payl
 
 	if not success then
 		local rawError = "Request failed: " .. tostring(requestError)
-		self:appendDebugEvent("HTTP " .. method .. " " .. endpoint .. " gagal request: " .. tostring(requestError), true)
+		if not quiet then
+			self:appendDebugEvent("HTTP " .. method .. " " .. endpoint .. " gagal request: " .. tostring(requestError), true)
+		end
 		return nil, formatGuidedError(rawError)
 	end
 
 	if not response.Success then
 		local rawError = formatHttpError(response)
-		self:appendDebugEvent("HTTP " .. method .. " " .. endpoint .. " gagal: " .. rawError, true)
+		if not quiet then
+			self:appendDebugEvent("HTTP " .. method .. " " .. endpoint .. " gagal: " .. rawError, true)
+		end
 		return nil, formatGuidedError(rawError)
 	end
 
 	local decoded, decodeError = decodeJson(response.Body)
 	if decoded == nil then
 		local rawError = "Invalid JSON response: " .. tostring(decodeError)
-		self:appendDebugEvent("HTTP " .. method .. " " .. endpoint .. " invalid JSON: " .. tostring(decodeError), true)
+		if not quiet then
+			self:appendDebugEvent("HTTP " .. method .. " " .. endpoint .. " invalid JSON: " .. tostring(decodeError), true)
+		end
 		return nil, formatGuidedError(rawError)
 	end
 
 	local elapsedMs = math.floor((os.clock() - requestStarted) * 1000 + 0.5)
-	self:appendDebugEvent("HTTP " .. method .. " " .. endpoint .. " ok (" .. tostring(elapsedMs) .. "ms)", false)
+	if not quiet then
+		self:appendDebugEvent("HTTP " .. method .. " " .. endpoint .. " ok (" .. tostring(elapsedMs) .. "ms)", false)
+	end
 
 	return decoded
 end
@@ -2724,6 +2741,7 @@ function SyncAPI:finishConfirmedPullStudio(response : {[string]: any}?)
 		self.debugState.lastPollTargetRev = serverRevision
 		self.plugin:SetSetting(SETTING_KEYS.LastRevision, self.lastAppliedRevision)
 	end
+	self.debugState.lastError = ""
 
 	local newCount = typeof(response) == "table" and tonumber(response.new_count) or 0
 	local updatedCount = typeof(response) == "table" and tonumber(response.updated_count) or 0
@@ -2748,6 +2766,7 @@ function SyncAPI:finishConfirmedPullStudio(response : {[string]: any}?)
 			path = "Studio -> local",
 		},
 	})
+	self:refreshServerDebugState(true, true)
 	self.updateStatus("Idle - pulled Studio rev " .. tostring(self.lastAppliedRevision), false)
 	self:pushDebugUpdate()
 end
@@ -5437,6 +5456,24 @@ function SyncAPI:applyDelete(change : {[string]: any})
 		return true, "Delete target not found at " .. targetPath
 	end
 
+	local targetIsManaged = isManagedInstance(target)
+	local targetStableId = target:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+	local hasExactStableId = incomingStableId ~= ""
+		and typeof(targetStableId) == "string"
+		and targetStableId == incomingStableId
+	local isLegacyScriptMatch = entity == INSTANCE_KINDS.Script
+		and isScriptClass(target.ClassName)
+		and typeof(targetStableId) == "string"
+		and targetStableId ~= ""
+		and (localPathTarget == target or resolvePath(targetPath) == target)
+	if change.repair_tombstone == true
+		and not targetIsManaged
+		and not hasExactStableId
+		and not isLegacyScriptMatch
+	then
+		return true, "Delete target not found with matching RiftSync ownership; skipped stale repair tombstone at " .. targetPath
+	end
+
 	if expectedClass ~= "" and target.ClassName ~= expectedClass then
 		return false, "Delete target class mismatch at " .. targetPath .. ": " .. target.ClassName .. " ~= " .. expectedClass
 	end
@@ -5454,16 +5491,7 @@ function SyncAPI:applyDelete(change : {[string]: any})
 	end
 
 	local repairedLegacyOwnership = false
-	if not isManagedInstance(target) then
-		local targetStableId = target:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
-		local hasExactStableId = incomingStableId ~= ""
-			and typeof(targetStableId) == "string"
-			and targetStableId == incomingStableId
-		local isLegacyScriptMatch = entity == INSTANCE_KINDS.Script
-			and isScriptClass(target.ClassName)
-			and typeof(targetStableId) == "string"
-			and targetStableId ~= ""
-			and (localPathTarget == target or resolvePath(targetPath) == target)
+	if not targetIsManaged then
 		if not hasExactStableId and not isLegacyScriptMatch then
 			return false, "Refused unmanaged delete without exact RiftSync ownership at " .. targetPath
 		end
@@ -5990,7 +6018,7 @@ function SyncAPI:performHandshake()
 	return true
 end
 
-function SyncAPI:refreshServerDebugState(force : boolean?)
+function SyncAPI:refreshServerDebugState(force : boolean?, quiet : boolean?)
 	local nowClock = os.clock()
 	if not force and (nowClock - self.lastServerDebugPullAt) < SERVER_DEBUG_PULL_INTERVAL then
 		return
@@ -5999,13 +6027,19 @@ function SyncAPI:refreshServerDebugState(force : boolean?)
 
 	local response, requestError = self:requestJson("GET", TypeList.ENDPOINTS.DebugState, nil, {
 		limit = 12,
+	}, {
+		quiet = quiet == true,
 	})
 	if not response then
-		self:appendDebugEvent("Fetch /debug/state gagal: " .. tostring(requestError), true)
+		if quiet ~= true then
+			self:appendDebugEvent("Fetch /debug/state gagal: " .. tostring(requestError), true)
+		end
 		return
 	end
 	if response.status ~= "ok" then
-		self:appendDebugEvent("Fetch /debug/state status: " .. tostring(response.status), true)
+		if quiet ~= true then
+			self:appendDebugEvent("Fetch /debug/state status: " .. tostring(response.status), true)
+		end
 		return
 	end
 

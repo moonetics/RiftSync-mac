@@ -3,6 +3,7 @@ package scanner
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"riftsync/internal/config"
@@ -47,6 +48,37 @@ func TestScanScriptsAndUITree(t *testing.T) {
 	}
 	if snapshot.ScriptCount != 1 || snapshot.UICount != 1 {
 		t.Fatalf("counts script=%d ui=%d, want 1/1", snapshot.ScriptCount, snapshot.UICount)
+	}
+}
+
+func TestScanWithProgressReportsEnumerationAndExactFileCount(t *testing.T) {
+	root := t.TempDir()
+	for index := 0; index < 25; index++ {
+		writeFile(t, root, filepath.ToSlash(filepath.Join("ServerScriptService", "Script"+strconv.Itoa(index)+".server.luau")), "print('hi')")
+	}
+	cfg := testConfig(t, root)
+	updates := []Progress{}
+	snapshot, err := NewCache().ScanWithProgress(cfg, func(progress Progress) {
+		updates = append(updates, progress)
+	})
+	if err != nil {
+		t.Fatalf("ScanWithProgress returned error: %v", err)
+	}
+	if len(snapshot.Records) != 25 {
+		t.Fatalf("record count = %d, want 25", len(snapshot.Records))
+	}
+	foundEnumeration := false
+	foundCompleteScan := false
+	for _, update := range updates {
+		if update.Phase == "enumerating" && update.Indeterminate {
+			foundEnumeration = true
+		}
+		if update.Phase == "scanning" && update.Current == 25 && update.Total == 25 && !update.Indeterminate {
+			foundCompleteScan = true
+		}
+	}
+	if !foundEnumeration || !foundCompleteScan {
+		t.Fatalf("progress updates = %#v", updates)
 	}
 }
 

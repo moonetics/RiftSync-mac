@@ -125,6 +125,7 @@ type appController struct {
 
 	mu        sync.Mutex
 	starting  bool
+	startup   state.Activity
 	lastError string
 	quitOnce  sync.Once
 	quit      chan struct{}
@@ -174,6 +175,7 @@ type statusPayload struct {
 	Polls                 int     `json:"polls"`
 	GitEnabled            bool    `json:"git_enabled"`
 	GitStatus             string  `json:"git_status"`
+	GitLastError          string  `json:"git_last_error"`
 	ActivityText          string  `json:"activity_text"`
 	ActivityOp            string  `json:"activity_operation"`
 	ActivityPhase         string  `json:"activity_phase"`
@@ -909,31 +911,24 @@ func (m *multiAppController) handleStartAll(w http.ResponseWriter, r *http.Reque
 	}
 	m.mu.Unlock()
 	results := map[string]any{}
-	var resultsMu sync.Mutex
-	var group sync.WaitGroup
 	for id, app := range apps {
-		group.Add(1)
-		go func(id string, app *appController) {
-			defer group.Done()
-			options := app.runner.Options()
-			err := m.validateOptionsUnique(id, options)
-			if err == nil {
-				err = ensureRemoteExecConfig(options)
-			}
-			if err == nil {
-				err = app.start(m.ctx)
-			}
-			resultsMu.Lock()
-			if err != nil {
-				results[id] = map[string]any{"status": "error", "error": err.Error(), "app": app.status()}
-			} else {
-				results[id] = map[string]any{"status": "ok", "app": app.status()}
-			}
-			resultsMu.Unlock()
-		}(id, app)
+		options := app.runner.Options()
+		err := m.validateOptionsUnique(id, options)
+		if err == nil {
+			err = ensureRemoteExecConfig(options)
+		}
+		if err != nil {
+			results[id] = map[string]any{"status": "error", "error": err.Error(), "app": app.status()}
+			continue
+		}
+		started := app.startAsync(m.ctx)
+		result := "already_running"
+		if started {
+			result = "starting"
+		}
+		results[id] = map[string]any{"status": "ok", "result": result, "app": app.status()}
 	}
-	group.Wait()
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "results": results})
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "ok", "results": results})
 }
 
 func (m *multiAppController) handleStartInstance(w http.ResponseWriter, r *http.Request) {
@@ -1051,11 +1046,14 @@ func (a *appController) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
 		return
 	}
-	if err := a.start(a.ctx); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": a.status()})
-		return
+	started := a.startAsync(a.ctx)
+	result := "already_running"
+	statusCode := http.StatusOK
+	if started {
+		result = "starting"
+		statusCode = http.StatusAccepted
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "app": a.status()})
+	writeJSON(w, statusCode, map[string]any{"status": "ok", "result": result, "app": a.status()})
 }
 
 func (a *appController) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -1635,20 +1633,62 @@ func (a *appController) saveAndSetOptions(options serverapp.Options) error {
 }
 
 func (a *appController) start(ctx context.Context) error {
-	a.mu.Lock()
-	if a.starting {
-		a.mu.Unlock()
+	if !a.beginStart() {
 		return nil
+	}
+	return a.runStart(ctx)
+}
+
+func (a *appController) startAsync(ctx context.Context) bool {
+	if !a.beginStart() {
+		return false
+	}
+	go func() {
+		_ = a.runStart(ctx)
+	}()
+	return true
+}
+
+func (a *appController) beginStart() bool {
+	if a.runner.Status(1).Running {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.starting {
+		return false
 	}
 	a.starting = true
 	a.lastError = ""
-	a.mu.Unlock()
+	a.startup = state.Activity{
+		Text:          "Starting RiftSync...",
+		Operation:     "startup",
+		Phase:         "queued",
+		Progress:      1,
+		Indeterminate: true,
+		At:            float64(time.Now().UnixNano()) / float64(time.Second),
+	}
+	return true
+}
 
-	err := a.runner.Start(ctx)
+func (a *appController) runStart(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := a.runner.StartWithProgress(ctx, func(activity state.Activity) {
+		a.mu.Lock()
+		a.startup = activity
+		a.mu.Unlock()
+	})
 	a.mu.Lock()
 	a.starting = false
 	if err != nil {
 		a.lastError = err.Error()
+		a.startup.Text = "Startup failed: " + err.Error()
+		a.startup.Phase = "error"
+		a.startup.Error = true
+		a.startup.Indeterminate = false
+		a.startup.At = float64(time.Now().UnixNano()) / float64(time.Second)
 	}
 	a.mu.Unlock()
 	return err
@@ -1657,12 +1697,16 @@ func (a *appController) start(ctx context.Context) error {
 func (a *appController) status() statusPayload {
 	a.mu.Lock()
 	starting := a.starting
+	startup := a.startup
 	lastError := a.lastError
 	options := a.options
 	a.mu.Unlock()
 
 	status := a.runner.Status(12)
 	status = hydrateStoppedStatus(status, options)
+	if starting || (!status.Running && startup.Operation == "startup") {
+		status.Activity = startup
+	}
 	return makeStatusPayload(status, starting, lastError)
 }
 
@@ -1788,6 +1832,7 @@ func makeStatusPayload(status serverapp.Status, starting bool, lastError string)
 		Polls:                 status.Metrics.ChangesRequests,
 		GitEnabled:            status.Git.Enabled,
 		GitStatus:             gitStatus,
+		GitLastError:          strings.TrimSpace(status.Git.LastError),
 		ActivityText:          fallback(status.Activity.Text, "No Studio activity yet."),
 		ActivityOp:            status.Activity.Operation,
 		ActivityPhase:         status.Activity.Phase,

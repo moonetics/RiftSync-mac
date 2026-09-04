@@ -81,14 +81,36 @@ func New(options Options) *Runner {
 }
 
 func (r *Runner) Start(parent context.Context) error {
+	return r.StartWithProgress(parent, nil)
+}
+
+func (r *Runner) StartWithProgress(parent context.Context, onProgress func(state.Activity)) error {
+	report := func(text, phase string, progress, current, total int, indeterminate bool) {
+		if onProgress == nil {
+			return
+		}
+		onProgress(state.Activity{
+			Text:          text,
+			Operation:     "startup",
+			Phase:         phase,
+			Progress:      progress,
+			Current:       current,
+			Total:         total,
+			Indeterminate: indeterminate,
+			At:            float64(time.Now().UnixNano()) / float64(time.Second),
+		})
+	}
+
 	r.mu.Lock()
 	if r.running {
 		r.mu.Unlock()
+		report("RiftSync is already running.", "complete", 100, 0, 0, false)
 		return nil
 	}
 	options := r.options
 	r.mu.Unlock()
 
+	report("Loading project configuration...", "loading_config", 4, 0, 0, true)
 	cfg, err := config.Load(options.ConfigPath)
 	if err != nil {
 		return fmt.Errorf("config error: %w", err)
@@ -109,6 +131,7 @@ func (r *Runner) Start(parent context.Context) error {
 	if err := cfg.NormalizeAndValidate(); err != nil {
 		return fmt.Errorf("config error: %w", err)
 	}
+	report("Reserving the local sync port...", "reserving_port", 9, 0, 0, true)
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.Host, cfg.Port))
 	if err != nil {
 		return fmt.Errorf("listen on %s:%d: %w", cfg.Host, cfg.Port, err)
@@ -123,6 +146,7 @@ func (r *Runner) Start(parent context.Context) error {
 	if err != nil {
 		return fmt.Errorf("executable path error: %w", err)
 	}
+	report("Preparing the project folder...", "preparing_project", 14, 0, 0, true)
 	if err := config.EnsureSyncRootScaffold(cfg, config.ScaffoldOptions{
 		ConfigPath:      options.ConfigPath,
 		ExecutablePath:  executablePath,
@@ -135,14 +159,38 @@ func (r *Runner) Start(parent context.Context) error {
 	appState := state.New(cfg)
 	scanCache := scanner.NewCache()
 	scanStarted := time.Now()
-	snapshot, err := scanCache.Scan(cfg)
+	snapshot, err := scanCache.ScanWithProgress(cfg, func(scanProgress scanner.Progress) {
+		progress := 20
+		text := "Finding project files..."
+		if scanProgress.Phase == "scanning" {
+			progress = 25
+			text = "Scanning project files..."
+			if scanProgress.Total > 0 {
+				progress += scanProgress.Current * 47 / scanProgress.Total
+				text = fmt.Sprintf("Scanning project files... %d/%d", scanProgress.Current, scanProgress.Total)
+			}
+		} else if scanProgress.Current > 0 {
+			text = fmt.Sprintf("Finding project files... %d found", scanProgress.Current)
+		}
+		report(
+			text,
+			scanProgress.Phase,
+			progress,
+			scanProgress.Current,
+			scanProgress.Total,
+			scanProgress.Indeterminate,
+		)
+	})
 	if err != nil {
 		return fmt.Errorf("scan error: %w", err)
 	}
+	report(fmt.Sprintf("Indexed %d sync records.", len(snapshot.Records)), "indexing_state", 76, len(snapshot.Records), len(snapshot.Records), false)
 	appState.SetSnapshot(snapshot.Records, snapshot.Warnings, len(snapshot.InvalidPaths))
+	report("Loading revision history...", "loading_history", 80, 0, 0, true)
 	if err := appState.LoadHistory(); err != nil && options.Debug && options.Stdout != nil {
 		fmt.Fprintf(options.Stdout, "[debug] load history error: %v\n", err)
 	}
+	report("Loading project state...", "loading_project_state", 84, 0, 0, true)
 	if err := appState.LoadProjectState(); err != nil && options.Debug && options.Stdout != nil {
 		fmt.Fprintf(options.Stdout, "[debug] load project state error: %v\n", err)
 	}
@@ -156,9 +204,11 @@ func (r *Runner) Start(parent context.Context) error {
 	}
 
 	ctx, cancel := context.WithCancel(parent)
+	report("Starting Git integration...", "starting_git", 88, 0, 0, true)
 	gitService := gitversion.New(cfg, appState, gitversion.Options{})
 	gitService.Start(ctx)
 
+	report("Starting filesystem watcher...", "starting_watcher", 92, 0, 0, true)
 	var watchService *watcher.Service
 	watchService, err = watcher.New(cfg, appState, watcher.Options{Cache: scanCache})
 	if err != nil {
@@ -174,6 +224,7 @@ func (r *Runner) Start(parent context.Context) error {
 	}
 	safetyDone := StartSafetyScanner(ctx, cfg, scanCache, appState, watchService, options.Debug, options.Stdout)
 
+	report("Starting local HTTP server...", "starting_server", 97, 0, 0, true)
 	server := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Handler: httpapi.NewWithScannerCacheAndWatchRefresh(appState, Version, scanCache, func() error {
@@ -204,6 +255,15 @@ func (r *Runner) Start(parent context.Context) error {
 	r.startedAt = time.Now()
 	r.mu.Unlock()
 	closeListener = false
+	appState.RecordActivity(state.Activity{
+		Text:      fmt.Sprintf("Startup complete: %d records indexed.", len(snapshot.Records)),
+		Operation: "startup",
+		Phase:     "complete",
+		Progress:  100,
+		Current:   len(snapshot.Records),
+		Total:     len(snapshot.Records),
+	})
+	report("RiftSync is ready.", "complete", 100, len(snapshot.Records), len(snapshot.Records), false)
 	return nil
 }
 
@@ -326,9 +386,6 @@ func (r *Runner) Status(limit int) Status {
 	status.History = appState.RevisionSummaries(limit)
 	status.Events = appState.Events(limit)
 	status.LastError = status.Metrics.LastError
-	if status.LastError == "" {
-		status.LastError = status.Git.LastError
-	}
 	return status
 }
 

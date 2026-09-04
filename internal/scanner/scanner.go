@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +30,15 @@ type FileResult struct {
 	InvalidPath string
 	CacheHit    bool
 }
+
+type Progress struct {
+	Phase         string
+	Current       int
+	Total         int
+	Indeterminate bool
+}
+
+type ProgressFunc func(Progress)
 
 type Cache struct {
 	mu      sync.Mutex
@@ -66,7 +76,11 @@ func ParseRelativeFile(cfg config.Config, relativePath string) FileResult {
 }
 
 func (c *Cache) Scan(cfg config.Config) (Snapshot, error) {
-	return c.scanTree(cfg, cfg.SyncRootAbs)
+	return c.ScanWithProgress(cfg, nil)
+}
+
+func (c *Cache) ScanWithProgress(cfg config.Config, progress ProgressFunc) (Snapshot, error) {
+	return c.scanTree(cfg, cfg.SyncRootAbs, progress)
 }
 
 func (c *Cache) ScanSubtree(cfg config.Config, relativeDir string) (Snapshot, error) {
@@ -74,10 +88,14 @@ func (c *Cache) ScanSubtree(cfg config.Config, relativeDir string) (Snapshot, er
 	if err != nil {
 		return Snapshot{Records: map[string]records.SyncRecord{}}, err
 	}
-	return c.scanTree(cfg, target)
+	return c.scanTree(cfg, target, nil)
 }
 
 func (c *Cache) ParseRelativeFile(cfg config.Config, relativePath string) FileResult {
+	return c.parseRelativeFile(cfg, relativePath, managedServiceSet(cfg.ManagedRoots))
+}
+
+func (c *Cache) parseRelativeFile(cfg config.Config, relativePath string, managedServices map[string]bool) FileResult {
 	relPosix := strings.Trim(strings.ReplaceAll(relativePath, "\\", "/"), "/")
 	if relPosix == "" || isIgnoredMetadataPath(relPosix) {
 		return FileResult{}
@@ -117,7 +135,7 @@ func (c *Cache) ParseRelativeFile(cfg config.Config, relativePath string) FileRe
 	if !utf8.Valid(body) {
 		result = FileResult{Warning: fmt.Sprintf("Skip %s: non-utf8 file", relPosix)}
 	} else {
-		record, err := parseRecord(cfg, relPosix, string(body), managedServiceSet(cfg.ManagedRoots), cfg.IgnoredRbxPaths)
+		record, err := parseRecord(cfg, relPosix, string(body), managedServices, cfg.IgnoredRbxPaths)
 		if err != nil && isJSONFile(relPosix) {
 			result = FileResult{
 				InvalidPath: relPosix,
@@ -183,26 +201,31 @@ func NormalizeRecords(input map[string]records.SyncRecord, warnings []string, in
 	return snapshot
 }
 
-func (c *Cache) scanTree(cfg config.Config, walkRoot string) (Snapshot, error) {
+func (c *Cache) scanTree(cfg config.Config, walkRoot string, progress ProgressFunc) (Snapshot, error) {
 	snapshot := Snapshot{
 		Records: map[string]records.SyncRecord{},
+	}
+	report := func(value Progress) {
+		if progress != nil {
+			progress(value)
+		}
 	}
 
 	if _, err := os.Stat(walkRoot); err != nil {
 		if os.IsNotExist(err) {
+			report(Progress{Phase: "scanning", Total: 0})
 			return snapshot, nil
 		}
 		return snapshot, fmt.Errorf("stat scan root: %w", err)
 	}
 
-	identityToLocalPath := map[string]string{}
-	skippedNonUTF8 := 0
-	skippedUnreadable := 0
-	unreadableSamples := []string{}
-
+	report(Progress{Phase: "enumerating", Indeterminate: true})
+	files := make([]string, 0, 256)
+	enumerated := 0
+	walkWarnings := []string{}
 	err := filepath.WalkDir(walkRoot, func(absPath string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("scan walk interrupted at %s: %v", absPath, walkErr))
+			walkWarnings = append(walkWarnings, fmt.Sprintf("scan walk interrupted at %s: %v", absPath, walkErr))
 			return nil
 		}
 		if entry.IsDir() {
@@ -212,12 +235,93 @@ func (c *Cache) scanTree(cfg config.Config, walkRoot string) (Snapshot, error) {
 			return nil
 		}
 
-		relative, err := filepath.Rel(cfg.SyncRootAbs, absPath)
-		if err != nil {
+		relative, relErr := filepath.Rel(cfg.SyncRootAbs, absPath)
+		if relErr != nil {
 			return nil
 		}
-		relPosix := filepath.ToSlash(relative)
-		result := c.ParseRelativeFile(cfg, relPosix)
+		files = append(files, filepath.ToSlash(relative))
+		enumerated++
+		if enumerated == 1 || enumerated%256 == 0 {
+			report(Progress{Phase: "enumerating", Current: enumerated, Indeterminate: true})
+		}
+		return nil
+	})
+	if err != nil {
+		walkWarnings = append(walkWarnings, fmt.Sprintf("scan walk interrupted: %v", err))
+	}
+	sort.Strings(files)
+	report(Progress{Phase: "scanning", Current: 0, Total: len(files)})
+
+	results := make([]FileResult, len(files))
+	if len(files) > 0 {
+		workerCount := runtime.GOMAXPROCS(0)
+		if workerCount > 1 {
+			workerCount-- // Leave CPU headroom for the dashboard and filesystem watcher.
+		}
+		if workerCount > 8 {
+			workerCount = 8
+		}
+		if workerCount < 1 {
+			workerCount = 1
+		}
+		if workerCount > len(files) {
+			workerCount = len(files)
+		}
+
+		type scanJob struct {
+			index int
+			path  string
+		}
+		type scanResult struct {
+			index  int
+			result FileResult
+		}
+		jobs := make(chan scanJob)
+		completed := make(chan scanResult, workerCount)
+		managedServices := managedServiceSet(cfg.ManagedRoots)
+		var workers sync.WaitGroup
+		for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				for job := range jobs {
+					completed <- scanResult{
+						index:  job.index,
+						result: c.parseRelativeFile(cfg, job.path, managedServices),
+					}
+				}
+			}()
+		}
+		go func() {
+			for index, relPosix := range files {
+				jobs <- scanJob{index: index, path: relPosix}
+			}
+			close(jobs)
+			workers.Wait()
+			close(completed)
+		}()
+
+		reportEvery := len(files) / 100
+		if reportEvery < 1 {
+			reportEvery = 1
+		}
+		completedCount := 0
+		for item := range completed {
+			results[item.index] = item.result
+			completedCount++
+			if completedCount == len(files) || completedCount%reportEvery == 0 {
+				report(Progress{Phase: "scanning", Current: completedCount, Total: len(files)})
+			}
+		}
+	}
+
+	snapshot.Warnings = append(snapshot.Warnings, walkWarnings...)
+	identityToLocalPath := map[string]string{}
+	skippedNonUTF8 := 0
+	skippedUnreadable := 0
+	unreadableSamples := []string{}
+	for index, relPosix := range files {
+		result := results[index]
 		if result.CacheHit {
 			snapshot.CacheHits++
 		} else {
@@ -225,7 +329,7 @@ func (c *Cache) scanTree(cfg config.Config, walkRoot string) (Snapshot, error) {
 		}
 		if strings.Contains(result.Warning, "non-utf8 file") {
 			skippedNonUTF8++
-			return nil
+			continue
 		}
 		if result.Warning != "" {
 			if strings.Contains(result.Warning, "read") || strings.Contains(result.Warning, "access") {
@@ -238,16 +342,12 @@ func (c *Cache) scanTree(cfg config.Config, walkRoot string) (Snapshot, error) {
 		}
 		if result.InvalidPath != "" {
 			snapshot.InvalidPaths = append(snapshot.InvalidPaths, result.InvalidPath)
-			return nil
+			continue
 		}
 		if result.Record == nil {
-			return nil
+			continue
 		}
 		addRecord(&snapshot, identityToLocalPath, *result.Record)
-		return nil
-	})
-	if err != nil {
-		snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("scan walk interrupted: %v", err))
 	}
 
 	if skippedNonUTF8 > 0 {

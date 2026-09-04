@@ -123,6 +123,23 @@ func TestMakeStatusPayloadSyncing(t *testing.T) {
 	}
 }
 
+func TestMakeStatusPayloadKeepsGitErrorSeparate(t *testing.T) {
+	payload := makeStatusPayload(serverapp.Status{
+		Running: true,
+		Git: state.GitState{
+			Enabled:   true,
+			Status:    state.GitStatusError,
+			LastError: "git add -A: fatal: index.lock exists",
+		},
+	}, false, "")
+	if payload.LastError != "" {
+		t.Fatalf("LastError = %q, want empty for git-only error", payload.LastError)
+	}
+	if payload.GitStatus != "Error" || payload.GitLastError == "" {
+		t.Fatalf("payload git fields = status %q error %q", payload.GitStatus, payload.GitLastError)
+	}
+}
+
 func TestGitStatusText(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -194,6 +211,13 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`/app/config/apply`,
 		`configInput`,
 		`syncRootInput`,
+		`configDirty=false`,
+		`configApplying=false`,
+		`!configDirty&&!configApplying`,
+		`markConfigDirty`,
+		`Unsaved changes`,
+		`git_last_error`,
+		`$("gitText").title=app.git_last_error||""`,
 		`historyRefreshBtn`,
 		`historyTimeline`,
 		`history-shell`,
@@ -203,6 +227,9 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`activityText`,
 		`activityProgress`,
 		`activity_indeterminate`,
+		`showStartPending`,
+		`phaseLabel`,
+		`Scanning files`,
 		`role="progressbar"`,
 		`activity-slide`,
 		`errorText`,
@@ -489,11 +516,15 @@ func TestMultiAppStartAllRunsTwoProjectsConcurrently(t *testing.T) {
 	}()
 	response := httptest.NewRecorder()
 	controller.handleStartAll(response, httptest.NewRequest(http.MethodPost, "/app/start-all", nil))
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"result":"starting"`) {
 		t.Fatalf("start-all code=%d body=%s", response.Code, response.Body.String())
 	}
+	deadline := time.Now().Add(5 * time.Second)
 	for _, entry := range entries {
 		app, _, ok := controller.resolveApp(entry.ID)
+		for ok && !app.runner.Status(1).Running && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
 		if !ok || !app.runner.Status(1).Running {
 			t.Fatalf("%s was not running after Start All", entry.ID)
 		}
@@ -1063,6 +1094,11 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 		`TypeList.ENDPOINTS.BootstrapPreview`,
 		`pendingPullPreview`,
 		`self:pushStudioSnapshot(`,
+		`self.debugState.lastError = ""`,
+		`self:refreshServerDebugState(true, true)`,
+		`quiet = quiet == true`,
+		`self:requestJson("POST", TypeList.ENDPOINTS.BootstrapPreview, payload, nil)`,
+		`self:requestJson("POST", TypeList.ENDPOINTS.Bootstrap, payload, nil)`,
 		`riftsync_connection_profiles_v1`,
 		`riftsync_place_profile_map_v1`,
 		`currentPlaceProfileKey`,
@@ -1074,6 +1110,7 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 		`response.deletion_tombstones`,
 		`repair_tombstone = true`,
 		`Repaired legacy delete`,
+		`skipped stale repair tombstone`,
 		`Refused unmanaged delete without exact RiftSync ownership`,
 		`skipInfo.ownership`,
 	} {

@@ -39,8 +39,16 @@ func TestRunnerStartStopAndHealth(t *testing.T) {
 	runner := New(Options{ConfigPath: configPath})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := runner.Start(ctx); err != nil {
+	startupPhases := map[string]bool{}
+	if err := runner.StartWithProgress(ctx, func(activity state.Activity) {
+		startupPhases[activity.Phase] = true
+	}); err != nil {
 		t.Fatalf("Start returned error: %v", err)
+	}
+	for _, phase := range []string{"loading_config", "enumerating", "scanning", "starting_watcher", "complete"} {
+		if !startupPhases[phase] {
+			t.Fatalf("startup progress missing phase %q: %#v", phase, startupPhases)
+		}
 	}
 	status := runner.Status(5)
 	if !status.Running || status.Host != "127.0.0.1" || status.Port != port || status.SyncRoot == "" {
@@ -114,6 +122,35 @@ func TestRunnerStartReportsPortConflictSynchronously(t *testing.T) {
 	}
 	if runner.Status(1).Running {
 		t.Fatal("runner reported running after bind failure")
+	}
+}
+
+func TestRunnerStatusKeepsGitErrorSeparateFromLastError(t *testing.T) {
+	cfg := config.Default()
+	cfg.SyncRoot = t.TempDir()
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		t.Fatalf("NormalizeAndValidate returned error: %v", err)
+	}
+	appState := state.New(cfg)
+	appState.SetGitState(state.GitState{
+		Enabled:   true,
+		Available: true,
+		Status:    state.GitStatusError,
+		LastError: "git add -A: fatal: index.lock exists",
+		RepoPath:  cfg.SyncRootAbs,
+	})
+	runner := &Runner{
+		cfg:      cfg,
+		appState: appState,
+		running:  true,
+	}
+
+	status := runner.Status(1)
+	if status.LastError != "" {
+		t.Fatalf("LastError = %q, want empty for git-only error", status.LastError)
+	}
+	if status.Git.LastError == "" || status.Git.Status != state.GitStatusError {
+		t.Fatalf("Git state = %#v, want git error preserved", status.Git)
 	}
 }
 
