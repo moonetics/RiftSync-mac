@@ -1,4 +1,6 @@
-# RiftSync Plugin (One-Way + Properties Tree)
+# RiftSync macOS (One-Way + Properties Tree)
+
+Fork macOS dari RiftSync dengan aplikasi native `RiftSync.app`, server Apple Silicon, dan profile Local plugin yang mengikuti project di aplikasi. Dukungan build Windows tetap dipertahankan di source yang sama.
 
 Versi: `4.1.3`
 Protocol sync: `rbxsync/2.0.0`
@@ -295,7 +297,7 @@ Contoh minimal:
 
 Go app adalah workflow recommended. Ada dua executable:
 
-- `riftsync.exe`: app launcher untuk double-click. Ini membuka window app embedded WebView2 dan tidak menampilkan console.
+- `riftsync.exe` / `RiftSync.app`: app launcher untuk Windows atau macOS. Ini membuka window app embedded WebView dan tidak menampilkan console.
 - `riftsync-server.exe`: console server untuk terminal. Secara default menampilkan startup, event sync/Studio/Remote Exec/Git, heartbeat status, error, dan shutdown; tambahkan `--debug` untuk metrics scan/cache/payload yang lebih detail.
 
 Build keduanya dari root project:
@@ -310,6 +312,15 @@ Build dengan icon Windows:
 ```powershell
 .\scripts\build-windows.ps1
 ```
+
+Build aplikasi native macOS (Apple Silicon), server, bundle, dan icon:
+
+```bash
+./scripts/build-macos.sh
+open ./dist/RiftSync.app
+```
+
+Bundle hasilnya berada di `dist/RiftSync.app`. UI macOS memakai WebKit bawaan sistem; folder picker dan tombol Open Folder memakai dialog native macOS.
 
 Build paket plugin Studio dengan Rojo:
 
@@ -343,6 +354,7 @@ Window app `RiftSync` akan terbuka pada ukuran default **1280×720** memakai emb
 - Project dapat berjalan bersamaan. Setiap project memiliki runner, watcher, port, status, history, dan antrean Remote Exec sendiri.
 - Menghapus project dari sidebar hanya menghapus entry registry; folder, config, history, dan file game tidak dihapus.
 - Sidebar normalnya berupa rail ikon dan melebar saat hover/focus. Tombol pin mempertahankan sidebar dalam keadaan terbuka.
+- Plugin Studio mengambil profile **Local** dari daftar project aplikasi secara otomatis melalui discovery loopback read-only di `127.0.0.1:8749`; nama, host, port, dan token tidak perlu disalin manual. Profile **Custom** tetap tersedia untuk koneksi remote/manual.
 
 Untuk menjalankan server langsung dari terminal dengan live log:
 
@@ -398,7 +410,7 @@ Manual test Studio Remote Exec:
 
 1. Jalankan `.\riftsync.exe`, pilih project, lalu Start; token akan muncul di tab `Exec`.
 2. Copy token dari app.
-3. Di widget RiftSync Studio, buat/pilih connection profile bernama, isi host, port, dan token project, lalu Save Profile. Profil aktif diingat per Roblox Place.
+3. Di widget RiftSync Studio, pilih profile **Local** yang otomatis mengikuti project aplikasi. Gunakan **Custom** hanya untuk koneksi remote/manual. Profile aktif diingat per Roblox Place.
 4. Klik `Start Sync`, lalu toggle `Exec ON`. Fresh session selalu mulai dari `Exec OFF`.
 5. Jalankan inline command:
 

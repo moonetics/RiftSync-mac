@@ -55,8 +55,13 @@ func TestLoadExistingConfig(t *testing.T) {
 	if cfg.GitVersioningEnabled {
 		t.Fatal("GitVersioningEnabled = true, want false")
 	}
-	if cfg.SyncRootAbs != filepath.Join(dir, "src", "game") {
-		t.Fatalf("SyncRootAbs = %q, want %q", cfg.SyncRootAbs, filepath.Join(dir, "src", "game"))
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("resolve temp dir: %v", err)
+	}
+	expectedRoot := filepath.Join(resolvedDir, "src", "game")
+	if cfg.SyncRootAbs != expectedRoot {
+		t.Fatalf("SyncRootAbs = %q, want %q", cfg.SyncRootAbs, expectedRoot)
 	}
 	if len(cfg.ManagedRoots) != 1 || cfg.ManagedRoots[0] != "game.Workspace" {
 		t.Fatalf("ManagedRoots = %#v, want normalized single value", cfg.ManagedRoots)

@@ -69,6 +69,24 @@ func TestParseOptionsInvalidHost(t *testing.T) {
 	}
 }
 
+func TestServerProfileSnapshotUsesEffectiveConfig(t *testing.T) {
+	syncRoot := t.TempDir()
+	configPath := writeValidateTestConfig(t, syncRoot)
+	snapshot := serverProfileSnapshot(cliOptions{
+		configPath:       configPath,
+		hostOverride:     "localhost",
+		portOverride:     9877,
+		syncRootOverride: syncRoot,
+	})
+	if snapshot.SelectedProfileID != "local:headless:9877" || len(snapshot.Profiles) != 1 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	profile := snapshot.Profiles[0]
+	if profile.Name != filepath.Base(syncRoot) || profile.Host != "localhost" || profile.Port != 9877 || !profile.Running {
+		t.Fatalf("profile = %#v", profile)
+	}
+}
+
 func TestParseOptionsHelp(t *testing.T) {
 	if _, err := parseOptions([]string{"--help"}); err != flag.ErrHelp {
 		t.Fatalf("err = %v, want flag.ErrHelp", err)

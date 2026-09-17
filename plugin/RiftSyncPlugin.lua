@@ -264,7 +264,7 @@ profileManageActions.Parent = connectionPanel
 horizontalList(profileManageActions, 8)
 local profileEditorToggleButton = button(profileManageActions, "Edit Profile", COLORS.SurfaceHigh, 1)
 profileEditorToggleButton.Size = UDim2.new(0.5, -4, 0, 40)
-local addProfileButton = button(profileManageActions, "Add Profile", COLORS.Blue, 2)
+local addProfileButton = button(profileManageActions, "Add Custom", COLORS.Blue, 2)
 addProfileButton.Size = UDim2.new(0.5, -4, 0, 40)
 addProfileButton.TextColor3 = COLORS.BorderDark
 
@@ -404,6 +404,7 @@ local selectedProfileIndex = 1
 local historyLines = {}
 local MAX_HISTORY_LINES = 12
 local progressTween = nil
+local updateStatus
 
 local function setProfileEditorVisible(visible)
 	profileEditor.Visible = visible == true
@@ -472,16 +473,25 @@ local function refreshProfileUI()
 	end
 	selectedProfileIndex = math.clamp(findSelectedProfileIndex(), 1, #profiles)
 	local profile = profiles[selectedProfileIndex]
-	profileNameLabel.Text = tostring(profile.name or "Profile")
+	local isLocal = profile.kind == "local"
+	profileNameLabel.Text = tostring(profile.name or "Profile") .. (isLocal and "  ·  LOCAL" or "  ·  CUSTOM")
 	profileNameInput.Text = tostring(profile.name or "")
 	hostInput.Text = tostring(profile.host or TypeList.DEFAULT_HOST or "127.0.0.1")
 	portInput.Text = tostring(profile.port or TypeList.DEFAULT_PORT or 8765)
 	execTokenInput.Text = tostring(profile.token or "")
-	removeProfileButton.Text = #profiles > 1 and "Remove" or "Keep one profile"
-	removeProfileButton.Active = #profiles > 1
-	removeProfileButton.AutoButtonColor = #profiles > 1
-	removeProfileButton.Selectable = #profiles > 1
-	removeProfileButton.TextTransparency = #profiles > 1 and 0 or 0.45
+	if isLocal then
+		setProfileEditorVisible(false)
+	end
+	profileEditorToggleButton.Text = isLocal and "Refresh Local" or (profileEditor.Visible and "Hide Settings" or "Edit Custom")
+	local editable = not isLocal and not client:isRunning()
+	setControlEnabled(profileNameInput, editable)
+	setControlEnabled(hostInput, editable)
+	setControlEnabled(portInput, editable)
+	setControlEnabled(execTokenInput, editable)
+	setControlEnabled(saveProfileButton, editable)
+	local canRemove = editable and #profiles > 1
+	removeProfileButton.Text = isLocal and "Managed by App" or (canRemove and "Remove" or "Keep one profile")
+	setControlEnabled(removeProfileButton, canRemove)
 end
 
 local function selectProfileAt(index)
@@ -511,6 +521,9 @@ local function saveCurrentProfile()
 	if not current then
 		return false
 	end
+	if current.kind == "local" then
+		return true
+	end
 	local saved, err = client:upsertConnectionProfile({
 		id = current.id,
 		name = profileNameInput.Text ~= "" and profileNameInput.Text or "Profile",
@@ -534,6 +547,21 @@ local function saveCurrentProfile()
 	statusDetail.TextColor3 = COLORS.Green
 	setProfileEditorVisible(false)
 	return true
+end
+
+local function refreshLocalProfilesFromApp(showStatus)
+	if not client then
+		return
+	end
+	local ok, err = client:refreshLocalProfiles()
+	if ok then
+		if showStatus then
+			updateStatus("Profile Local diperbarui dari aplikasi RiftSync.", false)
+		end
+	elseif showStatus then
+		updateStatus(tostring(err), true)
+	end
+	refreshProfileUI()
 end
 
 local function updateExecUI()
@@ -605,7 +633,7 @@ local function updateProgress(meta, isError)
 	progressCaption.Text = table.concat(bits, "  ·  ")
 end
 
-local function updateStatus(text, isError, meta)
+updateStatus = function(text, isError, meta)
 	local raw = tostring(text or "")
 	statusHeadline.Text = isError and "● Issue" or (client and client:isRunning() and "● Connected" or "● Ready")
 	statusHeadline.TextColor3 = isError and COLORS.Red or (client and client:isRunning() and COLORS.Green or COLORS.Text)
@@ -665,7 +693,9 @@ toolbarButton.Click:Connect(function()
 		pcall(function()
 			widget:RequestRaise()
 		end)
-		refreshProfileUI()
+		task.spawn(function()
+			refreshLocalProfilesFromApp(false)
+		end)
 	end
 end)
 
@@ -679,6 +709,13 @@ end)
 
 profileEditorToggleButton.MouseButton1Click:Connect(function()
 	if client:isRunning() then
+		return
+	end
+	local current = profiles[selectedProfileIndex]
+	if current and current.kind == "local" then
+		task.spawn(function()
+			refreshLocalProfilesFromApp(true)
+		end)
 		return
 	end
 	setProfileEditorVisible(not profileEditor.Visible)
@@ -725,7 +762,8 @@ removeProfileButton.MouseButton1Click:Connect(function()
 end)
 
 startButton.MouseButton1Click:Connect(function()
-	if not saveCurrentProfile() then
+	local current = profiles[selectedProfileIndex]
+	if (not current or current.kind ~= "local") and not saveCurrentProfile() then
 		return
 	end
 	client:setStartMode(START_MODES.FolderToStudio)

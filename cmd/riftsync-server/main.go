@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"riftsync/internal/config"
 	"riftsync/internal/debuglog"
 	"riftsync/internal/exechistory"
+	"riftsync/internal/profilediscovery"
 	"riftsync/internal/records"
 	"riftsync/internal/scanner"
 	"riftsync/internal/serverapp"
@@ -88,11 +90,58 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	discovery, discoveryErr := profilediscovery.Start(ctx, func() profilediscovery.Snapshot {
+		return serverProfileSnapshot(options)
+	})
+	if discoveryErr == nil {
+		defer func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = discovery.Close(closeCtx)
+		}()
+	} else if options.debug {
+		fmt.Fprintf(os.Stderr, "profile discovery unavailable: %v\n", discoveryErr)
+	}
 
 	runErr := runHeadless(ctx, options, os.Stdout)
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", runErr)
 		os.Exit(1)
+	}
+}
+
+func serverProfileSnapshot(options cliOptions) profilediscovery.Snapshot {
+	cfg, err := config.Load(options.configPath)
+	if err != nil {
+		return profilediscovery.Snapshot{Profiles: []profilediscovery.Profile{}}
+	}
+	if options.hostOverride != "" {
+		cfg.Host = options.hostOverride
+	}
+	if options.portOverride > 0 {
+		cfg.Port = options.portOverride
+	}
+	if options.syncRootOverride != "" {
+		cfg.SyncRoot = options.syncRootOverride
+		if err := cfg.NormalizeAndValidate(); err != nil {
+			return profilediscovery.Snapshot{Profiles: []profilediscovery.Profile{}}
+		}
+	}
+	name := filepath.Base(cfg.SyncRootAbs)
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		name = "RiftSync"
+	}
+	id := "local:headless:" + strconv.Itoa(cfg.Port)
+	return profilediscovery.Snapshot{
+		Profiles: []profilediscovery.Profile{{
+			ID:      id,
+			Name:    name,
+			Host:    cfg.Host,
+			Port:    cfg.Port,
+			Token:   cfg.RemoteExecToken,
+			Running: true,
+		}},
+		SelectedProfileID: id,
 	}
 }
 

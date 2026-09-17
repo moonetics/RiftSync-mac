@@ -473,6 +473,21 @@ func TestMultiAppControllerDoesNotReimportSeedAfterValidRegistryWasEmptied(t *te
 	}
 }
 
+func TestMultiAppControllerStartsEmptyWhenDefaultConfigIsMissing(t *testing.T) {
+	root := t.TempDir()
+	store := instances.NewStore(filepath.Join(root, "appdata", "instances.json"))
+	controller, err := newMultiAppController(context.Background(), store, serverapp.Options{
+		ConfigPath:   filepath.Join(root, "missing-sync-config.json"),
+		PortOverride: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.registry.Instances) != 0 || len(controller.apps) != 0 {
+		t.Fatalf("missing default config created a phantom project: %#v", controller.registry)
+	}
+}
+
 func TestMultiAppStartAllRunsTwoProjectsConcurrently(t *testing.T) {
 	root := t.TempDir()
 	portA := freePort(t)

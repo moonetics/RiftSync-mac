@@ -898,6 +898,7 @@ local function normalizeConnectionProfiles(rawProfiles, fallbackHost, fallbackPo
 					table.insert(profiles, {
 						id = id,
 						name = name,
+						kind = "custom",
 						host = TypeList.normaliseHost(tostring(profile.host or TypeList.DEFAULT_HOST)),
 						port = TypeList.normalisePort(profile.port or TypeList.DEFAULT_PORT),
 						token = tostring(profile.token or ""),
@@ -910,6 +911,7 @@ local function normalizeConnectionProfiles(rawProfiles, fallbackHost, fallbackPo
 		table.insert(profiles, {
 			id = httpService:GenerateGUID(false),
 			name = "Default",
+			kind = "custom",
 			host = TypeList.normaliseHost(tostring(fallbackHost or TypeList.DEFAULT_HOST)),
 			port = TypeList.normalisePort(fallbackPort or TypeList.DEFAULT_PORT),
 			token = tostring(fallbackToken or ""),
@@ -930,6 +932,7 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 	local connectionProfiles = normalizeConnectionProfiles(rawProfiles, configuredHost, configuredPort, configuredToken)
 	local placeKey = currentPlaceProfileKey()
 	local selectedProfileId = tostring(rawPlaceMap[placeKey] or "")
+	local pendingLocalProfileId = string.sub(selectedProfileId, 1, 6) == "local:" and selectedProfileId or ""
 	local selectedProfile = nil
 	for _, profile in ipairs(connectionProfiles) do
 		if profile.id == selectedProfileId then
@@ -940,7 +943,9 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 	if selectedProfile == nil then
 		selectedProfile = connectionProfiles[1]
 		selectedProfileId = selectedProfile.id
-		rawPlaceMap[placeKey] = selectedProfileId
+		if pendingLocalProfileId == "" then
+			rawPlaceMap[placeKey] = selectedProfileId
+		end
 	end
 
 	self.plugin = pluginInstance
@@ -958,6 +963,7 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 	self.placeProfileMap = rawPlaceMap
 	self.placeProfileKey = placeKey
 	self.selectedConnectionProfileId = selectedProfileId
+	self.pendingLocalProfileId = pendingLocalProfileId
 	self.host = selectedProfile.host
 	self.port = selectedProfile.port
 	self.baseUrl = TypeList.buildBaseUrl(self.host, self.port)
@@ -1014,22 +1020,131 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 end
 
 function SyncAPI:saveConnectionProfiles()
-	self.plugin:SetSetting(SETTING_KEYS.ConnectionProfiles, encodePluginTable(self.connectionProfiles))
+	local customProfiles = {}
+	for _, profile in ipairs(self.connectionProfiles or {}) do
+		if profile.kind ~= "local" then
+			table.insert(customProfiles, profile)
+		end
+	end
+	self.plugin:SetSetting(SETTING_KEYS.ConnectionProfiles, encodePluginTable(customProfiles))
 	self.plugin:SetSetting(SETTING_KEYS.PlaceProfileMap, encodePluginTable(self.placeProfileMap))
 end
 
 function SyncAPI:listConnectionProfiles()
 	local result = {}
 	for _, profile in ipairs(self.connectionProfiles or {}) do
-		table.insert(result, {
+			table.insert(result, {
 			id = profile.id,
 			name = profile.name,
+			kind = profile.kind or "custom",
 			host = profile.host,
 			port = profile.port,
 			token = profile.token,
+			running = profile.running == true,
 		})
 	end
 	return result
+end
+
+function SyncAPI:isSelectedConnectionProfileLocal()
+	for _, profile in ipairs(self.connectionProfiles or {}) do
+		if profile.id == self.selectedConnectionProfileId then
+			return profile.kind == "local"
+		end
+	end
+	return false
+end
+
+function SyncAPI:refreshLocalProfiles()
+	if self.running == true then
+		return false, "Stop sync before refreshing Local profiles"
+	end
+
+	local response
+	local success, requestError = pcall(function()
+		response = httpService:RequestAsync({
+			Url = TypeList.PROFILE_DISCOVERY_URL or "http://127.0.0.1:8749/riftsync/profiles",
+			Method = "GET",
+			Headers = { ["Accept"] = "application/json" },
+		})
+	end)
+	if not success then
+		return false, "RiftSync app tidak ditemukan: " .. tostring(requestError)
+	end
+	if not response.Success then
+		return false, "RiftSync app discovery gagal (HTTP " .. tostring(response.StatusCode) .. ")"
+	end
+	local decoded, decodeError = decodeJson(response.Body)
+	if decoded == nil or decoded.status ~= "ok" or typeof(decoded.profiles) ~= "table" then
+		return false, "Response profile aplikasi tidak valid: " .. tostring(decodeError or decoded and decoded.status or "unknown")
+	end
+
+	local merged = {}
+	for _, profile in ipairs(self.connectionProfiles or {}) do
+		if profile.kind ~= "local" then
+			table.insert(merged, profile)
+		end
+	end
+	local localIDs = {}
+	for _, profile in ipairs(decoded.profiles) do
+		if typeof(profile) == "table" then
+			local id = tostring(profile.id or "")
+			local name = tostring(profile.name or "")
+			local port = tonumber(profile.port)
+			if string.sub(id, 1, 6) == "local:" and name ~= "" and port and port >= 1 and port <= 65535 then
+				local normalized = {
+					id = id,
+					name = name,
+					kind = "local",
+					host = TypeList.normaliseHost(tostring(profile.host or TypeList.DEFAULT_HOST)),
+					port = TypeList.normalisePort(port),
+					token = tostring(profile.token or ""),
+					running = profile.running == true,
+				}
+				table.insert(merged, normalized)
+				localIDs[id] = normalized
+			end
+		end
+	end
+	if next(localIDs) == nil then
+		return false, "Belum ada profile Local di aplikasi RiftSync"
+	end
+
+	self.connectionProfiles = merged
+	local availableIDs = {}
+	local customCount = 0
+	for _, profile in ipairs(merged) do
+		availableIDs[profile.id] = profile
+		if profile.kind ~= "local" then
+			customCount += 1
+		end
+	end
+	local preferredID = tostring(self.pendingLocalProfileId or "")
+	if preferredID == "" then
+		local current = tostring(self.selectedConnectionProfileId or "")
+		if localIDs[current] then
+			preferredID = current
+		elseif availableIDs[current]
+			and availableIDs[current].kind == "custom"
+			and availableIDs[current].name == "Default"
+			and customCount == 1
+		then
+			preferredID = tostring(decoded.selected_profile_id or "")
+		elseif availableIDs[current] then
+			preferredID = current
+		end
+	end
+	if not availableIDs[preferredID] then
+		preferredID = tostring(decoded.selected_profile_id or "")
+	end
+	if not availableIDs[preferredID] then
+		for id in pairs(localIDs) do
+			preferredID = id
+			break
+		end
+	end
+	self.pendingLocalProfileId = ""
+	return self:selectConnectionProfile(preferredID)
 end
 
 function SyncAPI:getSelectedConnectionProfileId()
@@ -1044,6 +1159,7 @@ function SyncAPI:selectConnectionProfile(profileId : string)
 	for _, profile in ipairs(self.connectionProfiles or {}) do
 		if profile.id == profileId then
 			self.selectedConnectionProfileId = profile.id
+			self.pendingLocalProfileId = ""
 			self.placeProfileMap[self.placeProfileKey] = profile.id
 			self.host = profile.host
 			self.port = profile.port
@@ -1065,12 +1181,16 @@ function SyncAPI:upsertConnectionProfile(profile)
 		return nil, "Profile is required"
 	end
 	local profileId = tostring(profile.id or "")
+	if string.sub(profileId, 1, 6) == "local:" or profile.kind == "local" then
+		return nil, "Profile Local dikelola oleh aplikasi RiftSync"
+	end
 	if profileId == "" then
 		profileId = httpService:GenerateGUID(false)
 	end
 	local normalized = {
 		id = profileId,
 		name = tostring(profile.name or "Profile"),
+		kind = "custom",
 		host = TypeList.normaliseHost(tostring(profile.host or TypeList.DEFAULT_HOST)),
 		port = TypeList.normalisePort(profile.port or TypeList.DEFAULT_PORT),
 		token = tostring(profile.token or ""),
@@ -1098,6 +1218,9 @@ function SyncAPI:removeConnectionProfile(profileId : string)
 		return false, "At least one connection profile is required"
 	end
 	profileId = tostring(profileId or "")
+	if string.sub(profileId, 1, 6) == "local:" then
+		return false, "Profile Local dikelola oleh aplikasi RiftSync"
+	end
 	local filtered = {}
 	for _, profile in ipairs(self.connectionProfiles) do
 		if profile.id ~= profileId then
@@ -1124,9 +1247,13 @@ function SyncAPI:updateSelectedConnectionProfile()
 	local selectedId = tostring(self.selectedConnectionProfileId or "")
 	for index, profile in ipairs(self.connectionProfiles or {}) do
 		if profile.id == selectedId then
+			if profile.kind == "local" then
+				return
+			end
 			self.connectionProfiles[index] = {
 				id = profile.id,
 				name = profile.name,
+				kind = "custom",
 				host = self.host,
 				port = self.port,
 				token = self.remoteExecToken,

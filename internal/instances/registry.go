@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -241,7 +242,7 @@ func deriveName(configPath string) string {
 			SyncRoot string `json:"sync_root"`
 		}
 		if json.Unmarshal(body, &raw) == nil && strings.TrimSpace(raw.SyncRoot) != "" {
-			name := filepath.Base(filepath.Clean(raw.SyncRoot))
+			name := path.Base(strings.ReplaceAll(filepath.Clean(raw.SyncRoot), "\\", "/"))
 			if name != "." && name != string(filepath.Separator) && name != "" {
 				return name
 			}
