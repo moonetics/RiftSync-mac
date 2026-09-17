@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -169,6 +170,7 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 	for _, needle := range []string{
 		`color-scheme:dark`,
 		`class="brand-logo"`,
+		`class="brand-version">v` + serverapp.Version + `</span>`,
 		`data:image/png;base64,`,
 		`ROBLOX STUDIO LIVE SYNC`,
 		`--space-1:4px`,
@@ -223,6 +225,15 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 		`history-shell`,
 		`logsBtn`,
 		`logsModal`,
+		`removeModal`,
+		`role="alertdialog"`,
+		`removeKeepBtn`,
+		`removeDeleteBtn`,
+		`pendingRemoveProjectId`,
+		`function requestRemoveProject(`,
+		`function confirmRemoveProject(`,
+		`Choose whether RiftSync should delete the project folder`,
+		`delete_files`,
 		`/app/logs`,
 		`activityText`,
 		`activityProgress`,
@@ -296,6 +307,9 @@ func TestHTMLDocumentHasAppControls(t *testing.T) {
 	}
 	if strings.Contains(document, `background:linear-gradient`) || strings.Contains(document, `box-shadow:inset`) {
 		t.Fatal("htmlDocument still contains beveled control styling")
+	}
+	if strings.Contains(document, `confirm("Remove this project`) {
+		t.Fatal("htmlDocument still relies on the WebView JavaScript confirm dialog")
 	}
 	if strings.Contains(document, `Clear`) {
 		t.Fatal("htmlDocument still exposes the internal Clear sentinel")
@@ -453,6 +467,39 @@ func TestMultiAppControllerCreatesSelectsAndRemovesProjectsWithoutDeletingFiles(
 	if err != nil || len(registry.Instances) != 1 {
 		t.Fatalf("registry after remove=%#v err=%v", registry, err)
 	}
+
+	deleteRoot := filepath.Join(root, "delete-me")
+	deleteCreateBody, _ := json.Marshal(map[string]any{"name": "Delete me", "sync_root": deleteRoot})
+	deleteCreateResponse := httptest.NewRecorder()
+	mux.ServeHTTP(deleteCreateResponse, httptest.NewRequest(http.MethodPost, "/app/instances", bytes.NewReader(deleteCreateBody)))
+	if deleteCreateResponse.Code != http.StatusOK {
+		t.Fatalf("delete-project create code=%d body=%s", deleteCreateResponse.Code, deleteCreateResponse.Body.String())
+	}
+	var deleteCreated struct {
+		SelectedInstanceID string `json:"selected_instance_id"`
+	}
+	if err := json.Unmarshal(deleteCreateResponse.Body.Bytes(), &deleteCreated); err != nil {
+		t.Fatalf("decode delete-project response: %v", err)
+	}
+	markerToDelete := filepath.Join(deleteRoot, "remove-me.txt")
+	if err := os.WriteFile(markerToDelete, []byte("remove"), 0o644); err != nil {
+		t.Fatalf("write delete marker: %v", err)
+	}
+	deleteBody, _ := json.Marshal(map[string]any{"id": deleteCreated.SelectedInstanceID, "delete_files": true})
+	deleteResponse := httptest.NewRecorder()
+	mux.ServeHTTP(deleteResponse, httptest.NewRequest(http.MethodPost, "/app/instances/remove", bytes.NewReader(deleteBody)))
+	if deleteResponse.Code != http.StatusOK {
+		t.Fatalf("delete-project remove code=%d body=%s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	var deleteResult struct {
+		FilesDeleted bool `json:"files_deleted"`
+	}
+	if err := json.Unmarshal(deleteResponse.Body.Bytes(), &deleteResult); err != nil || !deleteResult.FilesDeleted {
+		t.Fatalf("delete-project response=%s err=%v", deleteResponse.Body.String(), err)
+	}
+	if _, err := os.Stat(deleteRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("project root still exists after delete: err=%v", err)
+	}
 }
 
 func TestMultiAppControllerDoesNotReimportSeedAfterValidRegistryWasEmptied(t *testing.T) {
@@ -501,6 +548,9 @@ func TestMultiAppStartAllRunsTwoProjectsConcurrently(t *testing.T) {
 		configPath := filepath.Join(root, fmt.Sprintf("project-%d.json", index+1))
 		cfg := config.Default()
 		cfg.SyncRoot = filepath.Join(root, fmt.Sprintf("game-%d", index+1))
+		if err := os.MkdirAll(cfg.SyncRoot, 0o755); err != nil {
+			t.Fatal(err)
+		}
 		cfg.Port = port
 		cfg.GitVersioningEnabled = false
 		if err := config.Save(configPath, cfg); err != nil {
@@ -602,6 +652,9 @@ func TestAppExecRunAndRerunWithRunningServer(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "sync_config.json")
 	syncRoot := filepath.Join(root, "game")
+	if err := os.MkdirAll(syncRoot, 0o755); err != nil {
+		t.Fatalf("mkdir sync root: %v", err)
+	}
 	port := freePort(t)
 	configBody, err := json.Marshal(map[string]any{
 		"host":                "127.0.0.1",
@@ -772,6 +825,12 @@ func TestConfigApplyStoppedStatusUsesNewPathAfterPreviousRun(t *testing.T) {
 	configPath := filepath.Join(root, "sync_config.json")
 	oldSyncRoot := filepath.Join(root, "old-game")
 	newSyncRoot := filepath.Join(root, "new-game")
+	if err := os.MkdirAll(oldSyncRoot, 0o755); err != nil {
+		t.Fatalf("mkdir old sync root: %v", err)
+	}
+	if err := os.MkdirAll(newSyncRoot, 0o755); err != nil {
+		t.Fatalf("mkdir new sync root: %v", err)
+	}
 	port := freePort(t)
 	configBody, err := json.Marshal(map[string]any{
 		"host":      "127.0.0.1",
@@ -832,6 +891,9 @@ func TestConfigApplyRunningIsRejected(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "sync_config.json")
 	syncRoot := filepath.Join(root, "game")
+	if err := os.MkdirAll(syncRoot, 0o755); err != nil {
+		t.Fatalf("mkdir sync root: %v", err)
+	}
 	port := freePort(t)
 	configBody, err := json.Marshal(map[string]any{
 		"host":                   "127.0.0.1",
@@ -1050,6 +1112,20 @@ func TestPluginUISimplifiedActions(t *testing.T) {
 		`selectConnectionProfile`,
 		`upsertConnectionProfile`,
 		`removeConnectionProfile`,
+		`local refreshProfilesButton = button(profileSwitcher, ""`,
+		`refreshProfilesIcon.Image = "rbxasset://studio_svg_textures/Lua/FileSync/Light/Standard/Refresh.png"`,
+		`refreshProfilesButton.MouseButton1Click:Connect`,
+		`refreshLocalProfilesFromApp(false)`,
+		`local startSourcePanel = panel(scroll, 5)`,
+		`"CHOOSE START SOURCE"`,
+		`local startFromStudioButton = button(startSourceActions, "Use Studio"`,
+		`local startFromLocalButton = button(startSourceActions, "Use Local"`,
+		`local forceIdentityRepairButton = button(startSourcePanel, "Force ID repair: OFF"`,
+		`forceIdentityRepairButton.MouseButton1Click:Connect`,
+		`client:setForceIdentityRepair(forceIdentityRepairEnabled)`,
+		`startWithMode(START_MODES.StudioToFolder)`,
+		`startWithMode(START_MODES.FolderToStudio)`,
+		`Start cancelled. Studio and local files were not changed.`,
 	} {
 		if !strings.Contains(document, needle) {
 			t.Fatalf("plugin UI missing %q", needle)
@@ -1082,7 +1158,7 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 	typeListDocument := string(typeListBody)
 	for _, needle := range []string{
 		`BootstrapPreview = "/bootstrap/preview"`,
-		`TypeList.VERSION = "4.1.3"`,
+		`TypeList.VERSION = "4.1.11"`,
 	} {
 		if !strings.Contains(typeListDocument, needle) {
 			t.Fatalf("TypeList missing %q", needle)
@@ -1182,6 +1258,8 @@ func TestPluginBroadPropertiesSchemaAndReferenceApply(t *testing.T) {
 		`AudioAnalyzer = { "SpectrumEnabled", "WindowSize" }`,
 		`ParticleEmitter = {`,
 		`WeldConstraint = { "Enabled", "Part0", "Part1" }`,
+		`Decal = { "Color3", "Face",`,
+		`Texture = { "Color3", "Face",`,
 		`TypeList.GEOMETRY_ANCESTOR_CLASSES`,
 		`TypeList.INSTANCE_REFERENCE_PROPERTIES`,
 	} {
@@ -1206,19 +1284,51 @@ func TestPluginBroadPropertiesSchemaAndReferenceApply(t *testing.T) {
 		`instance:IsA("BasePart") or instance:IsA("Model") or instance:IsA("Camera")`,
 		`["$type"] = "InstanceRef"`,
 		`["$type"] = "Ray"`,
-		`buildReferenceIndex(self.managedRoots)`,
+		`buildReferenceIndex(self.managedRoots, self.ignoredRbxPaths)`,
 		`properties.Enabled == nil and legacyDisabled ~= nil`,
 		`ORPHAN_PARENT: metadata target`,
 		`hasGeometryAncestorLocalPath(change.local_path)`,
 		`resolveLocalChangeParent`,
 		`isActualInstanceProperty`,
 		`propertyCandidateCache`,
-		`Local folder is empty - pulling Studio automatically`,
-		`self:pushStudioSnapshot("replace", "Auto Pull Studio")`,
+		`local function findUniqueChild`,
+		`local LOCAL_ID_MARKER = "~rid_"`,
+		`local function hasDuplicateSiblingIdentity`,
+		`buildLocalIdentityName(current, ensureIdentity)`,
+		`findChildByStableId(current, expectedStableId)`,
+		`AMBIGUOUS_SIBLING: multiple children named`,
+		`fatal_errors = fatalErrors`,
+		`Studio snapshot dibatalkan agar object tidak tertukar`,
+		`beginInitialLocalApplyRecording`,
+		`changeHistoryService:TryBeginRecording(`,
+		`Enum.FinishRecordingOperation.Commit`,
+		`local visited = {}`,
+		`duplicateStudioIds`,
+		`local function isStudioRollbackPath`,
+		`local serverStoragePrefix = "ServerStorage."`,
+		`string.sub(rootFolderName, 1, 2) == "__"`,
+		`string.find(string.lower(rootFolderName), "rollback", 1, true)`,
+		`noteSkip("ignored_subtree", candidatePath)`,
+		`buildManagedIndexes(self.managedRoots, self.ignoredRbxPaths)`,
+		`Identity.canAdoptExactTarget(change, {`,
+		`local function findAdoptableUnmanagedChild(`,
+		`local canAdoptUnmanaged = resolvedTarget == nil`,
+		`Exact same-class upsert dapat diadopsi`,
+		`Refused replacing unmanaged instance at`,
 	} {
 		if !strings.Contains(apiDocument, needle) {
 			t.Fatalf("broad property implementation missing %q", needle)
 		}
+	}
+	for _, vendorSpecificRollbackName := range []string{`WeAreDevsRollback`, `WrexDevRollback`} {
+		if strings.Contains(apiDocument, vendorSpecificRollbackName) {
+			t.Fatalf("rollback filter must remain vendor-neutral; found %q", vendorSpecificRollbackName)
+		}
+	}
+	stableLookup := strings.Index(apiDocument, `local byId = indexes.byStableId[stableId]`)
+	localPathLookup := strings.Index(apiDocument, `local byLocalPath = indexes.byLocalPath[localPath]`)
+	if stableLookup < 0 || localPathLookup < 0 || stableLookup > localPathLookup {
+		t.Fatal("managed target lookup must prefer stable ID before local/name paths")
 	}
 	runLoopStart := strings.Index(apiDocument, "function SyncAPI:runLoop")
 	if runLoopStart < 0 {
@@ -1232,15 +1342,33 @@ func TestPluginBroadPropertiesSchemaAndReferenceApply(t *testing.T) {
 	if strings.Count(runLoop, "self:pushStudioSnapshot()") != 1 {
 		t.Fatal("runLoop must keep exactly one direct StudioToFolder bootstrap")
 	}
-	if !strings.Contains(runLoop, `self:pushStudioSnapshot("replace", "Auto Pull Studio")`) ||
-		strings.Count(runLoop, "acceptBootstrapRevision(bootstrapResponse)") != 2 {
-		t.Fatal("empty FolderToStudio must auto-seed and both bootstrap paths must accept the response directly")
+	if strings.Contains(runLoop, `self:pushStudioSnapshot("replace", "Auto Pull Studio")`) ||
+		strings.Count(runLoop, "acceptBootstrapRevision(bootstrapResponse)") != 1 {
+		t.Fatal("explicit Local start must not silently switch to Studio auto-pull")
 	}
-	if !strings.Contains(runLoop, `self.serverSyncRootEmpty == true and self.serverSyncRootInitialized ~= true`) {
-		t.Fatal("empty initialized projects must remain local-authoritative instead of auto-pulling Studio")
+	if strings.Contains(runLoop, `self.serverSyncRootEmpty == true and self.serverSyncRootInitialized ~= true`) {
+		t.Fatal("explicit start source must not be overridden based on local folder state")
 	}
 	if strings.Contains(runLoop, "use Pull Studio to export Studio explicitly") {
 		t.Fatal("empty FolderToStudio still requires a manual Pull Studio")
+	}
+	for _, needle := range []string{
+		`function SyncAPI:setForceIdentityRepair`,
+		`restoreStudioStableIds = function`,
+		`clearStudioStableIds = function`,
+		`isIgnoredPath(gamePath, self.ignoredRbxPaths or {})`,
+		`finishForceIdentityRepairRecording`,
+		`ID lama sudah dikembalikan`,
+	} {
+		if !strings.Contains(apiDocument, needle) {
+			t.Fatalf("force identity repair missing %q", needle)
+		}
+	}
+	if strings.Count(runLoop, "clearStudioStableIds(self)") != 2 {
+		t.Fatal("force identity repair must clear Studio IDs once in either explicit start direction")
+	}
+	if strings.Count(runLoop, "identityRepairPending = false") != 2 {
+		t.Fatal("force identity repair must remain a one-shot bootstrap operation")
 	}
 	lastApplyStart := strings.LastIndex(apiDocument, "function SyncAPI:applyChanges")
 	if lastApplyStart < 0 {

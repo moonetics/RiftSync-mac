@@ -1,0 +1,35 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "sync_root": "src/game",
+  "scan_interval_sec": 0.4,
+  "poll_timeout_sec": 25,
+  "change_retention": 2048,
+  "debug_event_retention": 300,
+  "invalid_json_grace_sec": 1.2,
+  "git_versioning_enabled": true,
+  "strict_property_whitelist": false,
+  "extra_allowed_properties": {},
+  "managed_roots": [
+    "game.Workspace",
+    "game.ReplicatedFirst",
+    "game.ReplicatedStorage",
+    "game.ServerScriptService",
+    "game.ServerStorage",
+    "game.StarterGui",
+    "game.StarterPack",
+    "game.StarterPlayer",
+    "game.Lighting",
+    "game.SoundService",
+    "game.TextChatService"
+  ],
+  "ignored_rbx_paths": [
+    "game.ServerScriptService.RiftSyncPlugin",
+    "game.ServerScriptService.RBXLSyncPlugin"
+  ],
+  "remote_exec_enabled": false,
+  "remote_exec_token": "",
+  "remote_exec_max_source_bytes": 262144,
+  "remote_exec_default_timeout_sec": 10,
+  "remote_exec_max_timeout_sec": 120
+}

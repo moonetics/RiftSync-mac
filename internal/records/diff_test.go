@@ -82,3 +82,23 @@ func TestDetectChangesUnchanged(t *testing.T) {
 		t.Fatalf("changes = %#v, want none", changes)
 	}
 }
+
+func TestDetectChangesPreservesDuplicateRobloxPathsByStableID(t *testing.T) {
+	left := uiRecord(
+		"StarterGui/Same~rid_left.ScreenGui/properties.init.json",
+		"game.StarterGui.Same",
+		"left",
+	)
+	right := uiRecord(
+		"StarterGui/Same~rid_right.ScreenGui/properties.init.json",
+		"game.StarterGui.Same",
+		"right",
+	)
+	changes := DetectChanges(nil, map[string]SyncRecord{
+		left.LocalPath:  left,
+		right.LocalPath: right,
+	}, nil)
+	if len(changes) != 2 {
+		t.Fatalf("changes = %#v, want two duplicate-name upserts", changes)
+	}
+}

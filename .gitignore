@@ -5,3 +5,6 @@ rblxsync-server.exe
 coverage.out
 .DS_Store
 Thumbs.db
+graphify-out/
+*.rbxmx
+riftsync-server

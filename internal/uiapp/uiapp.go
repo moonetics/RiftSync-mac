@@ -68,46 +68,47 @@ type windowController struct {
 }
 
 type statusPayload struct {
-	InstanceID            string  `json:"instance_id,omitempty"`
-	InstanceName          string  `json:"instance_name,omitempty"`
-	Running               bool    `json:"running"`
-	Starting              bool    `json:"starting"`
-	Syncing               bool    `json:"syncing"`
-	Status                string  `json:"status"`
-	Address               string  `json:"address"`
-	Host                  string  `json:"host"`
-	Port                  int     `json:"port"`
-	ConfigPath            string  `json:"config_path"`
-	SyncRoot              string  `json:"sync_root"`
-	Mode                  string  `json:"mode"`
-	Debug                 bool    `json:"debug"`
-	LegacyScan            bool    `json:"legacy_scan"`
-	Revision              int     `json:"revision"`
-	Indexed               int     `json:"indexed"`
-	Scripts               int     `json:"scripts"`
-	UI                    int     `json:"ui"`
-	RequestCount          int     `json:"request_count"`
-	Polls                 int     `json:"polls"`
-	GitEnabled            bool    `json:"git_enabled"`
-	GitStatus             string  `json:"git_status"`
-	GitLastError          string  `json:"git_last_error"`
-	ActivityText          string  `json:"activity_text"`
-	ActivityOp            string  `json:"activity_operation"`
-	ActivityPhase         string  `json:"activity_phase"`
-	ActivityError         bool    `json:"activity_error"`
-	ActivityProgress      int     `json:"activity_progress"`
-	ActivityCurrent       int     `json:"activity_current"`
-	ActivityTotal         int     `json:"activity_total"`
-	ActivityIndeterminate bool    `json:"activity_indeterminate"`
-	ActivityClientID      string  `json:"activity_client_id"`
-	ActivityRevision      int     `json:"activity_revision"`
-	ActivityAt            float64 `json:"activity_at"`
-	LastError             string  `json:"last_error"`
-	Uptime                string  `json:"uptime"`
-	RemoteExecEnabled     bool    `json:"remote_exec_enabled"`
-	RemoteExecConfigured  bool    `json:"remote_exec_configured"`
-	RemoteExecAvailable   bool    `json:"remote_exec_available"`
-	RemoteExecToken       string  `json:"remote_exec_token"`
+	InstanceID            string         `json:"instance_id,omitempty"`
+	InstanceName          string         `json:"instance_name,omitempty"`
+	Running               bool           `json:"running"`
+	Starting              bool           `json:"starting"`
+	Syncing               bool           `json:"syncing"`
+	Status                string         `json:"status"`
+	Address               string         `json:"address"`
+	Host                  string         `json:"host"`
+	Port                  int            `json:"port"`
+	ConfigPath            string         `json:"config_path"`
+	SyncRoot              string         `json:"sync_root"`
+	Mode                  string         `json:"mode"`
+	Debug                 bool           `json:"debug"`
+	LegacyScan            bool           `json:"legacy_scan"`
+	Revision              int            `json:"revision"`
+	Indexed               int            `json:"indexed"`
+	Scripts               int            `json:"scripts"`
+	UI                    int            `json:"ui"`
+	RequestCount          int            `json:"request_count"`
+	Polls                 int            `json:"polls"`
+	GitEnabled            bool           `json:"git_enabled"`
+	GitStatus             string         `json:"git_status"`
+	GitLastError          string         `json:"git_last_error"`
+	ActivityText          string         `json:"activity_text"`
+	ActivityOp            string         `json:"activity_operation"`
+	ActivityPhase         string         `json:"activity_phase"`
+	ActivityError         bool           `json:"activity_error"`
+	ActivityProgress      int            `json:"activity_progress"`
+	ActivityCurrent       int            `json:"activity_current"`
+	ActivityTotal         int            `json:"activity_total"`
+	ActivityIndeterminate bool           `json:"activity_indeterminate"`
+	ActivityClientID      string         `json:"activity_client_id"`
+	ActivityRevision      int            `json:"activity_revision"`
+	ActivityAt            float64        `json:"activity_at"`
+	ActivityDetails       map[string]any `json:"activity_details,omitempty"`
+	LastError             string         `json:"last_error"`
+	Uptime                string         `json:"uptime"`
+	RemoteExecEnabled     bool           `json:"remote_exec_enabled"`
+	RemoteExecConfigured  bool           `json:"remote_exec_configured"`
+	RemoteExecAvailable   bool           `json:"remote_exec_available"`
+	RemoteExecToken       string         `json:"remote_exec_token"`
 }
 
 type restartRequest struct {
@@ -137,7 +138,8 @@ type createInstanceRequest struct {
 }
 
 type instanceIDRequest struct {
-	ID string `json:"id"`
+	ID          string `json:"id"`
+	DeleteFiles bool   `json:"delete_files"`
 }
 
 type updateInstanceRequest struct {
@@ -459,6 +461,10 @@ func (m *multiAppController) handleGlobalPickFolder(w http.ResponseWriter, r *ht
 }
 
 func (m *multiAppController) writeInstances(w http.ResponseWriter) {
+	m.writeInstancesWithExtras(w, nil)
+}
+
+func (m *multiAppController) writeInstancesWithExtras(w http.ResponseWriter, extras map[string]any) {
 	m.mu.Lock()
 	registry := m.registry
 	warning := m.warning
@@ -484,13 +490,17 @@ func (m *multiAppController) writeInstances(w http.ResponseWriter) {
 			"app":         status,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"status":               "ok",
 		"instances":            items,
 		"selected_instance_id": registry.SelectedInstanceID,
 		"sidebar_pinned":       registry.SidebarPinned,
 		"warning":              warning,
-	})
+	}
+	for key, value := range extras {
+		payload[key] = value
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (m *multiAppController) createInstance(w http.ResponseWriter, r *http.Request) {
@@ -808,6 +818,34 @@ func (m *multiAppController) handleRemoveInstance(w http.ResponseWriter, r *http
 		writeJSON(w, http.StatusConflict, map[string]any{"status": "error", "error": "stop this instance before removing it"})
 		return
 	}
+	var deletedRoot string
+	if request.DeleteFiles {
+		entryFound := false
+		for _, entry := range m.registry.Instances {
+			if entry.ID != id {
+				continue
+			}
+			entryFound = true
+			root, err := removableProjectRoot(entry, app)
+			if err != nil {
+				m.mu.Unlock()
+				writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+				return
+			}
+			deletedRoot = root
+			break
+		}
+		if !entryFound {
+			m.mu.Unlock()
+			writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "error": "instance not found"})
+			return
+		}
+		if err := deleteProjectRoot(deletedRoot); err != nil {
+			m.mu.Unlock()
+			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+	}
 	next := m.registry
 	filtered := make([]instances.Entry, 0, len(next.Instances)-1)
 	for _, entry := range next.Instances {
@@ -830,7 +868,58 @@ func (m *multiAppController) handleRemoveInstance(w http.ResponseWriter, r *http
 	delete(m.apps, id)
 	m.registry = next
 	m.mu.Unlock()
-	m.writeInstances(w)
+	m.writeInstancesWithExtras(w, map[string]any{
+		"files_deleted": deletedRoot != "",
+		"deleted_path":  deletedRoot,
+	})
+}
+
+func removableProjectRoot(entry instances.Entry, app *appController) (string, error) {
+	cfg, err := config.Load(entry.ConfigPath)
+	root := ""
+	if err == nil {
+		root = cfg.SyncRootAbs
+	} else if app != nil {
+		root = app.runner.Status(1).SyncRoot
+		if root == "" {
+			return "", fmt.Errorf("cannot determine project folder from %s: %v", entry.ConfigPath, err)
+		}
+	}
+	abs, absErr := filepath.Abs(root)
+	if absErr != nil {
+		return "", fmt.Errorf("cannot resolve project folder: %w", absErr)
+	}
+	abs = filepath.Clean(abs)
+	if abs == string(filepath.Separator) || filepath.Dir(abs) == abs {
+		return "", errors.New("refusing to delete a filesystem root")
+	}
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && abs == filepath.Clean(home) {
+		return "", errors.New("refusing to delete the user home folder")
+	}
+	info, statErr := os.Lstat(abs)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return abs, nil
+		}
+		return "", fmt.Errorf("cannot inspect project folder: %w", statErr)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("refusing to delete a symbolic-link sync root")
+	}
+	if !info.IsDir() {
+		return "", errors.New("project sync root is not a directory")
+	}
+	return abs, nil
+}
+
+func deleteProjectRoot(root string) error {
+	if root == "" {
+		return errors.New("project folder is empty")
+	}
+	if err := os.RemoveAll(root); err != nil {
+		return fmt.Errorf("delete project folder %s: %w", root, err)
+	}
+	return nil
 }
 
 func (m *multiAppController) handleSidebar(w http.ResponseWriter, r *http.Request) {
@@ -1799,6 +1888,7 @@ func makeStatusPayload(status serverapp.Status, starting bool, lastError string)
 		ActivityClientID:      status.Activity.ClientID,
 		ActivityRevision:      status.Activity.Revision,
 		ActivityAt:            status.Activity.At,
+		ActivityDetails:       status.Activity.Details,
 		LastError:             strings.TrimSpace(lastError),
 		Uptime:                uptime,
 		RemoteExecEnabled:     status.RemoteExecEnabled,
@@ -2367,6 +2457,11 @@ function showError(message) {
   $("errorDetailsBtn").disabled = !hasError;
   $("errorDetailText").textContent = hasError ? lastFullError : "Clear";
 }
+function activityDetailsText(app) {
+  const details = app && app.activity_details;
+  if (!details || typeof details !== "object" || Object.keys(details).length === 0) return "";
+  try { return "\n\nActivity details:\n" + JSON.stringify(details, null, 2); } catch (_) { return ""; }
+}
 function showErrorModal() { if (lastFullError && lastFullError !== "Clear") $("errorModal").classList.add("open"); }
 function hideErrorModal() { $("errorModal").classList.remove("open"); }
 function setActivityProgress(value, active) {
@@ -2394,7 +2489,7 @@ function render(app) {
     $("configInput").value = app.config_path || "sync_config.json"; $("syncRootInput").value = app.sync_root || "src/game"; $("hostInput").value = app.host || "127.0.0.1"; $("portInput").value = app.port || 8765;
     $("debugInput").checked = !!app.debug; updateSwitchText();
   }
-  $("requestsText").textContent = app.request_count || 0; $("pollsText").textContent = app.polls || 0; $("gitText").textContent = app.git_status || "Pending"; $("lastScanText").textContent = app.indexed ? app.indexed + " items" : "Ready"; showError(app.last_error || "Clear");
+  $("requestsText").textContent = app.request_count || 0; $("pollsText").textContent = app.polls || 0; $("gitText").textContent = app.git_status || "Pending"; $("lastScanText").textContent = app.indexed ? app.indexed + " items" : "Ready"; showError((app.last_error || "Clear") + (app.activity_error ? activityDetailsText(app) : ""));
   $("execTokenDisplay").value = app.remote_exec_token || "";
   $("execTokenCopyBtn").disabled = !(app.remote_exec_token || "").trim();
   if (app.remote_exec_available) $("execTokenHint").textContent = "Copy this token into the Studio plugin Exec Token field.";
@@ -2402,6 +2497,7 @@ function render(app) {
   else $("execTokenHint").textContent = "Token will appear after config is prepared.";
   $("activityText").textContent = app.starting ? "Starting server and scanning project files..." : (app.activity_text || "No Studio activity yet."); $("activityText").style.color = app.activity_error ? "var(--bad)" : "var(--ink)";
   const activityBits = []; if (app.activity_operation) activityBits.push(app.activity_operation); if (app.activity_progress) activityBits.push(app.activity_progress + "%"); if (app.activity_revision) activityBits.push("rev " + app.activity_revision);
+  if (app.activity_phase) activityBits.push("phase " + app.activity_phase);
   $("activityHint").textContent = app.starting ? "Preparing watcher, Git, and local index" : activityBits.join(" · ");
   if (app.starting) setStartupProgress(true); else setActivityProgress(app.activity_progress, !!app.activity_progress && !app.activity_error);
   $("startBtn").disabled = busy || app.running || app.starting; $("stopBtn").disabled = busy || !app.running;

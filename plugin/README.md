@@ -6,15 +6,17 @@ Struktur Studio:
 
 ```text
 RiftSyncPlugin (Script / PluginScript)
-└─ API (ModuleScript)
-   └─ TypeList (ModuleScript)
+└── API (ModuleScript)
+    ├── TypeList (ModuleScript)
+    └── Identity (ModuleScript)
 ```
 
 Mapping file:
 
 - `RiftSyncPlugin.lua` -> `RiftSyncPlugin`
-- `API.lua` -> `API`
-- `TypeList.lua` -> `TypeList`
+- `API.lua` -> `API` (child dari `RiftSyncPlugin`)
+- `TypeList.lua` -> `TypeList` (child dari `API`)
+- `Identity.lua` -> `Identity` (child dari `API`, sejajar dengan `TypeList`)
 
 Catatan migrasi Go:
 

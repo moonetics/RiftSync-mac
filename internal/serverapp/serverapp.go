@@ -19,7 +19,7 @@ import (
 	"riftsync/internal/watcher"
 )
 
-const Version = "4.1.3"
+const Version = "4.1.11"
 
 type Options struct {
 	ConfigPath            string
@@ -131,6 +131,9 @@ func (r *Runner) StartWithProgress(parent context.Context, onProgress func(state
 	if err := cfg.NormalizeAndValidate(); err != nil {
 		return fmt.Errorf("config error: %w", err)
 	}
+	if warning := cfg.PortabilityWarning(); warning != "" {
+		return fmt.Errorf("sync root unavailable: %s; choose a folder with Open Folder and retry", warning)
+	}
 	report("Reserving the local sync port...", "reserving_port", 9, 0, 0, true)
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.Host, cfg.Port))
 	if err != nil {
@@ -195,42 +198,47 @@ func (r *Runner) StartWithProgress(parent context.Context, onProgress func(state
 		fmt.Fprintf(options.Stdout, "[debug] load project state error: %v\n", err)
 	}
 	appState.RecordPerformance(0, 0, time.Since(scanStarted), 0, snapshot.CacheHits, snapshot.CacheMisses)
-	if err := config.WriteGuidebookStatus(cfg, config.ScaffoldOptions{
-		ConfigPath:        options.ConfigPath,
-		Version:           Version,
-		LastKnownRevision: appState.Revision(),
-	}); err != nil {
-		return fmt.Errorf("guidebook status error: %w", err)
-	}
 
 	ctx, cancel := context.WithCancel(parent)
 	report("Starting Git integration...", "starting_git", 88, 0, 0, true)
 	gitService := gitversion.New(cfg, appState, gitversion.Options{})
 	gitService.Start(ctx)
 
-	report("Starting filesystem watcher...", "starting_watcher", 92, 0, 0, true)
 	var watchService *watcher.Service
-	watchService, err = watcher.New(cfg, appState, watcher.Options{Cache: scanCache})
-	if err != nil {
-		cancel()
-		gitService.Close()
-		return fmt.Errorf("watcher error: %w", err)
+	var safetyDone <-chan struct{}
+	if options.LegacyScan {
+		report("Starting legacy periodic scanner...", "starting_scanner", 92, 0, 0, true)
+		safetyDone = StartLegacyScanner(ctx, cfg, scanCache, appState, options.Debug, options.Stdout)
+	} else {
+		report("Starting filesystem watcher...", "starting_watcher", 92, 0, 0, true)
+		watchService, err = watcher.New(cfg, appState, watcher.Options{Cache: scanCache})
+		if err != nil {
+			cancel()
+			gitService.Close()
+			return fmt.Errorf("watcher error: %w", err)
+		}
+		if err := watchService.Start(ctx); err != nil {
+			cancel()
+			gitService.Close()
+			_ = watchService.Close()
+			return fmt.Errorf("watcher error: %w", err)
+		}
+		if cfg.SafetyScanIntervalSec > 0 {
+			safetyDone = StartSafetyScanner(ctx, cfg, scanCache, appState, watchService, options.Debug, options.Stdout)
+		}
 	}
-	if err := watchService.Start(ctx); err != nil {
-		cancel()
-		gitService.Close()
-		_ = watchService.Close()
-		return fmt.Errorf("watcher error: %w", err)
-	}
-	safetyDone := StartSafetyScanner(ctx, cfg, scanCache, appState, watchService, options.Debug, options.Stdout)
 
 	report("Starting local HTTP server...", "starting_server", 97, 0, 0, true)
-	server := &http.Server{
-		Addr: fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Handler: httpapi.NewWithScannerCacheAndWatchRefresh(appState, Version, scanCache, func() error {
+	var refreshWatches func() error
+	if watchService != nil {
+		refreshWatches = func() error {
 			_, err := watchService.SyncTree()
 			return err
-		}),
+		}
+	}
+	server := &http.Server{
+		Addr: fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Handler: httpapi.NewWithScannerCacheAndWatchRefresh(appState, Version, scanCache, refreshWatches),
 	}
 	done := make(chan error, 1)
 	go func() {
@@ -357,7 +365,7 @@ func (r *Runner) Status(limit int) Status {
 		Port:              cfg.Port,
 		ConfigPath:        options.ConfigPath,
 		SyncRoot:          cfg.SyncRootAbs,
-		LegacyScan:        false,
+		LegacyScan:        running && options.LegacyScan,
 		Debug:             options.Debug,
 		RemoteExecEnabled: cfg.RemoteExecEnabled,
 		RemoteExecToken:   cfg.RemoteExecToken,
@@ -427,9 +435,9 @@ func normalizeOptions(options Options) Options {
 }
 
 func StartSafetyScanner(ctx context.Context, cfg config.Config, scanCache *scanner.Cache, appState *state.AppState, watchService *watcher.Service, debug bool, stdout io.Writer) <-chan struct{} {
-	interval := time.Duration(cfg.ScanIntervalSec * float64(time.Second))
+	interval := time.Duration(cfg.SafetyScanIntervalSec * float64(time.Second))
 	if interval <= 0 {
-		interval = 400 * time.Millisecond
+		interval = 30 * time.Second
 	}
 	done := make(chan struct{})
 	go func() {
@@ -459,7 +467,30 @@ func StartSafetyScanner(ctx context.Context, cfg config.Config, scanCache *scann
 }
 
 func StartLegacyScanner(ctx context.Context, cfg config.Config, scanCache *scanner.Cache, appState *state.AppState, debug bool, stdout io.Writer) <-chan struct{} {
-	return StartSafetyScanner(ctx, cfg, scanCache, appState, nil, debug, stdout)
+	interval := time.Duration(cfg.ScanIntervalSec * float64(time.Second))
+	if interval <= 0 {
+		interval = 400 * time.Millisecond
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				event, err := LegacyScanOnce(cfg, scanCache, appState, interval)
+				if debug && stdout != nil && err != nil {
+					fmt.Fprintf(stdout, "[debug] legacy scan error: %v\n", err)
+				} else if debug && stdout != nil && event.Rev > 0 {
+					fmt.Fprintf(stdout, "[debug] legacy scan revision=%d changes=%d\n", event.Rev, event.ChangeCount)
+				}
+			}
+		}
+	}()
+	return done
 }
 
 func LegacyScanOnce(cfg config.Config, scanCache *scanner.Cache, appState *state.AppState, interval time.Duration) (state.RevisionEvent, error) {

@@ -17,6 +17,7 @@ const (
 	UIPropertiesFilename = "properties.init.json"
 	UIInitMetaFilename   = "init.meta.json"
 	UIModelJSONSuffix    = ".model.json"
+	localIdentityMarker  = "~rid_"
 )
 
 var scriptSuffixToClass = map[string]string{
@@ -215,6 +216,9 @@ func BuildRenameChange(oldRecord, newRecord SyncRecord) map[string]any {
 }
 
 func IdentityKey(record SyncRecord) string {
+	if explicitStableID(record.StableID) {
+		return record.Entity + "\x00stable_id\x00" + record.StableID
+	}
 	if record.Entity == EntityScript {
 		return record.Entity + "\x00" + record.RbxPath
 	}
@@ -300,7 +304,7 @@ func IsNamedScriptSourceLocalPath(localPath string) bool {
 		return false
 	}
 	leafClass := classStack[len(classStack)-1]
-	return scriptClasses[leafClass] && leafClass == className && decodeLocalSegment(filenameStem) == decodedNames[len(decodedNames)-1]
+	return scriptClasses[leafClass] && leafClass == className && decodeLocalIdentityName(filenameStem) == decodedNames[len(decodedNames)-1]
 }
 
 func IsCanonicalScriptLocalPath(localPath string) bool {
@@ -363,7 +367,7 @@ func ScriptPropertiesPathForSourcePath(localPath string) (string, bool, error) {
 	if len(decodedNames) == 0 || classStack[len(classStack)-1] != className {
 		return "", false, nil
 	}
-	if decodeLocalSegment(stem) != decodedNames[len(decodedNames)-1] {
+	if decodeLocalIdentityName(stem) != decodedNames[len(decodedNames)-1] {
 		return "", false, nil
 	}
 	return path.Join(path.Dir(normalizeSlash(localPath)), UIPropertiesFilename), true, nil
@@ -685,7 +689,7 @@ func newNamedScriptRecord(relPosix string, parts []string, filenameStem, classNa
 			if classStack[len(classStack)-1] != className {
 				return nil, fmt.Errorf("script source %s class mismatch: folder=%s filename=%s", relPosix, classStack[len(classStack)-1], className)
 			}
-			if decodeLocalSegment(filenameStem) == decodedNames[len(decodedNames)-1] {
+			if decodeLocalIdentityName(filenameStem) == decodedNames[len(decodedNames)-1] {
 				rbxPath := "game." + strings.Join(append([]string{serviceName}, decodedNames...), ".")
 				if IsIgnoredRbxPath(rbxPath, ignored) {
 					return nil, nil
@@ -717,7 +721,7 @@ func newNamedScriptRecord(relPosix string, parts []string, filenameStem, classNa
 
 	decodedParts := make([]string, 0, len(resolvedParts))
 	for _, part := range resolvedParts {
-		decodedParts = append(decodedParts, decodeLocalSegment(part))
+		decodedParts = append(decodedParts, decodeLocalIdentityName(part))
 	}
 	rbxPath := "game." + strings.Join(decodedParts, ".")
 	if IsIgnoredRbxPath(rbxPath, ignored) {
@@ -734,8 +738,31 @@ func buildScriptRecord(localPath, rbxPath, className, source string) *SyncRecord
 		RbxPath:     rbxPath,
 		ClassName:   className,
 		Source:      source,
+		StableID:    scriptStableIDFromLocalPath(localPath),
 		ContentHash: ContentDigest(source),
 	}
+}
+
+func scriptStableIDFromLocalPath(localPath string) string {
+	parts := splitPath(localPath)
+	if len(parts) == 0 {
+		return ""
+	}
+	filename := parts[len(parts)-1]
+	if stem, _, _, ok := splitScriptSourceFilename(filename); ok {
+		_, stableID := splitLocalIdentityName(stem)
+		if stableID != "" {
+			return stableID
+		}
+	}
+	if len(parts) >= 2 {
+		folderSegment := parts[len(parts)-2]
+		if splitIndex := strings.LastIndex(folderSegment, "."); splitIndex > 0 {
+			_, stableID := splitLocalIdentityName(folderSegment[:splitIndex])
+			return stableID
+		}
+	}
+	return ""
 }
 
 func (r *SyncRecord) ApplyScriptPayload(payload map[string]any) error {
@@ -822,7 +849,7 @@ func parseUISegment(segment string) (string, string, bool) {
 	if splitIndex <= 0 || splitIndex >= len(segment)-1 {
 		return "", "", false
 	}
-	return decodeLocalSegment(segment[:splitIndex]), segment[splitIndex+1:], true
+	return decodeLocalIdentityName(segment[:splitIndex]), segment[splitIndex+1:], true
 }
 
 func normalizeInitMetaPayload(payload map[string]any, relPosix, defaultName, defaultClassName string) (map[string]any, string, error) {
@@ -951,6 +978,28 @@ func decodeLocalSegment(segment string) string {
 		}
 	}
 	return segment
+}
+
+func splitLocalIdentityName(segment string) (string, string) {
+	markerIndex := strings.LastIndex(segment, localIdentityMarker)
+	if markerIndex <= 0 {
+		return segment, ""
+	}
+	stableID := segment[markerIndex+len(localIdentityMarker):]
+	if stableID == "" {
+		return segment, ""
+	}
+	for _, ch := range stableID {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+			return segment, ""
+		}
+	}
+	return segment[:markerIndex], stableID
+}
+
+func decodeLocalIdentityName(segment string) string {
+	encodedName, _ := splitLocalIdentityName(segment)
+	return decodeLocalSegment(encodedName)
 }
 
 func splitPath(value string) []string {

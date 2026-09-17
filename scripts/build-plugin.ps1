@@ -15,6 +15,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $Root "plugin\RiftSyncPlugin.lua") -Destination (Join-Path $pluginStage "init.server.lua")
     Copy-Item -LiteralPath (Join-Path $Root "plugin\API.lua") -Destination (Join-Path $apiStage "init.lua")
     Copy-Item -LiteralPath (Join-Path $Root "plugin\TypeList.lua") -Destination (Join-Path $apiStage "TypeList.lua")
+    Copy-Item -LiteralPath (Join-Path $Root "plugin\Identity.lua") -Destination (Join-Path $apiStage "Identity.lua")
 
     $projectPath = Join-Path $stageRoot "plugin.project.json"
     @{

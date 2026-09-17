@@ -24,6 +24,7 @@ trap cleanup EXIT INT TERM
 mkdir -p "$ICONSET" "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 
 cd "$PROJECT_ROOT"
+"$SCRIPT_DIR/build-plugin.sh"
 CGO_ENABLED=1 "$GO_CMD" build -trimpath -o riftsync-app-macos-arm64 ./cmd/riftsync-app
 CGO_ENABLED=0 "$GO_CMD" build -trimpath -o riftsync-server-macos-arm64 ./cmd/riftsync-server
 cp riftsync-app-macos-arm64 "$APP_BUNDLE/Contents/MacOS/RiftSync"
@@ -43,6 +44,15 @@ iconutil -c icns "$ICONSET" -o "$APP_BUNDLE/Contents/Resources/RiftSync.icns"
 
 plutil -lint "$APP_BUNDLE/Contents/Info.plist" >/dev/null
 codesign --force --deep --sign - "$APP_BUNDLE"
+
+if [ -d "/Applications/RiftSync.app" ]; then
+    cp -R "$APP_BUNDLE" "/Applications/"
+    echo "Updated /Applications/RiftSync.app"
+fi
+if [ -d "${HOME}/Applications/RiftSync.app" ]; then
+    cp -R "$APP_BUNDLE" "${HOME}/Applications/"
+    echo "Updated ${HOME}/Applications/RiftSync.app"
+fi
 
 echo "Built:"
 echo "  $APP_BUNDLE"

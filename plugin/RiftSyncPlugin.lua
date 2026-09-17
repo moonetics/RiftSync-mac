@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------------------
--- RiftSyncPlugin v4.1.3
+-- RiftSyncPlugin v4.1.11
 -- Multi-profile Roblox Studio client for RiftSync.
 --------------------------------------------------------------------------------------------
 
@@ -245,7 +245,7 @@ profileSwitcher.Parent = connectionPanel
 local previousProfileButton = button(profileSwitcher, "Prev", COLORS.SurfaceHigh, 1)
 previousProfileButton.Size = UDim2.new(0, 52, 0, 40)
 local profileNameLabel = label(profileSwitcher, "Default", 13, COLORS.Text, true)
-profileNameLabel.Size = UDim2.new(1, -120, 0, 40)
+profileNameLabel.Size = UDim2.new(1, -168, 0, 40)
 profileNameLabel.Position = UDim2.new(0, 60, 0, 0)
 profileNameLabel.TextXAlignment = Enum.TextXAlignment.Center
 profileNameLabel.BackgroundColor3 = COLORS.Well
@@ -254,7 +254,20 @@ corner(profileNameLabel, 8)
 stroke(profileNameLabel, COLORS.Border, 1)
 local nextProfileButton = button(profileSwitcher, "Next", COLORS.SurfaceHigh, 2)
 nextProfileButton.Size = UDim2.new(0, 52, 0, 40)
-nextProfileButton.Position = UDim2.new(1, -52, 0, 0)
+nextProfileButton.Position = UDim2.new(1, -100, 0, 0)
+local refreshProfilesButton = button(profileSwitcher, "", COLORS.Cyan, 3)
+refreshProfilesButton.Name = "RefreshProfilesButton"
+refreshProfilesButton.Size = UDim2.new(0, 40, 0, 40)
+refreshProfilesButton.Position = UDim2.new(1, -40, 0, 0)
+refreshProfilesButton.TextColor3 = COLORS.BorderDark
+local refreshProfilesIcon = Instance.new("ImageLabel")
+refreshProfilesIcon.Name = "Icon"
+refreshProfilesIcon.AnchorPoint = Vector2.new(0.5, 0.5)
+refreshProfilesIcon.Size = UDim2.fromOffset(22, 22)
+refreshProfilesIcon.Position = UDim2.fromScale(0.5, 0.5)
+refreshProfilesIcon.BackgroundTransparency = 1
+refreshProfilesIcon.Image = "rbxasset://studio_svg_textures/Lua/FileSync/Light/Standard/Refresh.png"
+refreshProfilesIcon.Parent = refreshProfilesButton
 
 local profileManageActions = Instance.new("Frame")
 profileManageActions.Size = UDim2.new(1, 0, 0, 40)
@@ -331,7 +344,43 @@ pullStudioButton.TextColor3 = COLORS.BorderDark
 local stopButton = button(actionGrid, "Stop", COLORS.Red, 4)
 stopButton.TextColor3 = COLORS.BorderDark
 
-local pullPreviewPanel = panel(scroll, 5)
+local startSourcePanel = panel(scroll, 5)
+startSourcePanel.Visible = false
+label(startSourcePanel, "CHOOSE START SOURCE", 10, COLORS.Amber, true)
+local startSourceExplanation = wrappedLabel(
+	startSourcePanel,
+	"No compare. Use Studio replaces local after making a backup. Use Local applies local to Studio with an Undo entry. Live sync then runs Local -> Studio.",
+	11,
+	COLORS.Text,
+	false
+)
+startSourceExplanation.LayoutOrder = 1
+local forceIdentityRepairButton = button(startSourcePanel, "Force ID repair: OFF", COLORS.SurfaceHigh, 2)
+forceIdentityRepairButton.Size = UDim2.new(1, 0, 0, 40)
+local forceIdentityRepairHint = wrappedLabel(
+	startSourcePanel,
+	"Recovery only: clears RiftSync IDs in Studio once. Studio source creates fresh IDs; Local source restores IDs from local files.",
+	10,
+	COLORS.Muted,
+	false
+)
+forceIdentityRepairHint.LayoutOrder = 3
+local startSourceActions = Instance.new("Frame")
+startSourceActions.Size = UDim2.new(1, 0, 0, 40)
+startSourceActions.BackgroundTransparency = 1
+startSourceActions.LayoutOrder = 4
+startSourceActions.Parent = startSourcePanel
+horizontalList(startSourceActions, 8)
+local startFromStudioButton = button(startSourceActions, "Use Studio", COLORS.Cyan, 1)
+startFromStudioButton.TextColor3 = COLORS.BorderDark
+startFromStudioButton.Size = UDim2.new(0.5, -4, 0, 40)
+local startFromLocalButton = button(startSourceActions, "Use Local", COLORS.Green, 2)
+startFromLocalButton.TextColor3 = COLORS.BorderDark
+startFromLocalButton.Size = UDim2.new(0.5, -4, 0, 40)
+local cancelStartButton = button(startSourcePanel, "Cancel", COLORS.SurfaceHigh, 5)
+cancelStartButton.Size = UDim2.new(1, 0, 0, 40)
+
+local pullPreviewPanel = panel(scroll, 6)
 pullPreviewPanel.Visible = false
 label(pullPreviewPanel, "PULL STUDIO PREVIEW", 10, COLORS.Amber, true)
 local pullPreviewCountLabel = wrappedLabel(pullPreviewPanel, "", 11, COLORS.Text, true)
@@ -371,12 +420,12 @@ corner(progressFill, 4)
 local progressCaption = label(statusPanel, "", 12, COLORS.Muted, false)
 progressCaption.Visible = false
 
-local historyPanel = panel(scroll, 6)
+local historyPanel = panel(scroll, 7)
 label(historyPanel, "RECENT SYNC ACTIVITY", 10, COLORS.Muted, true)
 local historyLabel = wrappedLabel(historyPanel, "History is available after sync begins.", 10, COLORS.Muted, false)
 historyLabel.Font = Enum.Font.Code
 
-local debugPanel = panel(scroll, 7)
+local debugPanel = panel(scroll, 8)
 local debugDisclosureButton = button(debugPanel, "Diagnostics  +", COLORS.SurfaceHigh, 1)
 debugDisclosureButton.Size = UDim2.new(1, 0, 0, 40)
 debugDisclosureButton.TextXAlignment = Enum.TextXAlignment.Left
@@ -405,6 +454,7 @@ local historyLines = {}
 local MAX_HISTORY_LINES = 12
 local progressTween = nil
 local updateStatus
+local forceIdentityRepairEnabled = false
 
 local function setProfileEditorVisible(visible)
 	profileEditor.Visible = visible == true
@@ -428,6 +478,14 @@ local function setControlEnabled(control, enabled)
 	control.TextTransparency = enabled and 0 or 0.45
 end
 
+local function refreshForceIdentityRepairUI()
+	forceIdentityRepairButton.Text = forceIdentityRepairEnabled
+		and "Force ID repair: ON"
+		or "Force ID repair: OFF"
+	forceIdentityRepairButton.BackgroundColor3 = forceIdentityRepairEnabled and COLORS.Amber or COLORS.SurfaceHigh
+	forceIdentityRepairButton.TextColor3 = forceIdentityRepairEnabled and COLORS.BorderDark or COLORS.Text
+end
+
 local function setProfileControlsLocked(locked)
 	for _, control in ipairs({
 		profileNameInput,
@@ -436,6 +494,7 @@ local function setProfileControlsLocked(locked)
 		execTokenInput,
 		previousProfileButton,
 		nextProfileButton,
+		refreshProfilesButton,
 		addProfileButton,
 		profileEditorToggleButton,
 		saveProfileButton,
@@ -553,7 +612,23 @@ local function refreshLocalProfilesFromApp(showStatus)
 	if not client then
 		return
 	end
+	if client:isRunning() then
+		if showStatus then
+			updateStatus("Stop sync sebelum refresh profile.", true)
+		end
+		return
+	end
+	setControlEnabled(refreshProfilesButton, false)
+	refreshProfilesIcon.ImageTransparency = 0.35
+	local refreshTween = TweenService:Create(
+		refreshProfilesIcon,
+		TweenInfo.new(0.65, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false),
+		{ Rotation = 360 }
+	)
+	refreshTween:Play()
 	local ok, err = client:refreshLocalProfiles()
+	refreshTween:Cancel()
+	refreshProfilesIcon.Rotation = 0
 	if ok then
 		if showStatus then
 			updateStatus("Profile Local diperbarui dari aplikasi RiftSync.", false)
@@ -562,6 +637,8 @@ local function refreshLocalProfilesFromApp(showStatus)
 		updateStatus(tostring(err), true)
 	end
 	refreshProfileUI()
+	refreshProfilesIcon.ImageTransparency = 0
+	setControlEnabled(refreshProfilesButton, not client:isRunning())
 end
 
 local function updateExecUI()
@@ -683,9 +760,9 @@ local function updateDebug(payload)
 end
 
 client = SyncAPI.new(plugin, updateStatus, updateDebug)
-client:setStartMode(START_MODES.FolderToStudio)
 refreshProfileUI()
 updateExecUI()
+refreshForceIdentityRepairUI()
 
 toolbarButton.Click:Connect(function()
 	widget.Enabled = not widget.Enabled
@@ -705,6 +782,12 @@ end)
 
 nextProfileButton.MouseButton1Click:Connect(function()
 	selectProfileAt(selectedProfileIndex + 1)
+end)
+
+refreshProfilesButton.MouseButton1Click:Connect(function()
+	task.spawn(function()
+		refreshLocalProfilesFromApp(true)
+	end)
 end)
 
 profileEditorToggleButton.MouseButton1Click:Connect(function()
@@ -761,22 +844,124 @@ removeProfileButton.MouseButton1Click:Connect(function()
 	updateStatus("Connection profile removed. Project files were not changed.", false)
 end)
 
+local function detectWorkspaceState()
+	local studioItemCount = 0
+	local rootsToCheck = {
+		game:GetService("Workspace"),
+		game:GetService("ReplicatedStorage"),
+		game:GetService("ServerScriptService"),
+		game:GetService("StarterGui"),
+		game:GetService("ServerStorage"),
+	}
+	for _, root in ipairs(rootsToCheck) do
+		for _, child in ipairs(root:GetChildren()) do
+			if root == game.Workspace then
+				if not child:IsA("Terrain") and not child:IsA("Camera") and child.Name ~= "Baseplate" then
+					studioItemCount += 1
+				end
+			else
+				studioItemCount += 1
+			end
+		end
+	end
+
+	pcall(function()
+		client:fetchHealth()
+	end)
+
+	local localCount = tonumber(client.serverIndexedCount)
+	return localCount, studioItemCount
+end
+
+local function refreshStartSourceGuidance()
+	local localCount, studioCount = detectWorkspaceState()
+	startFromStudioButton.Text = "Use Studio"
+	startFromStudioButton.BackgroundColor3 = COLORS.Cyan
+	startFromLocalButton.Text = "Use Local"
+	startFromLocalButton.BackgroundColor3 = COLORS.Green
+
+	if localCount ~= nil and localCount > 0 then
+		startSourceExplanation.Text = "Folder lokal: "
+			.. tostring(localCount)
+			.. " file. Studio: "
+			.. tostring(studioCount)
+			.. " objek.\n• Use Studio: Mengekspor objek Studio ke folder lokal (backup lokal dibuat).\n• Use Local: Menerapkan file folder lokal ke Studio (Undo tersedia).\nLive sync berjalan otomatis setelah start."
+	else
+		startSourceExplanation.Text = "Pilih sumber data awal:\n• Use Studio: Mengekspor objek Studio ke folder lokal (backup lokal dibuat).\n• Use Local: Menerapkan file folder lokal ke Studio (Undo tersedia).\nLive sync berjalan otomatis setelah start."
+	end
+end
+
 startButton.MouseButton1Click:Connect(function()
+	if client:isRunning() then
+		return
+	end
 	local current = profiles[selectedProfileIndex]
 	if (not current or current.kind ~= "local") and not saveCurrentProfile() then
 		return
 	end
-	client:setStartMode(START_MODES.FolderToStudio)
+	pullPreviewPanel.Visible = false
+	forceIdentityRepairEnabled = false
+	client:setForceIdentityRepair(false)
+	refreshForceIdentityRepairUI()
+	refreshStartSourceGuidance()
+	startSourcePanel.Visible = true
+	setProfileControlsLocked(true)
+	updateStatus("Choose Studio or Local as the source for this start. Nothing has changed yet.", false)
+end)
+
+forceIdentityRepairButton.MouseButton1Click:Connect(function()
+	forceIdentityRepairEnabled = not forceIdentityRepairEnabled
+	refreshForceIdentityRepairUI()
+	if forceIdentityRepairEnabled then
+		updateStatus(
+			"Force ID repair armed for this Start only. Now choose Studio or Local as the source.",
+			false
+		)
+	else
+		updateStatus("Force ID repair disabled. Start will use existing identities.", false)
+	end
+end)
+
+local function startWithMode(mode : string)
+	startSourcePanel.Visible = false
+	client:setStartMode(mode)
+	client:setForceIdentityRepair(forceIdentityRepairEnabled)
 	local ok, err = client:start()
+	forceIdentityRepairEnabled = false
+	refreshForceIdentityRepairUI()
 	if not ok then
+		client:setForceIdentityRepair(false)
+		setProfileControlsLocked(false)
 		updateStatus(tostring(err), true)
 	else
 		setProfileControlsLocked(true)
 		updateExecUI()
 	end
+end
+
+startFromStudioButton.MouseButton1Click:Connect(function()
+	startWithMode(START_MODES.StudioToFolder)
+end)
+
+startFromLocalButton.MouseButton1Click:Connect(function()
+	startWithMode(START_MODES.FolderToStudio)
+end)
+
+cancelStartButton.MouseButton1Click:Connect(function()
+	startSourcePanel.Visible = false
+	forceIdentityRepairEnabled = false
+	client:setForceIdentityRepair(false)
+	refreshForceIdentityRepairUI()
+	setProfileControlsLocked(false)
+	refreshProfileUI()
+	updateStatus("Start cancelled. Studio and local files were not changed.", false)
 end)
 
 stopButton.MouseButton1Click:Connect(function()
+	startSourcePanel.Visible = false
+	pullPreviewPanel.Visible = false
+	forceIdentityRepairEnabled = false
+	refreshForceIdentityRepairUI()
 	client:stop()
 	setProfileControlsLocked(false)
 	refreshProfileUI()

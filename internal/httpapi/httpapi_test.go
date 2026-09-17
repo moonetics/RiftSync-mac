@@ -1167,8 +1167,8 @@ func TestBootstrapReplaceRemovesStaleAndWritesIncoming(t *testing.T) {
 	} else if string(body) != "print('old')" {
 		t.Fatalf("backup stale body = %q", string(body))
 	}
-	if _, err := os.Stat(filepath.Join(root, config.GuidebookDir, config.GuidebookStatus)); err != nil {
-		t.Fatalf("guidebook status missing after bootstrap: %v", err)
+	if _, err := os.Stat(filepath.Join(root, config.GuidebookDir)); !os.IsNotExist(err) {
+		t.Fatalf("expected .guidebook to not exist after bootstrap, err=%v", err)
 	}
 }
 

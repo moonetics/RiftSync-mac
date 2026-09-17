@@ -419,12 +419,13 @@ func printRuntimeStatus(out io.Writer, status serverapp.Status, debug bool) {
 }
 
 type validateReport struct {
-	Status     string         `json:"status"`
-	ConfigPath string         `json:"config_path"`
-	SyncRoot   string         `json:"sync_root"`
-	Errors     []string       `json:"errors"`
-	Warnings   []string       `json:"warnings"`
-	Counts     map[string]int `json:"counts"`
+	Status     string             `json:"status"`
+	ConfigPath string             `json:"config_path"`
+	SyncRoot   string             `json:"sync_root"`
+	Errors     []string           `json:"errors"`
+	Warnings   []string           `json:"warnings"`
+	Conflicts  []records.Conflict `json:"conflicts"`
+	Counts     map[string]int     `json:"counts"`
 }
 
 func runValidateCommand(options cliOptions, stdout, stderr io.Writer) int {
@@ -432,9 +433,10 @@ func runValidateCommand(options cliOptions, stdout, stderr io.Writer) int {
 	if err != nil {
 		if options.validate.jsonOutput {
 			_ = json.NewEncoder(stdout).Encode(validateReport{
-				Status: "cli_error",
-				Errors: []string{err.Error()},
-				Counts: map[string]int{},
+				Status:    "cli_error",
+				Errors:    []string{err.Error()},
+				Conflicts: []records.Conflict{},
+				Counts:    map[string]int{},
 			})
 		} else {
 			fmt.Fprintf(stderr, "validation setup error: %v\n", err)
@@ -477,12 +479,16 @@ func validateProject(options cliOptions) (validateReport, error) {
 		Status:     "ok",
 		ConfigPath: cfg.ConfigPathAbs,
 		SyncRoot:   cfg.SyncRootAbs,
+		Conflicts:  []records.Conflict{},
 		Counts: map[string]int{
 			"scripts":                  0,
 			"ui":                       0,
 			"entries":                  0,
 			"invalid_json":             0,
 			"duplicate_stable_ids":     0,
+			"identity_conflicts":       0,
+			"duplicate_rbx_paths":      0,
+			"missing_stable_ids":       0,
 			"unsupported_paths":        0,
 			"ignored_metadata_folders": countIgnoredMetadataFolders(cfg.SyncRootAbs),
 			"warnings":                 0,
@@ -493,6 +499,9 @@ func validateProject(options cliOptions) (validateReport, error) {
 		if abs, absErr := filepath.Abs(options.configPath); absErr == nil {
 			report.ConfigPath = filepath.Clean(abs)
 		}
+	}
+	if warning := cfg.PortabilityWarning(); warning != "" {
+		report.Warnings = append(report.Warnings, warning)
 	}
 
 	if info, statErr := os.Stat(cfg.SyncRootAbs); statErr != nil {
@@ -519,15 +528,19 @@ func validateProject(options cliOptions) (validateReport, error) {
 	report.Counts["ui"] = snapshot.UICount
 	report.Counts["entries"] = len(snapshot.Records)
 
-	for _, invalidPath := range snapshot.InvalidPaths {
-		report.Errors = append(report.Errors, "invalid metadata JSON: "+invalidPath)
+	report.Conflicts = append(report.Conflicts, snapshot.Conflicts...)
+	for _, conflict := range snapshot.Conflicts {
+		if conflict.Error() {
+			report.Errors = append(report.Errors, conflict.Message)
+		} else {
+			report.Warnings = append(report.Warnings, conflict.Message)
+		}
 	}
 	for _, warning := range snapshot.Warnings {
-		if strings.Contains(strings.ToLower(warning), "duplicate stable id") {
-			report.Errors = append(report.Errors, warning)
+		if strings.Contains(strings.ToLower(warning), "invalid json") {
 			continue
 		}
-		if strings.Contains(strings.ToLower(warning), "invalid json") {
+		if strings.Contains(strings.ToLower(warning), "duplicate stable id") {
 			continue
 		}
 		report.Warnings = append(report.Warnings, warning)
@@ -541,7 +554,10 @@ func validateProject(options cliOptions) (validateReport, error) {
 		report.Warnings = append(report.Warnings, "unsupported sync path: "+path)
 	}
 	report.Counts["invalid_json"] = len(snapshot.InvalidPaths)
-	report.Counts["duplicate_stable_ids"] = countDuplicateStableIDErrors(report.Errors)
+	report.Counts["duplicate_stable_ids"] = countConflictKind(report.Conflicts, records.ConflictDuplicateStableID)
+	report.Counts["identity_conflicts"] = len(report.Conflicts)
+	report.Counts["duplicate_rbx_paths"] = countConflictKind(report.Conflicts, records.ConflictAmbiguousTarget)
+	report.Counts["missing_stable_ids"] = countConflictKind(report.Conflicts, records.ConflictMissingStableID)
 	report.Counts["unsupported_paths"] = len(unsupported)
 	finalizeValidateReport(&report)
 	return report, nil
@@ -573,6 +589,7 @@ func writeValidateHuman(out io.Writer, report validateReport) {
 	fmt.Fprintf(out, "- Scripts: %d\n", report.Counts["scripts"])
 	fmt.Fprintf(out, "- UI metadata: %d\n", report.Counts["ui"])
 	fmt.Fprintf(out, "- Ignored metadata folders: %d\n", report.Counts["ignored_metadata_folders"])
+	fmt.Fprintf(out, "- Identity conflicts: %d\n", report.Counts["identity_conflicts"])
 
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Warnings:")
@@ -591,6 +608,15 @@ func writeValidateHuman(out io.Writer, report validateReport) {
 	} else {
 		for _, validationError := range report.Errors {
 			fmt.Fprintln(out, "- "+validationError)
+		}
+	}
+
+	if len(report.Conflicts) > 0 {
+		fmt.Fprintln(out, "")
+		fmt.Fprintln(out, "Conflicts:")
+		for _, conflict := range report.Conflicts {
+			fmt.Fprintf(out, "- [%s] %s | local=%s | rbx=%s | stable_id=%s | hint=%s\n",
+				conflict.Kind, conflict.Message, conflict.LocalPath, conflict.RbxPath, conflict.StableID, conflict.Hint)
 		}
 	}
 
@@ -658,10 +684,10 @@ func countIgnoredMetadataFolders(syncRoot string) int {
 	return count
 }
 
-func countDuplicateStableIDErrors(errors []string) int {
+func countConflictKind(conflicts []records.Conflict, kind records.ConflictKind) int {
 	count := 0
-	for _, item := range errors {
-		if strings.Contains(strings.ToLower(item), "duplicate stable id") {
+	for _, conflict := range conflicts {
+		if conflict.Kind == kind {
 			count++
 		}
 	}

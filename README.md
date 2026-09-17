@@ -2,7 +2,7 @@
 
 Fork macOS dari RiftSync dengan aplikasi native `RiftSync.app`, server Apple Silicon, dan profile Local plugin yang mengikuti project di aplikasi. Dukungan build Windows tetap dipertahankan di source yang sama.
 
-Versi: `4.1.3`
+Versi: `4.1.11`
 Protocol sync: `rbxsync/2.0.0`
 
 One-way sync untuk Roblox Studio:
@@ -17,12 +17,13 @@ One-way sync untuk Roblox Studio:
 
 ## Hierarki Plugin
 
-Gunakan struktur ini saat menyusun plugin:
+Gunakan struktur ini saat menyusun plugin di Roblox Studio:
 
 ```text
 RiftSyncPlugin (Script / PluginScript)
-└─ API (ModuleScript)
-   └─ TypeList (ModuleScript)
+└── API (ModuleScript)
+    ├── TypeList (ModuleScript)
+    └── Identity (ModuleScript)
 ```
 
 Sumber file:
@@ -30,6 +31,7 @@ Sumber file:
 - `plugin/RiftSyncPlugin.lua` -> isi `RiftSyncPlugin`
 - `plugin/API.lua` -> isi `API` (child dari `RiftSyncPlugin`)
 - `plugin/TypeList.lua` -> isi `TypeList` (child dari `API`)
+- `plugin/Identity.lua` -> isi `Identity` (child dari `API`)
 
 ## Struktur Project
 
@@ -39,7 +41,14 @@ cmd/                 Entrypoint Go server
 internal/            Package Go server
 docs/                Dokumen rencana migrasi dan PRD
 sync_config.json     Konfigurasi server/sync root
+sync_config.example.json  Template aman untuk setup baru
 ```
+
+`sync_config.json` adalah konfigurasi lokal dan tidak boleh menyimpan token pribadi di
+repository. Mulai dari [`sync_config.example.json`](sync_config.example.json), lalu
+simpan token Remote Exec hanya di file lokal. Di macOS, path Windows absolute akan
+memunculkan migration warning; sync root yang tidak ada atau tidak dapat diakses
+menghentikan startup sampai folder diperbaiki melalui `Open Folder`.
 
 ## Naming Convention File Lokal
 
@@ -99,6 +108,7 @@ ServerScriptService/
 - Setelah project pernah diinisialisasi, folder lokal tetap menjadi sumber utama meskipun seluruh file sync sengaja dihapus. RiftSync tidak menarik ulang object lama dari Studio.
 - Delete lokal disimpan sebagai tombstone di `.rblxsync/project-state.json` agar Studio yang baru tersambung tetap dapat membersihkan instance lama secara aman.
 - RiftSync hanya menghapus instance dengan bukti ownership yang cocok. Service root, Terrain, BasePart, Model, ignored path, dan instance unmanaged tetap dilindungi.
+- Saat Local -> Studio, satu object unmanaged pada destination yang path dan class-nya persis sama dapat diadopsi, termasuk metadata lokal dengan suffix `~rid_...`. StableId yang bentrok, beberapa kandidat yang sama-sama cocok, rename/delete, dan penggantian class tetap diblokir.
 - Orphan `properties.init.json` milik script dan folder canonical `<Name>.<ClassName>` yang benar-benar kosong dipangkas otomatis. Folder nonempty tidak dihapus secara rekursif.
 
 ### Format Folder UI
@@ -328,6 +338,14 @@ Build paket plugin Studio dengan Rojo:
 .\scripts\build-plugin.ps1 -Output .\RiftSyncPlugin.rbxm
 ```
 
+Di macOS gunakan `./scripts/build-plugin.sh`. Script build macOS menjalankan
+build plugin lebih dulu dan sengaja gagal jika Rojo tidak tersedia agar asset
+`.rbxm` lama tidak dipakai diam-diam. `sync_config.example.json` adalah template
+portable; jangan commit `sync_config.json` lokal atau token pribadi.
+
+Unit test suite Go dapat dijalankan dengan `go test -count=1 ./...`.
+Smoke test integration plugin dilakukan langsung di Roblox Studio.
+
 Script ini membuat asset dari `assets/brand/riftsync-logo.png`, menghasilkan:
 
 - `assets/brand/riftsync-icon-512.png`
@@ -499,11 +517,13 @@ git diff --check
 1. Enable HTTP requests di Studio (Game Settings -> Security -> Allow HTTP Requests).
 2. Install plugin dengan struktur hierarki di atas.
 3. Buka toolbar `RiftSync`, isi host/port (default `127.0.0.1:8765`).
-4. Pilih mode `Start` di widget:
-   - `Folder -> Studio` jika source of truth ada di folder lokal.
-   - `Studio -> Folder` jika mau override folder lokal dari Studio.
-   - Jika pilih `Folder -> Studio` dan index folder lokal masih kosong, plugin otomatis menjalankan Pull Studio sekali untuk membuat snapshot awal. Snapshot hasil upload tidak diterapkan kembali ke Studio.
-5. Klik `Start`.
+   - Profile Local dimuat ulang otomatis saat widget dibuka. Setelah menambah project di aplikasi RiftSync, klik tombol `↻` di samping pemilih profile jika widget masih terbuka.
+4. Klik `Start Sync`. RiftSync selalu meminta sumber awal dan tidak menampilkan compare:
+	- Opsional, aktifkan `Force ID repair` hanya untuk memulihkan error duplicate/corrupt StableId. Opsi ini berlaku satu kali untuk Start tersebut dan kembali `OFF` setelah dipakai.
+	- `Use Studio`: Studio menjadi sumber awal dan mengganti isi folder lokal. Sebelum replace, backup lokal dibuat di `.rblxsync/backups/<timestamp>/`.
+	- `Use Local`: folder lokal menjadi sumber awal dan diterapkan ke Studio. Perubahan awal dicatat sebagai `RiftSync: Start from Local` agar bisa di-Undo dari Studio.
+	- `Cancel`: tidak mengubah Studio maupun folder lokal.
+5. Setelah start awal selesai, arah live sync selalu `Local -> Studio`, apa pun sumber awal yang dipilih.
 6. Save file di VS Code, perubahan akan otomatis muncul di Studio.
 7. Jika ada error, status bar tampil ringkas dan detail lengkap muncul di panel `Output` Studio.
 8. Klik `Pull Studio` untuk mirror Studio ke folder lokal. Widget akan menampilkan preview add/update/delete/unchanged, lalu kamu harus pilih `Confirm` atau `Cancel`.
@@ -533,14 +553,17 @@ Widget menampilkan hint pendek untuk error umum:
 - `Invalid JSON`: cek syntax JSON, koma, bracket, dan typed value.
 - `Unsupported property`: cek nama/type property atau tambahkan ke `extra_allowed_properties`.
 - `Unsupported class`: cek `className` dan `managed_roots`.
-- `Unmanaged conflict`: rename/remove instance di Studio atau jadikan target managed.
+- `Unmanaged conflict`: upsert otomatis mengadopsi object existing bila path persis sama, class cocok, dan StableId tidak bertentangan. Class berbeda, sibling ambigu, rename/delete, atau ID berbeda tetap dihentikan agar object tidak tertukar.
 - `Duplicate stable id`: ganti/hapus duplicate `id` di `properties.init.json`.
+- Duplicate sibling dengan `Name` dan `ClassName` yang sama didukung memakai suffix stable ID internal (`~rid_...`) pada folder lokal. Suffix tersebut bukan bagian dari `Name` object di Roblox Studio.
 - `Server offline / HTTP disabled`: jalankan `.\riftsync.exe` lalu klik **Start**, atau gunakan `.\riftsync-server.exe --headless` untuk debug terminal. Cek host/port dan aktifkan HTTP Requests di Studio.
 
 ### Troubleshooting Server
 
 - Progress berhenti di fase **Uploading/indexing**: request Roblox masih berjalan sebagai satu HTTP request; desktop menampilkan progres penulisan server dan Studio memakai indikator indeterminate sampai respons kembali.
-- Folder lokal kosong pada mode **Folder -> Studio** otomatis di-seed dari Studio. Gunakan **Pull Studio** manual hanya jika ingin melihat preview perubahan pada project yang sudah berisi data.
+- Pilihan sumber selalu muncul setiap `Start Sync` dan tidak diingat otomatis. Pilih **Use Studio** bila perubahan terakhir ada di Studio; pilih **Use Local** hanya bila folder lokal memang harus menjadi sumber utama.
+- Untuk error StableId duplikat, nyalakan **Force ID repair** lalu pilih sumber yang benar: **Use Studio** membuat ID baru dari object Studio lalu mengganti local dengan backup; **Use Local** mempertahankan ID dari file local dan memasangnya kembali ke object Studio. Folder ignored dan subtree rollback tidak disentuh. Bila bootstrap gagal, RiftSync mencoba mengembalikan ID Studio lama dan berhenti tanpa masuk live sync.
+- Snapshot recovery milik tool lain diabaikan otomatis bila berupa child langsung `ServerStorage` dengan nama tersembunyi berpola `__*Rollback*` (tidak peka huruf besar/kecil). Salinan rollback tetap berada di Studio, tetapi atribut StableId di dalam backup tidak ikut dianggap sebagai identity aktif RiftSync.
 - Metadata di bawah Model/Part yang belum ada di Studio dilewati sebagai warning teragregasi; RiftSync tidak membuat geometry pengganti.
 - Port sudah dipakai: jalankan dengan `--port 8766`, lalu samakan port di widget Studio.
 - HTTP Requests belum aktif: buka `Game Settings -> Security -> Allow HTTP Requests`.
@@ -552,7 +575,7 @@ Widget menampilkan hint pendek untuk error umum:
 ## Menjadikan RBXM
 
 1. Di Studio, buat `Model` bernama `RiftSyncPluginModel`.
-2. Pindahkan `RiftSyncPlugin` beserta child module bertingkat (`API` -> `TypeList`) ke dalam model itu.
+2. Pindahkan `RiftSyncPlugin` beserta child module bertingkat (`API` -> `TypeList` dan `Identity`) ke dalam model itu.
 3. Pilih model tersebut.
 4. `File -> Export Selection...` lalu simpan sebagai `.rbxm`.
 

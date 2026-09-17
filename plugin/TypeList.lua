@@ -1,6 +1,6 @@
 local TypeList = {}
 
-TypeList.VERSION = "4.1.3"
+TypeList.VERSION = "4.1.11"
 TypeList.PROTOCOL = "rbxsync/2.0.0"
 TypeList.PLUGIN_ICON = "rbxassetid://72034413544662"
 TypeList.CHANGE_ENCODINGS = {
@@ -26,6 +26,7 @@ TypeList.DEFAULT_STRICT_PROPERTY_WHITELIST = false
 TypeList.DEFAULT_EXTRA_ALLOWED_PROPERTIES = {}
 
 TypeList.ENDPOINTS = {
+	Health = "/health",
 	Handshake = "/handshake",
 	Snapshot = "/snapshot",
 	Changes = "/changes",
@@ -544,8 +545,8 @@ TypeList.CLASS_PROPERTY_WHITELIST = {
 	PointLight = {},
 	SpotLight = {},
 	SurfaceLight = {},
-	Decal = { "Color3", "LocalTransparencyModifier", "Texture", "Transparency", "ZIndex" },
-	Texture = { "Color3", "OffsetStudsU", "OffsetStudsV", "StudsPerTileU", "StudsPerTileV", "Texture", "Transparency", "ZIndex" },
+	Decal = { "Color3", "Face", "LocalTransparencyModifier", "Texture", "Transparency", "ZIndex" },
+	Texture = { "Color3", "Face", "OffsetStudsU", "OffsetStudsV", "StudsPerTileU", "StudsPerTileV", "Texture", "Transparency", "ZIndex" },
 	SurfaceAppearance = { "AlphaMode", "Color", "ColorMap", "MetalnessMap", "NormalMap", "RoughnessMap" },
 	SpecialMesh = { "MeshId", "MeshType", "Offset", "Scale", "TextureId", "VertexColor" },
 	BlockMesh = { "Offset", "Scale", "VertexColor" },

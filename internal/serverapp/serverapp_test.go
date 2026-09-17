@@ -21,6 +21,9 @@ func TestRunnerStartStopAndHealth(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "sync_config.json")
 	syncRoot := filepath.Join(root, "game")
+	if err := os.MkdirAll(syncRoot, 0o755); err != nil {
+		t.Fatalf("mkdir sync root: %v", err)
+	}
 	port := freePort(t)
 	body := map[string]any{
 		"host":                   "127.0.0.1",
@@ -59,26 +62,8 @@ func TestRunnerStartStopAndHealth(t *testing.T) {
 			t.Fatalf("service dir %s missing or not dir after start: info=%#v err=%v", dir, info, err)
 		}
 	}
-	if body, err := os.ReadFile(filepath.Join(syncRoot, config.GuidebookDir, "README.md")); err != nil {
-		t.Fatalf("guidebook missing after start: %v", err)
-	} else if !strings.Contains(string(body), "RiftSync Guidebook") {
-		t.Fatalf("guidebook content = %q, want RiftSync Guidebook", string(body))
-	}
-	if body, err := os.ReadFile(filepath.Join(syncRoot, config.GuidebookDir, config.GuidebookExecLauncher)); err != nil {
-		t.Fatalf("guidebook exec launcher missing after start: %v", err)
-	} else if !strings.Contains(string(body), "--config") || !strings.Contains(string(body), " exec @execArgs") {
-		t.Fatalf("guidebook exec launcher content = %q", string(body))
-	}
-	statusBody, err := os.ReadFile(filepath.Join(syncRoot, config.GuidebookDir, config.GuidebookStatus))
-	if err != nil {
-		t.Fatalf("guidebook status missing after start: %v", err)
-	}
-	var statusPayload config.GuidebookStatusPayload
-	if err := json.Unmarshal(statusBody, &statusPayload); err != nil {
-		t.Fatalf("decode guidebook status: %v", err)
-	}
-	if statusPayload.ConfigPath != configPath || statusPayload.SyncRoot != syncRoot || statusPayload.Version != Version || statusPayload.LastKnownRevision != status.Revision {
-		t.Fatalf("guidebook status payload = %#v, runner status=%#v", statusPayload, status)
+	if _, err := os.Stat(filepath.Join(syncRoot, config.GuidebookDir)); !os.IsNotExist(err) {
+		t.Fatalf("expected .guidebook to not exist after start, err=%v", err)
 	}
 
 	resp, err := http.Get("http://" + status.Host + ":" + strconv.Itoa(status.Port) + "/health")
@@ -111,6 +96,9 @@ func TestRunnerStartReportsPortConflictSynchronously(t *testing.T) {
 	configPath := filepath.Join(root, "sync_config.json")
 	cfg := config.Default()
 	cfg.SyncRoot = filepath.Join(root, "game")
+	if err := os.MkdirAll(cfg.SyncRoot, 0o755); err != nil {
+		t.Fatalf("mkdir sync root: %v", err)
+	}
 	cfg.Port = listener.Addr().(*net.TCPAddr).Port
 	if err := config.Save(configPath, cfg); err != nil {
 		t.Fatal(err)
@@ -183,6 +171,9 @@ func TestHybridSafetyScannerDetectsNestedLocalSave(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "sync_config.json")
 	syncRoot := filepath.Join(root, "game")
+	if err := os.MkdirAll(syncRoot, 0o755); err != nil {
+		t.Fatalf("mkdir sync root: %v", err)
+	}
 	port := freePort(t)
 	configBody, err := json.Marshal(map[string]any{
 		"host":                   "127.0.0.1",

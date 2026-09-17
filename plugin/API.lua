@@ -1,15 +1,193 @@
 local SyncAPI = {}
 SyncAPI.__index = SyncAPI
 
-local TypeList = require(script:WaitForChild("TypeList"))
+local function requireChildModule(parent : Instance, childName : string)
+	local child = parent:FindFirstChild(childName)
+	if not child then
+			error(
+			"[RiftSync] Missing API module '"
+				.. childName
+				.. "'. Rebuild/reinstall RiftSyncPlugin.rbxm or RiftSyncPlugin.rbxmx with scripts/build-plugin.sh. Expected hierarchy: RiftSyncPlugin > API > "
+				.. childName
+				.. "."
+			)
+	end
+	return require(child)
+end
+
+local TypeList = requireChildModule(script, "TypeList")
+
+-- Keep older local-plugin copies loadable while they are being replaced from
+-- Studio. New artifacts always include the standalone Identity ModuleScript;
+-- this fallback only prevents an old in-memory plugin from crashing before it
+-- can be saved again.
+local function buildLegacyIdentityFallback()
+	local legacyIdentity = {}
+
+	function legacyIdentity.isExplicitStableId(value)
+		return type(value) == "string" and value ~= "" and string.sub(value, 1, 5) ~= "path:"
+	end
+
+	function legacyIdentity.localSegmentHasStableId(value)
+		if type(value) ~= "string" then
+			return false
+		end
+		local marker = "~rid_"
+		local markerIndex = string.find(value, marker, 1, true)
+		return markerIndex ~= nil and markerIndex > 1 and string.sub(value, markerIndex + #marker) ~= ""
+	end
+
+	function legacyIdentity.resolveName(candidates, name, stableId)
+		local matches = {}
+		for _, candidate in ipairs(candidates or {}) do
+			if candidate.name == name and (stableId == "" or candidate.stableId == stableId) then
+				table.insert(matches, candidate)
+			end
+		end
+		if #matches == 1 then
+			return matches[1], nil
+		end
+		if #matches > 1 then
+			return nil, "multiple candidates share the same identity"
+		end
+		return nil, nil
+	end
+
+	function legacyIdentity.canAdoptExactTarget(change, candidate)
+		if type(change) ~= "table" or type(candidate) ~= "table" then
+			return false
+		end
+		if tostring(change.op or "upsert") ~= "upsert" then
+			return false
+		end
+		local desiredPath = change.new_rbx_path or change.rbx_path or ""
+		local payload = type(change.payload) == "table" and change.payload or {}
+		local expectedClass = change.class_name or payload.className or payload["$className"] or ""
+		if desiredPath == ""
+			or candidate.rbxPath ~= desiredPath
+			or expectedClass == ""
+			or candidate.className ~= expectedClass
+		then
+			return false
+		end
+		local desiredStableId = change.stable_id or payload.id or payload["$id"] or payload.syncId or ""
+		local candidateStableId = candidate.stableId or ""
+		return not (legacyIdentity.isExplicitStableId(desiredStableId)
+			and legacyIdentity.isExplicitStableId(candidateStableId)
+			and desiredStableId ~= candidateStableId)
+	end
+
+	function legacyIdentity.buildApplyPlan(changes, candidates)
+		-- The full planner lives in Identity.lua. The fallback deliberately does
+		-- not mutate Studio; it only lets the legacy artifact boot safely.
+		local steps = {}
+		for _, change in ipairs(changes or {}) do
+			table.insert(steps, {
+				operation = change.op or "upsert",
+				action = "create",
+				target = nil,
+				change = change,
+			})
+		end
+		return { steps = steps, conflicts = {} }
+	end
+
+	return legacyIdentity
+end
+
+local identityModule = script:FindFirstChild("Identity")
+local Identity
+if identityModule then
+	Identity = require(identityModule)
+else
+	Identity = buildLegacyIdentityFallback()
+	warn(
+		"[RiftSync] Identity ModuleScript tidak ditemukan; compatibility fallback aktif. "
+			.. "Rebuild plugin untuk memasukkan API > Identity."
+	)
+end
 
 local httpService = game:GetService("HttpService")
 local scriptEditorService = game:GetService("ScriptEditorService")
 local runService = game:GetService("RunService")
 local playersService = game:GetService("Players")
+local changeHistoryService = game:GetService("ChangeHistoryService")
 
 local DEBUG_EVENT_LIMIT = 28
 local SERVER_DEBUG_PULL_INTERVAL = 2.0
+local activeMutationJournal = nil
+local clearStudioStableIds
+local restoreStudioStableIds
+
+local function beginInitialLocalApplyRecording()
+	local ok, identifier = pcall(function()
+		return changeHistoryService:TryBeginRecording(
+			"RiftSyncStartFromLocal",
+			"RiftSync: Start from Local"
+		)
+	end)
+	if ok and typeof(identifier) == "string" and identifier ~= "" then
+		return "recording", identifier
+	end
+
+	local waypointOk = pcall(function()
+		changeHistoryService:SetWaypoint("RiftSync: Before Start from Local")
+	end)
+	if waypointOk then
+		return "waypoint", nil
+	end
+	return "none", nil
+end
+
+local function finishInitialLocalApplyRecording(recordingKind : string, identifier : string?, preserveUndo : boolean)
+	if recordingKind == "recording" and identifier then
+		pcall(function()
+			changeHistoryService:FinishRecording(
+				identifier,
+				preserveUndo and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel
+			)
+		end)
+	elseif recordingKind == "waypoint" and preserveUndo then
+		pcall(function()
+			changeHistoryService:SetWaypoint("RiftSync: Start from Local complete")
+		end)
+	end
+end
+
+local function beginForceIdentityRepairRecording()
+	local ok, identifier = pcall(function()
+		return changeHistoryService:TryBeginRecording(
+			"RiftSyncForceIdentityRepair",
+			"RiftSync: Force identity repair"
+		)
+	end)
+	if ok and typeof(identifier) == "string" and identifier ~= "" then
+		return "recording", identifier
+	end
+
+	local waypointOk = pcall(function()
+		changeHistoryService:SetWaypoint("RiftSync: Before force identity repair")
+	end)
+	if waypointOk then
+		return "waypoint", nil
+	end
+	return "none", nil
+end
+
+local function finishForceIdentityRepairRecording(recordingKind : string, identifier : string?, preserveUndo : boolean)
+	if recordingKind == "recording" and identifier then
+		pcall(function()
+			changeHistoryService:FinishRecording(
+				identifier,
+				preserveUndo and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel
+			)
+		end)
+	elseif recordingKind == "waypoint" and preserveUndo then
+		pcall(function()
+			changeHistoryService:SetWaypoint("RiftSync: Force identity repair complete")
+		end)
+	end
+end
 
 local function isManagedAttributeName(attributeName : any)
 	if typeof(attributeName) ~= "string" then
@@ -28,7 +206,31 @@ local function isManagedAttributeName(attributeName : any)
 	return string.sub(string.lower(attributeName), 1, 10) == "_rbxlsync_"
 end
 
+local function isStudioRollbackPath(pathValue : any)
+	if typeof(pathValue) ~= "string" then
+		return false
+	end
+
+	local normalisedPath = pathValue
+	if string.sub(normalisedPath, 1, 5) == "game." then
+		normalisedPath = string.sub(normalisedPath, 6)
+	end
+
+	local serverStoragePrefix = "ServerStorage."
+	if string.sub(normalisedPath, 1, #serverStoragePrefix) ~= serverStoragePrefix then
+		return false
+	end
+
+	local relativePath = string.sub(normalisedPath, #serverStoragePrefix + 1)
+	local rootFolderName = string.match(relativePath, "^[^%.]+") or relativePath
+	return string.sub(rootFolderName, 1, 2) == "__"
+		and string.find(string.lower(rootFolderName), "rollback", 1, true) ~= nil
+end
+
 local function isIgnoredPath(pathValue : string, ignoredPaths : {string})
+	if isStudioRollbackPath(pathValue) then
+		return true
+	end
 	if TypeList.isIgnoredRbxPath then
 		return TypeList.isIgnoredRbxPath(pathValue, ignoredPaths)
 	end
@@ -95,11 +297,13 @@ local function encodeLocalSegment(value : string)
 
 	local endsWithDotOrSpace = string.match(value, "[%.%s]$") ~= nil
 	local looksLikeEncodedPrefix = string.match(value, "^~x_[%x]*$") ~= nil
+	local containsIdentityMarker = string.find(value, "~rid_", 1, true) ~= nil
 	local shouldEncode = value == ""
 		or hasInvalidWindowsChar
 		or endsWithDotOrSpace
 		or isReserved
 		or looksLikeEncodedPrefix
+		or containsIdentityMarker
 
 	if not shouldEncode then
 		return value
@@ -123,6 +327,44 @@ local function getServiceByName(serviceName : string)
 	end
 
 	return game:FindFirstChild(serviceName)
+end
+
+local function findUniqueChild(parent : Instance, childName : string, className : string?)
+	local found = nil
+	for _, child in ipairs(parent:GetChildren()) do
+		if child.Name == childName and (className == nil or className == "" or child.ClassName == className) then
+			if found then
+				local classHint = if className and className ~= "" then "." .. className else ""
+				return nil,
+					"AMBIGUOUS_SIBLING: multiple children named "
+						.. childName
+						.. classHint
+						.. " under "
+						.. parent:GetFullName()
+						.. "; rename one of them before syncing"
+			end
+			found = child
+		end
+	end
+	return found, nil
+end
+
+local function findChildByStableId(parent : Instance, stableId : string)
+	local found = nil
+	for _, child in ipairs(parent:GetChildren()) do
+		local childStableId = child:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+		if childStableId == stableId or child:GetAttribute("SyncId") == stableId then
+			if found then
+				return nil,
+					"AMBIGUOUS_STABLE_ID: multiple direct children under "
+						.. parent:GetFullName()
+						.. " use stable ID "
+						.. stableId
+			end
+			found = child
+		end
+	end
+	return found, nil
 end
 
 local function buildGamePath(instance : Instance)
@@ -195,6 +437,9 @@ local function decodeJson(body : string)
 end
 
 local function setScriptSource(target : LuaSourceContainer, source : string)
+	if activeMutationJournal then
+		activeMutationJournal:touch(target)
+	end
 	local updated = false
 
 	local updateSuccess = pcall(function()
@@ -231,7 +476,10 @@ local function resolvePath(path : string)
 	end
 
 	for index = 3, #segments do
-		local child = current:FindFirstChild(segments[index])
+		local child, childError = findUniqueChild(current, segments[index])
+		if childError then
+			return nil, childError
+		end
 		if not child then
 			return nil
 		end
@@ -255,13 +503,19 @@ local function ensureParentPath(path : string)
 	local current = root
 	for index = 3, #segments - 1 do
 		local childName = segments[index]
-		local existing = current:FindFirstChild(childName)
-
-		if not existing then
-			existing = Instance.new("Folder")
-			existing.Name = childName
-			existing.Parent = current
+		local existing, existingError = findUniqueChild(current, childName)
+		if existingError then
+			return nil, nil, existingError
 		end
+
+			if not existing then
+				existing = Instance.new("Folder")
+				if activeMutationJournal then
+					activeMutationJournal:recordCreated(existing)
+				end
+				existing.Name = childName
+				existing.Parent = current
+			end
 
 		current = existing
 	end
@@ -316,7 +570,10 @@ local function replaceManagedConflict(parent : Instance, targetName : string, cl
 		return true
 	end
 
-	local existing = parent:FindFirstChild(targetName)
+	local existing, existingError = findUniqueChild(parent, targetName)
+	if existingError then
+		return nil, existingError
+	end
 	if not existing then
 		return nil
 	end
@@ -341,7 +598,11 @@ local function replaceManagedConflict(parent : Instance, targetName : string, cl
 			for _, child in ipairs(existing:GetChildren()) do
 				child.Parent = upgraded
 			end
-			existing:Destroy()
+			if activeMutationJournal then
+				activeMutationJournal:remove(existing)
+			else
+				existing:Destroy()
+			end
 			return upgraded
 		end
 	end
@@ -970,6 +1231,7 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 	self.clientId = getPluginSetting(pluginInstance, "ClientId") or httpService:GenerateGUID(false)
 	self.lastAppliedRevision = tonumber(getPluginSetting(pluginInstance, "LastRevision")) or 0
 	self.running = false
+	self.forceIdentityRepair = false
 	self.sessionId = ""
 	self.runToken = 0
 	self.initialSyncInProgress = false
@@ -983,6 +1245,7 @@ function SyncAPI.new(pluginInstance : Plugin, updateStatusCallback : (string, bo
 	self.startMode = TypeList.normaliseStartMode(tostring(configuredStartMode or ""))
 	self.serverIndexedCount = 0
 	self.serverSyncRootEmpty = false
+	self.syncRootEmpty = false
 	self.serverSyncRootInitialized = false
 	self.changeEncoding = TypeList.CHANGE_ENCODINGS and TypeList.CHANGE_ENCODINGS.Compact or "compact-json-v1"
 	self.debugEnabled = getPluginSetting(pluginInstance, "DebugEnabled") == true
@@ -1286,6 +1549,14 @@ function SyncAPI:setStartMode(mode : string)
 	self.plugin:SetSetting(SETTING_KEYS.StartMode, self.startMode)
 end
 
+function SyncAPI:setForceIdentityRepair(enabled : boolean)
+	self.forceIdentityRepair = enabled == true
+end
+
+function SyncAPI:isForceIdentityRepairEnabled()
+	return self.forceIdentityRepair == true
+end
+
 function SyncAPI:isRunning()
 	return self.running
 end
@@ -1412,6 +1683,8 @@ function SyncAPI:buildDebugPayload()
 			last_change_count = self.debugState.lastPollChangeCount,
 			poll_error_count = self.debugState.pollErrorCount,
 			last_error = self.debugState.lastError,
+			last_apply = self.lastApplyStats or {},
+			last_conflicts = (self.lastApplyStats and self.lastApplyStats.conflicts) or {},
 			remote_exec_enabled = self.remoteExecEnabled == true,
 			remote_exec_token_configured = tokenConfigured,
 			remote_exec_auth_error = self.lastExecAuthError == true,
@@ -1609,6 +1882,9 @@ function SyncAPI:reportActivity(text : any, isError : boolean?, meta : any?)
 		indeterminate = indeterminate,
 		revision = tonumber(self.lastAppliedRevision) or 0,
 	}
+	if typeof(metaValue.details) == "table" then
+		payload.details = metaValue.details
+	end
 
 	local body
 	local encodeOk = pcall(function()
@@ -2039,13 +2315,17 @@ function SyncAPI:applyRename(change : {[string]: any}, revision : number)
 		return true
 	end
 
-	local indexes = buildManagedIndexes(self.managedRoots)
+	local indexes = buildManagedIndexes(self.managedRoots, self.ignoredRbxPaths)
 	local existing = nil
 	if typeof(change.old_local_path) == "string" and change.old_local_path ~= "" then
 		existing = indexes.byLocalPath[change.old_local_path]
 	end
 	if not existing then
-		existing = resolvePath(oldPath)
+		local resolveError
+		existing, resolveError = resolvePath(oldPath)
+		if resolveError then
+			return false, resolveError
+		end
 	end
 	if not existing then
 		if typeof(change.source) == "string" then
@@ -2071,7 +2351,10 @@ function SyncAPI:applyRename(change : {[string]: any}, revision : number)
 		return false, parentError
 	end
 
-	local occupied = newParent:FindFirstChild(newName)
+	local occupied, occupiedError = findUniqueChild(newParent, newName)
+	if occupiedError then
+		return false, occupiedError
+	end
 	if occupied and occupied ~= existing then
 		if occupied:GetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged) then
 			occupied:Destroy()
@@ -2097,6 +2380,11 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 			skipped = 0,
 			warnings = 0,
 			errors = 0,
+			phase = "apply",
+			conflicts = {},
+			rollback_status = "not_needed",
+			rolled_back_count = 0,
+			rollback_errors = {},
 		}
 	end
 
@@ -2195,6 +2483,9 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 	return wasSuccessful, errors, notices, {
 		total = #orderedChanges,
 		applied = appliedCount,
+		skipped = skippedCount,
+		warnings = #notices,
+		errors = #errors,
 	}
 end
 
@@ -2235,6 +2526,12 @@ function SyncAPI:fetchSnapshot()
 		self.debugState.snapshot = false
 		self:setDebugError(buildErrorSummary("Snapshot apply gagal", errors, 3))
 		warnErrorList("Snapshot apply", errors)
+		self.updateStatus(buildErrorSummary("Snapshot apply gagal", errors, 3), true, {
+			operation = "folder_to_studio",
+			phase = typeof(applyStats) == "table" and (applyStats.phase or "apply") or "apply",
+			progress = 100,
+			details = applyStats,
+		})
 		return false, buildErrorSummary("Snapshot apply gagal", errors, 3)
 	end
 
@@ -2265,6 +2562,20 @@ function SyncAPI:fetchSnapshot()
 	end
 	self:pushDebugUpdate()
 	return true
+end
+
+function SyncAPI:fetchHealth()
+	local response, err = self:requestJson("GET", TypeList.ENDPOINTS.Health or "/health", nil, nil, { quiet = true })
+	if typeof(response) == "table" and response.status == "ok" then
+		local count = tonumber(response.indexed_entry_count)
+		if not count then
+			count = (tonumber(response.indexed_script_count) or 0) + (tonumber(response.indexed_ui_count) or 0)
+		end
+		self.serverIndexedCount = count
+		self.syncRootEmpty = response.sync_root_empty == true
+		return true, response
+	end
+	return false, err
 end
 
 function SyncAPI:performHandshake()
@@ -2392,6 +2703,12 @@ function SyncAPI:pollChanges()
 	end
 	self:setDebugError(buildErrorSummary("Delta apply gagal", errors, 3))
 	warnErrorList("Delta apply", errors)
+	self.updateStatus(buildErrorSummary("Delta apply gagal", errors, 3), true, {
+		operation = "folder_to_studio",
+		phase = typeof(applyStats) == "table" and (applyStats.phase or "apply") or "apply",
+		progress = 100,
+		details = applyStats,
+	})
 	return false, buildErrorSummary("Delta apply gagal", errors, 3), "apply"
 end
 
@@ -2668,7 +2985,16 @@ end
 
 function SyncAPI:runLoop(runToken : number)
 	self:resetDebugState()
-	self:appendDebugEvent("Run loop dimulai (mode=" .. tostring(self.startMode) .. ")", false)
+	local identityRepairPending = self.forceIdentityRepair == true
+	self.forceIdentityRepair = false
+	self:appendDebugEvent(
+		"Run loop dimulai (mode="
+			.. tostring(self.startMode)
+			.. ", force_ids="
+			.. tostring(identityRepairPending)
+			.. ")",
+		false
+	)
 	local function acceptBootstrapRevision(response : {[string]: any})
 		local revision = tonumber(response.server_rev) or self.lastAppliedRevision
 		self.lastAppliedRevision = revision
@@ -2694,6 +3020,37 @@ function SyncAPI:runLoop(runToken : number)
 		local readyForPolling = true
 		local initialStatusText = nil
 		if self.startMode == TypeList.START_MODES.StudioToFolder then
+			local forceRepairThisStart = identityRepairPending
+			local clearedIdentityEntries = nil
+			local repairRecordingKind = "none"
+			local repairRecordingIdentifier = nil
+			if forceRepairThisStart then
+				identityRepairPending = false
+				repairRecordingKind, repairRecordingIdentifier = beginForceIdentityRepairRecording()
+				self.updateStatus("Force ID repair: clearing Studio identities... (12%)", false, {
+					operation = "studio_to_folder",
+					phase = "repairing_identity",
+					progress = 12,
+					indeterminate = true,
+				})
+				local clearError
+				local clearedIdentityCount
+				clearedIdentityEntries, clearError, clearedIdentityCount = clearStudioStableIds(self)
+				if not clearedIdentityEntries then
+					finishForceIdentityRepairRecording(repairRecordingKind, repairRecordingIdentifier, false)
+					self.running = false
+					self.updateStatus("Not synced - force ID repair gagal: " .. tostring(clearError), true, {
+						operation = "studio_to_folder",
+						phase = "repairing_identity",
+						progress = 100,
+					})
+					return
+				end
+				self:appendDebugEvent(
+					"Force ID repair membersihkan " .. tostring(clearedIdentityCount or 0) .. " identity Studio",
+					false
+				)
+			end
 			self.updateStatus("Preparing Studio snapshot... (15%)", false, {
 				operation = "studio_to_folder",
 				phase = "enumerating",
@@ -2702,63 +3059,144 @@ function SyncAPI:runLoop(runToken : number)
 			})
 			local didBootstrap, bootstrapResponse = self:pushStudioSnapshot()
 			if not didBootstrap then
+				if forceRepairThisStart then
+					local restored, _, restoreErrors = restoreStudioStableIds(clearedIdentityEntries)
+					finishForceIdentityRepairRecording(
+						repairRecordingKind,
+						repairRecordingIdentifier,
+						not restored
+					)
+					local restoreSuffix = restored
+						and " ID lama sudah dikembalikan."
+						or (" Pemulihan ID lama juga gagal: " .. table.concat(restoreErrors, " | "))
+					self.running = false
+					self.updateStatus(
+						"Not synced - force ID repair gagal: " .. tostring(bootstrapResponse) .. "." .. restoreSuffix,
+						true,
+						{
+							operation = "studio_to_folder",
+							phase = "repairing_identity",
+							progress = 100,
+						}
+					)
+					return
+				end
 				readyForPolling = false
 				self:waitBeforeReconnect(runToken, "bootstrap failed: " .. tostring(bootstrapResponse))
 			else
+				if forceRepairThisStart then
+					finishForceIdentityRepairRecording(repairRecordingKind, repairRecordingIdentifier, true)
+					self:appendDebugEvent("Force ID repair Studio -> Local selesai", false)
+				end
 				local revision = acceptBootstrapRevision(bootstrapResponse)
-				initialStatusText = "Studio snapshot uploaded - rev " .. tostring(revision)
+				initialStatusText = (forceRepairThisStart and "Force ID repair complete - " or "")
+					.. "Studio snapshot uploaded - rev "
+					.. tostring(revision)
 			end
 		else
-			if self.serverSyncRootEmpty == true and self.serverSyncRootInitialized ~= true then
-				self.updateStatus("Local folder is empty - pulling Studio automatically... (15%)", false, {
-					operation = "studio_to_folder",
-					phase = "auto_pull",
-					progress = 15,
-					indeterminate = true,
-				})
-				local didBootstrap, bootstrapResponse = self:pushStudioSnapshot("replace", "Auto Pull Studio")
-				if not didBootstrap then
-					readyForPolling = false
-					self:waitBeforeReconnect(runToken, "auto pull failed: " .. tostring(bootstrapResponse))
-				else
-					local revision = acceptBootstrapRevision(bootstrapResponse)
-					initialStatusText = "Local folder seeded automatically from Studio - rev " .. tostring(revision)
-				end
-			else
-				self.updateStatus("Fetching local snapshot... (35%)", false, {
+			self.updateStatus("Fetching local snapshot... (35%)", false, {
+				operation = "folder_to_studio",
+				phase = "fetching",
+				progress = 35,
+				indeterminate = true,
+			})
+			self.initialSyncInProgress = true
+			self.lastApplyStats = nil
+			local recordingKind, recordingIdentifier = beginInitialLocalApplyRecording()
+			local forceRepairThisStart = identityRepairPending
+			local clearedIdentityEntries = nil
+			if forceRepairThisStart then
+				identityRepairPending = false
+				self.updateStatus("Force ID repair: clearing Studio identities... (25%)", false, {
 					operation = "folder_to_studio",
-					phase = "fetching",
-					progress = 35,
+					phase = "repairing_identity",
+					progress = 25,
 					indeterminate = true,
 				})
-				self.initialSyncInProgress = true
-				local didSnapshot, snapshotError = self:fetchSnapshot()
-				self.initialSyncInProgress = false
-				if not didSnapshot then
-					local snapshotText = tostring(snapshotError)
-					if string.find(string.lower(snapshotText), "apply gagal", 1, true) then
-						self.running = false
-						self.updateStatus("Not synced - snapshot failed: " .. snapshotText, true, {
-							operation = "folder_to_studio",
-							phase = "error",
-							progress = 100,
-						})
-						return
-					end
-					readyForPolling = false
-					self:waitBeforeReconnect(runToken, "snapshot failed: " .. snapshotText)
-				else
-					local stats = self.lastApplyStats or {}
-					initialStatusText = "Synced rev "
-						.. tostring(self.lastAppliedRevision)
-						.. " - "
-						.. tostring(stats.applied or 0)
-						.. " applied, "
-						.. tostring(stats.skipped or 0)
-						.. " skipped, "
-						.. tostring(stats.warnings or 0)
-						.. " warnings"
+				local clearError
+				local clearedIdentityCount
+				clearedIdentityEntries, clearError, clearedIdentityCount = clearStudioStableIds(self)
+				if not clearedIdentityEntries then
+					self.initialSyncInProgress = false
+					finishInitialLocalApplyRecording(recordingKind, recordingIdentifier, false)
+					self.running = false
+					self.updateStatus("Not synced - force ID repair gagal: " .. tostring(clearError), true, {
+						operation = "folder_to_studio",
+						phase = "repairing_identity",
+						progress = 100,
+					})
+					return
 				end
+				self:appendDebugEvent(
+					"Force ID repair membersihkan " .. tostring(clearedIdentityCount or 0) .. " identity Studio",
+					false
+				)
+			end
+			local didSnapshot, snapshotError = self:fetchSnapshot()
+			self.initialSyncInProgress = false
+			local applyStats = self.lastApplyStats or {}
+			local preserveUndo = didSnapshot == true and (tonumber(applyStats.applied) or 0) > 0
+			if not didSnapshot and applyStats.rollback_status == "failed" then
+				preserveUndo = true
+			end
+			local identitiesRestored = true
+			local restoreErrors = {}
+			if forceRepairThisStart then
+				if didSnapshot then
+					preserveUndo = true
+					self:appendDebugEvent("Force ID repair Local -> Studio selesai", false)
+				else
+					identitiesRestored, _, restoreErrors = restoreStudioStableIds(clearedIdentityEntries)
+					if not identitiesRestored then
+						preserveUndo = true
+					end
+				end
+			end
+			finishInitialLocalApplyRecording(recordingKind, recordingIdentifier, preserveUndo)
+			if not didSnapshot then
+				local snapshotText = tostring(snapshotError)
+				if forceRepairThisStart then
+					local restoreSuffix = identitiesRestored
+						and " ID lama sudah dikembalikan."
+						or (" Pemulihan ID lama juga gagal: " .. table.concat(restoreErrors, " | "))
+					self.running = false
+					self.updateStatus(
+						"Not synced - force ID repair gagal: " .. snapshotText .. "." .. restoreSuffix,
+						true,
+						{
+							operation = "folder_to_studio",
+							phase = applyStats.phase or "repairing_identity",
+							progress = 100,
+							details = applyStats,
+						}
+					)
+					return
+				end
+				if string.find(string.lower(snapshotText), "apply gagal", 1, true) then
+					self.running = false
+					local failureStats = self.lastApplyStats or {}
+					self.updateStatus("Not synced - snapshot failed: " .. snapshotText, true, {
+						operation = "folder_to_studio",
+						phase = failureStats.phase or "apply",
+						progress = 100,
+						details = failureStats,
+					})
+					return
+				end
+				readyForPolling = false
+				self:waitBeforeReconnect(runToken, "snapshot failed: " .. snapshotText)
+			else
+				local stats = applyStats
+				initialStatusText = (forceRepairThisStart and "Force ID repair complete - " or "")
+					.. "Synced rev "
+					.. tostring(self.lastAppliedRevision)
+					.. " - "
+					.. tostring(stats.applied or 0)
+					.. " applied, "
+					.. tostring(stats.skipped or 0)
+					.. " skipped, "
+					.. tostring(stats.warnings or 0)
+					.. " warnings"
 			end
 		end
 
@@ -2778,7 +3216,13 @@ function SyncAPI:runLoop(runToken : number)
 			if not ok then
 				if failureKind == "apply" then
 					self.running = false
-					self.updateStatus("Not synced - " .. tostring(pollResult), true)
+					local failureStats = self.lastApplyStats or {}
+					self.updateStatus("Not synced - " .. tostring(pollResult), true, {
+						operation = "folder_to_studio",
+						phase = failureStats.phase or "apply",
+						progress = 100,
+						details = failureStats,
+					})
 					return
 				end
 				self:waitBeforeReconnect(runToken, pollResult)
@@ -2832,6 +3276,7 @@ end
 
 function SyncAPI:stop()
 	self.running = false
+	self.forceIdentityRepair = false
 	self.initialSyncInProgress = false
 	self.remoteExecBusy = false
 	self.lastExecStatus = "Exec disabled"
@@ -3002,6 +3447,7 @@ local INSTANCE_KINDS = TypeList.INSTANCE_KINDS or {
 	Script = "script",
 	UIInstance = "ui_instance",
 }
+local LOCAL_ID_MARKER = "~rid_"
 
 local function decodeLocalSegment(value : string)
 	if string.sub(value, 1, 3) ~= "~x_" then
@@ -3049,12 +3495,25 @@ local SCRIPT_LOCAL_SUFFIX = {
 	ModuleScript = ".module.luau",
 }
 
+local function parseLocalIdentityName(encodedName : string)
+	local markerStart = string.find(encodedName, LOCAL_ID_MARKER, 1, true)
+	if not markerStart or markerStart <= 1 then
+		return decodeLocalSegment(encodedName), ""
+	end
+	local stableId = string.sub(encodedName, markerStart + #LOCAL_ID_MARKER)
+	if stableId == "" or string.find(stableId, "[^%w_%-]") then
+		return decodeLocalSegment(encodedName), ""
+	end
+	return decodeLocalSegment(string.sub(encodedName, 1, markerStart - 1)), stableId
+end
+
 local function parseLocalInstanceSegment(segment : string)
 	local encodedName, className = string.match(segment, "^(.*)%.([^%.]+)$")
 	if not encodedName or encodedName == "" or not className or className == "" then
-		return nil, nil
+		return nil, nil, nil
 	end
-	return decodeLocalSegment(encodedName), className
+	local name, stableId = parseLocalIdentityName(encodedName)
+	return name, className, stableId
 end
 
 local function resolveLocalChangeParent(change : {[string]: any}, entity : string, className : string, useOldPath : boolean?)
@@ -3076,6 +3535,8 @@ local function resolveLocalChangeParent(change : {[string]: any}, entity : strin
 
 	local targetIndex
 	local targetName
+	local targetStableId = ""
+	local parentEndIndex
 	if entity == INSTANCE_KINDS.UIInstance then
 		if parts[#parts] ~= UI_PROPERTIES_FILENAME then
 			return nil, nil, false, "Invalid metadata local path: " .. localPath
@@ -3085,7 +3546,7 @@ local function resolveLocalChangeParent(change : {[string]: any}, entity : strin
 			return nil, service, true, nil
 		end
 		local declaredClass
-		targetName, declaredClass = parseLocalInstanceSegment(parts[targetIndex])
+		targetName, declaredClass, targetStableId = parseLocalInstanceSegment(parts[targetIndex])
 		if not targetName then
 			return nil, nil, false, "Invalid metadata target segment: " .. tostring(parts[targetIndex])
 		end
@@ -3093,6 +3554,7 @@ local function resolveLocalChangeParent(change : {[string]: any}, entity : strin
 			return nil, nil, false,
 				"Metadata class mismatch in local path: " .. tostring(declaredClass) .. " ~= " .. className
 		end
+		parentEndIndex = targetIndex - 1
 	else
 		targetIndex = #parts
 		local suffix = SCRIPT_LOCAL_SUFFIX[className]
@@ -3100,16 +3562,56 @@ local function resolveLocalChangeParent(change : {[string]: any}, entity : strin
 		if not suffix or string.sub(filename, -#suffix) ~= suffix then
 			return nil, nil, false, "Invalid script local path: " .. localPath
 		end
-		targetName = decodeLocalSegment(string.sub(filename, 1, #filename - #suffix))
+		targetName, targetStableId = parseLocalIdentityName(string.sub(filename, 1, #filename - #suffix))
+		parentEndIndex = targetIndex - 1
+		if targetIndex > 2 then
+			local folderName, folderClass, folderStableId = parseLocalInstanceSegment(parts[targetIndex - 1])
+			if folderName == targetName and folderClass == className then
+				if targetStableId ~= "" and folderStableId ~= "" and targetStableId ~= folderStableId then
+					return nil, nil, false, "Script stable ID mismatch in local path: " .. localPath
+				end
+				if targetStableId == "" then
+					targetStableId = folderStableId or ""
+				end
+				parentEndIndex = targetIndex - 2
+			end
+		end
 	end
 
 	local current = service
-	for index = 2, targetIndex - 1 do
-		local childName, expectedClass = parseLocalInstanceSegment(parts[index])
+	for index = 2, parentEndIndex do
+		local childName, expectedClass, expectedStableId = parseLocalInstanceSegment(parts[index])
 		if not childName then
 			return nil, nil, false, "Invalid parent segment in local path: " .. tostring(parts[index])
 		end
-		local child = current:FindFirstChild(childName)
+		local child, childError
+		if expectedStableId ~= "" then
+			child, childError = findChildByStableId(current, expectedStableId)
+			if child and (child.Name ~= childName or child.ClassName ~= expectedClass) then
+				return nil, nil, false,
+					"ORPHAN_PARENT: stable ID points to "
+						.. child:GetFullName()
+						.. " instead of "
+						.. childName
+						.. "."
+						.. expectedClass,
+					targetStableId
+			end
+		else
+			child, childError = findUniqueChild(current, childName, expectedClass)
+			if childError and not child then
+				for _, candidate in ipairs(current:GetChildren()) do
+					if candidate.Name == childName and (expectedClass == nil or expectedClass == "" or candidate.ClassName == expectedClass) then
+						child = candidate
+						childError = nil
+						break
+					end
+				end
+			end
+		end
+		if childError then
+			return nil, nil, false, childError .. " for " .. localPath, targetStableId
+		end
 		if not child then
 			return nil, nil, false,
 				"ORPHAN_PARENT: missing " .. childName .. "." .. expectedClass .. " for " .. localPath
@@ -3127,11 +3629,11 @@ local function resolveLocalChangeParent(change : {[string]: any}, entity : strin
 		current = child
 	end
 
-	return current, targetName, false, nil
+	return current, targetName, false, nil, targetStableId
 end
 
 local function resolveLocalChangeTarget(change : {[string]: any}, entity : string, className : string)
-	local parent, targetNameOrService, isRootService = resolveLocalChangeParent(change, entity, className, false)
+	local parent, targetNameOrService, isRootService, _, targetStableId = resolveLocalChangeParent(change, entity, className, false)
 	if isRootService and typeof(targetNameOrService) == "Instance" then
 		return targetNameOrService
 	end
@@ -3141,18 +3643,148 @@ local function resolveLocalChangeTarget(change : {[string]: any}, entity : strin
 	if parent.Name == targetNameOrService and (className == "" or parent.ClassName == className) then
 		return parent
 	end
-	local target = parent:FindFirstChild(targetNameOrService)
-	if target and (className == "" or target.ClassName == className) then
-		return target
+	local target
+	if targetStableId ~= "" then
+		target = findChildByStableId(parent, targetStableId)
+		if target and (target.Name ~= targetNameOrService or (className ~= "" and target.ClassName ~= className)) then
+			return nil
+		end
+	else
+		target = findUniqueChild(parent, targetNameOrService, className)
 	end
-	return nil
+	return target
 end
 
 local function isManagedInstance(instance : Instance)
 	return instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged) == true
 end
 
+local function newMutationJournal()
+	local journal = {
+		entries = {},
+		seen = {},
+		created = {},
+		removed = {},
+		committed = false,
+	}
+
+	function journal:touch(instance : Instance)
+		if not instance or self.seen[instance] then
+			return
+		end
+		self.seen[instance] = true
+		local attributes = instance:GetAttributes()
+		local tags = collectionService:GetTags(instance)
+		self.entries[#self.entries + 1] = {
+			instance = instance,
+			name = instance.Name,
+			parent = instance.Parent,
+			attributes = attributes,
+			tags = tags,
+			properties = {},
+		}
+	end
+
+	function journal:rememberProperty(instance : Instance, propertyName : string)
+		self:touch(instance)
+		for _, entry in ipairs(self.entries) do
+			if entry.instance == instance and entry.properties[propertyName] == nil then
+				local ok, value = pcall(function()
+					return (instance :: any)[propertyName]
+				end)
+				if ok then
+					entry.properties[propertyName] = { present = true, value = value }
+				end
+				return
+			end
+		end
+	end
+
+	function journal:recordCreated(instance : Instance)
+		if instance and not self.created[instance] then
+			self.created[instance] = true
+			table.insert(self.created, instance)
+		end
+	end
+
+	function journal:remove(instance : Instance)
+		if not instance then
+			return
+		end
+		self:touch(instance)
+		self.removed[instance] = true
+		pcall(function()
+			instance.Parent = nil
+		end)
+	end
+
+	function journal:commit()
+		self.committed = true
+		for instance, _ in pairs(self.removed) do
+			pcall(function()
+				instance:Destroy()
+			end)
+		end
+	end
+
+	function journal:rollback()
+		local errors = {}
+		local restored = 0
+		for index = #self.created, 1, -1 do
+			local instance = self.created[index]
+			local ok, err = pcall(function()
+				instance:Destroy()
+			end)
+			if ok then
+				restored += 1
+			else
+				table.insert(errors, "destroy created " .. tostring(instance) .. ": " .. tostring(err))
+			end
+		end
+		for index = #self.entries, 1, -1 do
+			local entry = self.entries[index]
+			local instance = entry.instance
+			if not self.created[instance] then
+				local ok, err = pcall(function()
+					instance.Name = entry.name
+					instance.Parent = entry.parent
+					for key, value in pairs(entry.attributes) do
+						instance:SetAttribute(key, value)
+					end
+					for key, _ in pairs(instance:GetAttributes()) do
+						if entry.attributes[key] == nil then
+							instance:SetAttribute(key, nil)
+						end
+					end
+					for _, tag in ipairs(collectionService:GetTags(instance)) do
+						collectionService:RemoveTag(instance, tag)
+					end
+					for _, tag in ipairs(entry.tags) do
+						collectionService:AddTag(instance, tag)
+					end
+					for propertyName, property in pairs(entry.properties) do
+						if property.present then
+							(instance :: any)[propertyName] = property.value
+						end
+					end
+				end)
+				if ok then
+					restored += 1
+				else
+					table.insert(errors, "restore " .. instance:GetFullName() .. ": " .. tostring(err))
+				end
+			end
+		end
+		return #errors == 0, restored, errors
+	end
+
+	return journal
+end
+
 local function markManagedInstance(instance : Instance, localPath : string?, revision : number?, stableId : string?, entityKind : string?)
+	if activeMutationJournal then
+		activeMutationJournal:touch(instance)
+	end
 	instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged, true)
 	instance:SetAttribute("ManagedByLocalSync", true)
 	if typeof(localPath) == "string" then
@@ -3172,6 +3804,9 @@ local function markManagedInstance(instance : Instance, localPath : string?, rev
 end
 
 local function ensureStableId(instance : Instance)
+	if activeMutationJournal then
+		activeMutationJournal:touch(instance)
+	end
 	local existing = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
 	if typeof(existing) == "string" and existing ~= "" then
 		return existing
@@ -3180,6 +3815,109 @@ local function ensureStableId(instance : Instance)
 	local generated = httpService:GenerateGUID(false)
 	instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, generated)
 	return generated
+end
+
+restoreStudioStableIds = function(entries)
+	local errors = {}
+	local restored = 0
+	for _, entry in ipairs(entries or {}) do
+		local instance = entry.instance
+		if typeof(instance) == "Instance" and instance.Parent ~= nil then
+			local ok, restoreError = pcall(function()
+				if entry.stableId ~= nil then
+					instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, entry.stableId)
+				end
+				if entry.localPath ~= nil then
+					instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.LocalPath, entry.localPath)
+				end
+				if entry.isManaged ~= nil then
+					instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged, entry.isManaged)
+				end
+				if entry.lastHash ~= nil then
+					instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.LastSyncedHash, entry.lastHash)
+				end
+				if entry.syncId ~= nil then
+					instance:SetAttribute("SyncId", entry.syncId)
+				end
+				if entry.legacyManaged ~= nil then
+					instance:SetAttribute("ManagedByLocalSync", entry.legacyManaged)
+				end
+			end)
+			if ok then
+				restored += 1
+			else
+				table.insert(errors, instance:GetFullName() .. ": " .. tostring(restoreError))
+			end
+		end
+	end
+	return #errors == 0, restored, errors
+end
+
+clearStudioStableIds = function(self)
+	local clearedEntries = {}
+	local clearedCount = 0
+	local visited = {}
+
+	for _, rootPath in ipairs(self.managedRoots or {}) do
+		local rootInstance = resolvePath(rootPath)
+		if rootInstance then
+			local pending = { rootInstance }
+			while #pending > 0 do
+				local instance = table.remove(pending)
+				if not visited[instance] then
+					visited[instance] = true
+					local gamePath = buildGamePath(instance)
+					if not isIgnoredPath(gamePath, self.ignoredRbxPaths or {}) then
+						for _, child in ipairs(instance:GetChildren()) do
+							table.insert(pending, child)
+						end
+
+						local stableId = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+						local localPath = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.LocalPath)
+						local isManaged = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged)
+						local lastHash = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.LastSyncedHash)
+						local syncId = instance:GetAttribute("SyncId")
+						local legacyManaged = instance:GetAttribute("ManagedByLocalSync")
+						local hasAnyAttribute = stableId ~= nil
+							or localPath ~= nil
+							or isManaged ~= nil
+							or lastHash ~= nil
+							or syncId ~= nil
+							or legacyManaged ~= nil
+
+						local entry = {
+							instance = instance,
+							stableId = stableId,
+							localPath = localPath,
+							isManaged = isManaged,
+							lastHash = lastHash,
+							syncId = syncId,
+							legacyManaged = legacyManaged,
+						}
+						table.insert(clearedEntries, entry)
+						if hasAnyAttribute then
+							local ok, clearError = pcall(function()
+								instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, nil)
+								instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.LocalPath, nil)
+								instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged, nil)
+								instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.LastSyncedHash, nil)
+								instance:SetAttribute("SyncId", nil)
+								instance:SetAttribute("ManagedByLocalSync", nil)
+							end)
+							if not ok then
+								local restored, _, restoreErrors = restoreStudioStableIds(clearedEntries)
+								local suffix = restored and "" or ("; restore gagal: " .. table.concat(restoreErrors, " | "))
+								return nil, tostring(clearError) .. suffix, clearedCount
+							end
+							clearedCount += 1
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return clearedEntries, nil, clearedCount
 end
 
 local function isUIInstanceCandidate(instance : Instance)
@@ -3886,7 +4624,19 @@ local function parseRobloxPath(pathValue : string)
 	local current = service
 	for index = 3, #segments - 1 do
 		local childName = segments[index]
-		local child = current:FindFirstChild(childName)
+		local child, childError = findUniqueChild(current, childName)
+		if childError and not child then
+			for _, candidate in ipairs(current:GetChildren()) do
+				if candidate.Name == childName then
+					child = candidate
+					childError = nil
+					break
+				end
+			end
+		end
+		if childError then
+			return nil, nil, false, childError
+		end
 		if not child then
 			return nil, nil, false, "Parent not found for path: " .. tostring(pathValue)
 		end
@@ -4138,14 +4888,36 @@ local function serialiseUiProperties(self, instance : Instance, ensureReferenceS
 	return result
 end
 
-local function buildUiFolderPath(instance : Instance)
+local function hasDuplicateSiblingIdentity(instance : Instance)
+	local parent = instance.Parent
+	if not parent or parent == game then
+		return false
+	end
+	for _, sibling in ipairs(parent:GetChildren()) do
+		if sibling ~= instance and sibling.Name == instance.Name then
+			return true
+		end
+	end
+	return false
+end
+
+local function buildLocalIdentityName(instance : Instance, ensureIdentity)
+	local encodedName = encodeLocalSegment(instance.Name)
+	if not hasDuplicateSiblingIdentity(instance) then
+		return encodedName
+	end
+	local stableId = if ensureIdentity then ensureIdentity(instance) else ensureStableId(instance)
+	return encodedName .. LOCAL_ID_MARKER .. stableId
+end
+
+local function buildUiFolderPath(instance : Instance, ensureIdentity)
 	local segments = {}
 	local current = instance
 	while current and current ~= game do
 		if current.Parent == game then
 			table.insert(segments, 1, encodeLocalSegment(current.Name))
 		else
-			table.insert(segments, 1, encodeLocalSegment(current.Name) .. "." .. current.ClassName)
+			table.insert(segments, 1, buildLocalIdentityName(current, ensureIdentity) .. "." .. current.ClassName)
 		end
 		current = current.Parent
 	end
@@ -4175,13 +4947,13 @@ local SCRIPT_CLASS_TO_SOURCE_SUFFIX = {
 	ModuleScript = ".module.luau",
 }
 
-local function buildScriptSourceFilename(instance : Instance)
+local function buildScriptSourceFilename(instance : Instance, ensureIdentity)
 	local suffix = SCRIPT_CLASS_TO_SOURCE_SUFFIX[instance.ClassName]
 	if not suffix then
 		return nil
 	end
 
-	return encodeLocalSegment(instance.Name) .. suffix
+	return buildLocalIdentityName(instance, ensureIdentity) .. suffix
 end
 
 local function isPropertySyncPath(pathValue : string)
@@ -4242,23 +5014,46 @@ local function hasGeometryAncestorLocalPath(localPath : any)
 	return false
 end
 
-local function buildManagedIndexes(managedRoots : {string})
+local function buildManagedIndexes(managedRoots : {string}, ignoredPaths : {string}?)
 	local byStableId = {}
+	local byStableIdAll = {}
 	local byLocalPath = {}
+	local byLocalPathAll = {}
+	local candidates = {}
+	local visited = {}
 	for _, rootPath in ipairs(managedRoots) do
 		local rootInstance = resolvePath(rootPath)
 		if rootInstance then
 			local instances = rootInstance:GetDescendants()
-			table.insert(instances, rootInstance)
+			table.insert(instances, 1, rootInstance)
 			for _, instance in ipairs(instances) do
-				if isManagedInstance(instance) then
-					local stableId = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
-					if typeof(stableId) == "string" and stableId ~= "" and not byStableId[stableId] then
-						byStableId[stableId] = instance
-					end
-					local localPath = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.LocalPath)
-					if typeof(localPath) == "string" and localPath ~= "" and not byLocalPath[localPath] then
-						byLocalPath[localPath] = instance
+				if not visited[instance] then
+					visited[instance] = true
+					if not isIgnoredPath(buildGamePath(instance), ignoredPaths or {}) and isManagedInstance(instance) then
+						local stableId = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+						local localPath = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.LocalPath)
+						table.insert(candidates, {
+							name = instance.Name,
+							className = instance.ClassName,
+							stableId = typeof(stableId) == "string" and stableId or "",
+							localPath = typeof(localPath) == "string" and localPath or "",
+							rbxPath = instance:GetFullName(),
+							managed = true,
+						})
+						if typeof(stableId) == "string" and stableId ~= "" then
+							byStableIdAll[stableId] = byStableIdAll[stableId] or {}
+							table.insert(byStableIdAll[stableId], instance)
+							if not byStableId[stableId] then
+								byStableId[stableId] = instance
+							end
+						end
+						if typeof(localPath) == "string" and localPath ~= "" then
+							byLocalPathAll[localPath] = byLocalPathAll[localPath] or {}
+							table.insert(byLocalPathAll[localPath], instance)
+							if not byLocalPath[localPath] then
+								byLocalPath[localPath] = instance
+							end
+						end
 					end
 				end
 			end
@@ -4266,12 +5061,16 @@ local function buildManagedIndexes(managedRoots : {string})
 	end
 	return {
 		byStableId = byStableId,
+		byStableIdAll = byStableIdAll,
 		byLocalPath = byLocalPath,
+		byLocalPathAll = byLocalPathAll,
+		candidates = candidates,
 	}
 end
 
-local function buildReferenceIndex(managedRoots : {string})
+local function buildReferenceIndex(managedRoots : {string}, ignoredPaths : {string}?)
 	local byStableId = {}
+	local byStableIdAll = {}
 	local visited = {}
 	for _, rootPath in ipairs(managedRoots or {}) do
 		local rootInstance = resolvePath(rootPath)
@@ -4282,14 +5081,21 @@ local function buildReferenceIndex(managedRoots : {string})
 				if not visited[instance] then
 					visited[instance] = true
 					local stableId = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
-					if typeof(stableId) == "string" and stableId ~= "" and not byStableId[stableId] then
-						byStableId[stableId] = instance
+					if not isIgnoredPath(buildGamePath(instance), ignoredPaths or {})
+						and typeof(stableId) == "string"
+						and stableId ~= ""
+					then
+						byStableIdAll[stableId] = byStableIdAll[stableId] or {}
+						table.insert(byStableIdAll[stableId], instance)
+						if not byStableId[stableId] then
+							byStableId[stableId] = instance
+						end
 					end
 				end
 			end
 		end
 	end
-	return { byStableId = byStableId }
+	return { byStableId = byStableId, byStableIdAll = byStableIdAll }
 end
 
 function SyncAPI:collectStudioSnapshot()
@@ -4299,6 +5105,8 @@ function SyncAPI:collectStudioSnapshot()
 	local skipBreakdown = {}
 	local skipSamples = {}
 	local skipDetails = {}
+	local fatalErrors = {}
+	local fatalLocalPaths = {}
 	local seenLocalPath = {}
 	local seenPropertyStableIds = {}
 	local snapshotCandidates = {}
@@ -4359,7 +5167,20 @@ function SyncAPI:collectStudioSnapshot()
 
 	local function registerLocalPath(localPath : string, sourcePath : string)
 		local existingSource = seenLocalPath[localPath]
-		if typeof(existingSource) == "string" and existingSource ~= "" and existingSource ~= sourcePath then
+		if typeof(existingSource) == "string" and existingSource ~= "" then
+			if not fatalLocalPaths[localPath] then
+				fatalLocalPaths[localPath] = true
+				table.insert(
+					fatalErrors,
+					"Duplicate sibling tidak dapat disimpan ke satu path: "
+						.. localPath
+						.. " ("
+						.. existingSource
+						.. " dan "
+						.. sourcePath
+						.. "). Ubah salah satu Name sebelum sync."
+				)
+			end
 			return false, existingSource
 		end
 		seenLocalPath[localPath] = sourcePath
@@ -4404,12 +5225,17 @@ function SyncAPI:collectStudioSnapshot()
 				local candidate = table.remove(stack)
 				if not visitedInstances[candidate] then
 					visitedInstances[candidate] = true
-					table.insert(snapshotCandidates, candidate)
-					for _, child in ipairs(candidate:GetChildren()) do
-						table.insert(stack, child)
-					end
-					if not publishSnapshotProgress("Enumerating Studio instances", 20, #snapshotCandidates, 0, true) then
-						break
+					local candidatePath = buildGamePath(candidate)
+					if isIgnoredPath(candidatePath, self.ignoredRbxPaths) then
+						noteSkip("ignored_subtree", candidatePath)
+					else
+						table.insert(snapshotCandidates, candidate)
+						for _, child in ipairs(candidate:GetChildren()) do
+							table.insert(stack, child)
+						end
+						if not publishSnapshotProgress("Enumerating Studio instances", 20, #snapshotCandidates, 0, true) then
+							break
+						end
 					end
 				end
 			end
@@ -4417,6 +5243,28 @@ function SyncAPI:collectStudioSnapshot()
 		if cancelled then
 			break
 		end
+	end
+
+	local function ensureSnapshotStableId(instance : Instance)
+		local stableId = ensureStableId(instance)
+		if seenPropertyStableIds[stableId] and seenPropertyStableIds[stableId] ~= instance then
+			local newId = httpService:GenerateGUID(false)
+			local oldId = stableId
+			instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, newId)
+			self:appendDebugEvent(
+				"Auto-healed duplicate StableId pada "
+					.. instance:GetFullName()
+					.. " ("
+					.. oldId
+					.. " -> "
+					.. newId
+					.. ")",
+				false
+			)
+			stableId = newId
+		end
+		seenPropertyStableIds[stableId] = instance
+		return stableId
 	end
 
 	for candidateIndex, candidate in ipairs(snapshotCandidates) do
@@ -4434,7 +5282,7 @@ function SyncAPI:collectStudioSnapshot()
 			continue
 		end
 		local className = candidate.ClassName
-		local sourceFilename = buildScriptSourceFilename(candidate)
+		local sourceFilename = buildScriptSourceFilename(candidate, ensureSnapshotStableId)
 		if not sourceFilename then
 			noteSkip("script_no_suffix", candidate:GetFullName())
 			continue
@@ -4446,7 +5294,7 @@ function SyncAPI:collectStudioSnapshot()
 			continue
 		end
 
-		local folderPath = buildUiFolderPath(candidate)
+		local folderPath = buildUiFolderPath(candidate, ensureSnapshotStableId)
 		local localPath = if folderPath then folderPath .. "/" .. sourceFilename else nil
 		if not localPath then
 			noteSkip("script_duplicate_or_invalid_local_path", gamePath)
@@ -4468,7 +5316,7 @@ function SyncAPI:collectStudioSnapshot()
 			continue
 		end
 
-		local stableId = ensureStableId(candidate)
+		local stableId = ensureSnapshotStableId(candidate)
 		table.insert(files, {
 			entity = INSTANCE_KINDS.Script,
 			local_path = localPath,
@@ -4489,18 +5337,6 @@ function SyncAPI:collectStudioSnapshot()
 		end
 	end
 
-	local function ensureSnapshotStableId(instance : Instance)
-		local stableId = ensureStableId(instance)
-		if seenPropertyStableIds[stableId] and seenPropertyStableIds[stableId] ~= instance then
-			repeat
-				stableId = httpService:GenerateGUID(false)
-			until not seenPropertyStableIds[stableId]
-			instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, stableId)
-		end
-		seenPropertyStableIds[stableId] = instance
-		return stableId
-	end
-
 	local function exportPropertyNode(instance : Instance)
 		if not shouldTrackPropertyInstance(instance, runtimeCharacterRoots) then
 			return
@@ -4512,7 +5348,7 @@ function SyncAPI:collectStudioSnapshot()
 			return
 		end
 
-		local folderPath = buildUiFolderPath(instance)
+		local folderPath = buildUiFolderPath(instance, ensureSnapshotStableId)
 		if not folderPath then
 			noteSkip("properties_invalid_folder_path", gamePath)
 			return
@@ -4575,6 +5411,7 @@ function SyncAPI:collectStudioSnapshot()
 		breakdown = skipBreakdown,
 		samples = skipSamples,
 		details = skipDetails,
+		fatal_errors = fatalErrors,
 		cancelled = cancelled,
 		ownership = ownershipEntries,
 	}
@@ -4599,6 +5436,19 @@ function SyncAPI:pushStudioSnapshot(
 	end
 	if typeof(skipInfo) == "table" and skipInfo.cancelled == true then
 		return false, "Studio snapshot cancelled"
+	end
+	if typeof(skipInfo) == "table" and typeof(skipInfo.fatal_errors) == "table" and #skipInfo.fatal_errors > 0 then
+		local fatalLimit = math.min(#skipInfo.fatal_errors, 5)
+		local fatalMessages = {}
+		for index = 1, fatalLimit do
+			table.insert(fatalMessages, tostring(skipInfo.fatal_errors[index]))
+		end
+		if #skipInfo.fatal_errors > fatalLimit then
+			table.insert(fatalMessages, "+" .. tostring(#skipInfo.fatal_errors - fatalLimit) .. " konflik lain")
+		end
+		local fatalText = "Studio snapshot dibatalkan agar object tidak tertukar: " .. table.concat(fatalMessages, " | ")
+		self:setDebugError(fatalText)
+		return false, fatalText
 	end
 	local mode = bootstrapMode == "merge" and "merge" or "replace"
 
@@ -4768,19 +5618,67 @@ local function removeFromIndexesRecursive(indexes : {[string]: any}, instance : 
 		local stableId = descendant:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
 		if typeof(stableId) == "string" and stableId ~= "" then
 			indexes.byStableId[stableId] = nil
+			if indexes.byStableIdAll then
+				indexes.byStableIdAll[stableId] = nil
+			end
 		end
 		local localPath = descendant:GetAttribute(TypeList.MANAGED_ATTRIBUTES.LocalPath)
 		if typeof(localPath) == "string" and localPath ~= "" then
 			indexes.byLocalPath[localPath] = nil
+			if indexes.byLocalPathAll then
+				indexes.byLocalPathAll[localPath] = nil
+			end
 		end
 	end
 end
 
+local function getIncomingChangeStableId(change : {[string]: any})
+	if typeof(change.stable_id) == "string" and change.stable_id ~= "" then
+		return change.stable_id
+	end
+	local payload = change.payload
+	if typeof(payload) == "table" then
+		for _, key in ipairs({ "id", "$id", "syncId" }) do
+			local value = payload[key]
+			if typeof(value) == "string" and value ~= "" then
+				return value
+			end
+		end
+	end
+	return ""
+end
+
+local function candidateMatchesStableId(candidate : Instance?, incomingStableId : string)
+	if not candidate or incomingStableId == "" then
+		return true
+	end
+	local candidateStableId = candidate:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+	return typeof(candidateStableId) ~= "string"
+		or candidateStableId == ""
+		or candidateStableId == incomingStableId
+end
+
 local function findExistingManagedTarget(change : {[string]: any}, indexes : {[string]: any})
+	local stableId = getIncomingChangeStableId(change)
+	if stableId ~= "" then
+		local candidates = indexes.byStableIdAll and indexes.byStableIdAll[stableId]
+		if candidates and #candidates > 1 then
+			return nil, "AMBIGUOUS_IDENTITY: stable ID " .. stableId .. " belongs to multiple managed instances"
+		end
+		local byId = indexes.byStableId[stableId]
+		if byId then
+			return byId
+		end
+	end
+
 	local localPath = change.local_path
 	if typeof(localPath) == "string" and localPath ~= "" then
+		local candidates = indexes.byLocalPathAll and indexes.byLocalPathAll[localPath]
+		if candidates and #candidates > 1 then
+			return nil, "AMBIGUOUS_IDENTITY: local path " .. localPath .. " belongs to multiple managed instances"
+		end
 		local byLocalPath = indexes.byLocalPath[localPath]
-		if byLocalPath then
+		if byLocalPath and candidateMatchesStableId(byLocalPath, stableId) then
 			return byLocalPath
 		end
 	end
@@ -4793,24 +5691,54 @@ local function findExistingManagedTarget(change : {[string]: any}, indexes : {[s
 	for _, pathValue in ipairs(pathCandidates) do
 		if typeof(pathValue) == "string" then
 			local existing = resolvePath(pathValue)
-			if existing then
+			if existing and candidateMatchesStableId(existing, stableId) then
 				return existing
 			end
 		end
 	end
 
-	local stableId = change.stable_id
-	if typeof(stableId) == "string" and stableId ~= "" then
-		local byId = indexes.byStableId[stableId]
-		if byId then
-			local existingLocalPath = byId:GetAttribute(TypeList.MANAGED_ATTRIBUTES.LocalPath)
-			if tostring(change.op) == "rename" or existingLocalPath == localPath then
-				return byId
+	return nil
+end
+
+local function findAdoptableUnmanagedChild(
+	parent : Instance,
+	targetName : string,
+	expectedClass : string,
+	incomingStableId : string,
+	claimedInstances : {[Instance]: boolean}?
+)
+	local compatible = {}
+	local conflicting = {}
+	for _, child in ipairs(parent:GetChildren()) do
+		if child.Name == targetName and child.ClassName == expectedClass and not isManagedInstance(child) then
+			if not (claimedInstances and claimedInstances[child]) then
+				local childStableId = child:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+				if Identity.isExplicitStableId(incomingStableId)
+					and Identity.isExplicitStableId(childStableId)
+					and childStableId ~= incomingStableId
+				then
+					table.insert(conflicting, child)
+				else
+					table.insert(compatible, child)
+				end
 			end
 		end
 	end
 
-	return nil
+	if #conflicting > 0 and #compatible == 0 then
+		return nil,
+			"AMBIGUOUS_IDENTITY: unmanaged destination "
+				.. conflicting[1]:GetFullName()
+				.. " has a conflicting StableId"
+	end
+	if #compatible > 0 then
+		local selected = compatible[1]
+		if claimedInstances then
+			claimedInstances[selected] = true
+		end
+		return selected, nil
+	end
+	return nil, nil
 end
 
 local function isRestrictedAttributeName(attributeName : string)
@@ -4884,6 +5812,9 @@ local function resolveInstanceReference(encodedValue : {[string]: any}, referenc
 
 	local stableId = tostring(encodedValue.stableId or "")
 	if stableId ~= "" and referenceIndex and referenceIndex.byStableId then
+		if referenceIndex.byStableIdAll and referenceIndex.byStableIdAll[stableId] and #referenceIndex.byStableIdAll[stableId] > 1 then
+			return false, nil, "AMBIGUOUS_IDENTITY: InstanceRef stableId=" .. stableId .. " has multiple candidates"
+		end
 		local byId = referenceIndex.byStableId[stableId]
 		if byId then
 			return true, byId, nil
@@ -5004,6 +5935,9 @@ local function applyUiProperties(self, instance : Instance, payload : {[string]:
 				continue
 			end
 			local ok, err = pcall(function()
+				if activeMutationJournal then
+					activeMutationJournal:rememberProperty(instance, propertyName)
+				end
 				(instance :: any)[propertyName] = decoded
 			end)
 			if not ok then
@@ -5031,6 +5965,9 @@ local function applyUiProperties(self, instance : Instance, payload : {[string]:
 end
 
 local function applyUiAttributesAndTags(instance : Instance, payload : {[string]: any})
+	if activeMutationJournal then
+		activeMutationJournal:touch(instance)
+	end
 	local errors = {}
 	local notices = {}
 	local attributes = payload.attributes or {}
@@ -5159,7 +6096,10 @@ local function createOrUpdateInstance(parent : Instance, config : {[string]: any
 		end
 	end
 	if not existing then
-		local named = parent:FindFirstChild(name)
+		local named, namedError = findUniqueChild(parent, name)
+		if namedError then
+			return nil, namedError
+		end
 		if named and named:IsA(className) then
 			existing = named
 		elseif named and isManagedInstance(named) then
@@ -5267,7 +6207,7 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 		return true, ""
 	end
 
-	local parent, targetNameOrService, isRootService, parentError = resolveLocalChangeParent(
+	local parent, targetNameOrService, isRootService, parentError, targetLocalStableId = resolveLocalChangeParent(
 		change,
 		INSTANCE_KINDS.UIInstance,
 		payload.className,
@@ -5294,8 +6234,23 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 			return false, "ORPHAN_PARENT: metadata target " .. targetPath .. ": " .. tostring(parentError)
 		end
 	end
+	if targetLocalStableId ~= nil and targetLocalStableId ~= "" then
+		if payload.stableId ~= "" and payload.stableId ~= targetLocalStableId then
+			return false,
+				"Local path stable ID mismatch for "
+					.. targetPath
+					.. ": "
+					.. targetLocalStableId
+					.. " ~= "
+					.. payload.stableId
+		end
+		if payload.stableId == "" then
+			payload.stableId = targetLocalStableId
+		end
+	end
 
 	local existing = nil
+	local existingError = nil
 	local rootServiceTarget = nil
 
 	if isRootService then
@@ -5308,42 +6263,105 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 			end
 			existing = workspaceService:FindFirstChildOfClass("Terrain")
 		else
-		existing = findExistingManagedTarget(change, indexes)
-		if existing and not isManagedInstance(existing) then
-			existing = nil
-		end
+			existing, existingError = findExistingManagedTarget(change, indexes)
+			if existingError then
+				return false, existingError
+			end
+			if existing and not isManagedInstance(existing) then
+				local existingStableId = existing:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+				if Identity.isExplicitStableId(payload.stableId)
+					and Identity.isExplicitStableId(existingStableId)
+					and existingStableId ~= payload.stableId
+				then
+					return false,
+						"AMBIGUOUS_IDENTITY: unmanaged destination "
+							.. existing:GetFullName()
+							.. " has a conflicting StableId"
+				end
+			end
 		end
 
 		if existing and not existing:IsA(payload.className) then
 			if isProtectedRootInstance(existing) then
 				return false, "Refused replacing protected root service: " .. existing:GetFullName()
 			end
+			if not isManagedInstance(existing) then
+				return false,
+					"Refused replacing unmanaged instance at "
+						.. existing:GetFullName()
+						.. " (wanted "
+						.. tostring(payload.className)
+						.. ")"
+			end
 			removeFromIndexesRecursive(indexes, existing)
-			existing:Destroy()
+			if activeMutationJournal then
+				activeMutationJournal:remove(existing)
+			else
+				existing:Destroy()
+			end
 			existing = nil
 		end
 
-		if not existing then
-			local occupied = parent:FindFirstChild(targetNameOrService)
-			if occupied and occupied:IsA(payload.className) then
-				existing = occupied
-			elseif occupied and isManagedInstance(occupied) then
-				if isProtectedRootInstance(occupied) then
-					return false, "Refused replacing protected root service: " .. occupied:GetFullName()
-				end
-				removeFromIndexesRecursive(indexes, occupied)
-				occupied:Destroy()
-				occupied = nil
-			else
-				if occupied then
-					return false,
-						"Refused replacing unmanaged instance at "
-							.. occupied:GetFullName()
-							.. " (wanted "
-							.. tostring(payload.className)
-							.. ")"
+		if targetLocalStableId == nil or targetLocalStableId == "" then
+			local occupied, occupiedError = findUniqueChild(parent, targetNameOrService)
+			if occupiedError then
+				return false, occupiedError
+			end
+			if existing and occupied and occupied ~= existing then
+				return false,
+					"AMBIGUOUS_IDENTITY: destination "
+						.. targetPath
+						.. " is already occupied by a different instance"
+			end
+
+			if not existing then
+				if occupied and occupied:IsA(payload.className) then
+					local occupiedStableId = occupied:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+					if payload.stableId ~= ""
+						and typeof(occupiedStableId) == "string"
+						and occupiedStableId ~= ""
+						and occupiedStableId ~= payload.stableId
+					then
+						return false,
+							"AMBIGUOUS_IDENTITY: "
+								.. occupied:GetFullName()
+								.. " has a different stable ID; rename one of the siblings before syncing"
+					end
+					existing = occupied
+				elseif occupied and isManagedInstance(occupied) then
+					if isProtectedRootInstance(occupied) then
+						return false, "Refused replacing protected root service: " .. occupied:GetFullName()
+					end
+					removeFromIndexesRecursive(indexes, occupied)
+					if activeMutationJournal then
+						activeMutationJournal:remove(occupied)
+					else
+						occupied:Destroy()
+					end
+				else
+					if occupied then
+						return false,
+							"Refused replacing unmanaged instance at "
+								.. occupied:GetFullName()
+								.. " (wanted "
+								.. tostring(payload.className)
+								.. ")"
+					end
 				end
 			end
+		elseif not existing then
+			indexes.claimedAdopted = indexes.claimedAdopted or {}
+			local adoptable, adoptError = findAdoptableUnmanagedChild(
+				parent,
+				targetNameOrService,
+				payload.className,
+				payload.stableId,
+				indexes.claimedAdopted
+			)
+			if adoptError then
+				return false, adoptError
+			end
+			existing = adoptable
 		end
 
 		if not existing and payload.className ~= "Terrain" then
@@ -5354,12 +6372,18 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 				return false, "Unsupported class: " .. tostring(payload.className)
 			end
 			existing = createdOrError
+			if activeMutationJournal then
+				activeMutationJournal:recordCreated(existing)
+			end
 		end
 		if not existing then
 			return false, "Missing required instance for class " .. tostring(payload.className) .. " at " .. targetPath
 		end
 
 		if not isLockedParentInstance(existing) then
+			if activeMutationJournal then
+				activeMutationJournal:touch(existing)
+			end
 			existing.Name = targetNameOrService
 			existing.Parent = parent
 		end
@@ -5377,20 +6401,21 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 	if stableId == "" then
 		stableId = tostring(change.stable_id or "")
 	end
-	local generatedStableId = false
 	if stableId == "" then
 		local existingStableId = existing:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
-		stableId = ensureStableId(existing)
-		generatedStableId = typeof(existingStableId) ~= "string" or existingStableId == ""
+		if typeof(existingStableId) == "string" and existingStableId ~= "" then
+			stableId = existingStableId
+		end
 	end
 
 	local stableIdOwner = if stableId ~= "" then indexes.byStableId[stableId] else nil
 	if stableIdOwner and stableIdOwner ~= existing and tostring(change.op) ~= "rename" then
-		repeat
-			stableId = httpService:GenerateGUID(false)
-		until not indexes.byStableId[stableId]
-		existing:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, stableId)
-		generatedStableId = true
+		return false,
+			"AMBIGUOUS_IDENTITY: stable ID "
+				.. stableId
+				.. " already belongs to "
+				.. stableIdOwner:GetFullName()
+				.. "; fix the duplicate instead of rewriting the ID"
 	else
 		existing:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, stableId)
 	end
@@ -5414,7 +6439,7 @@ local function prepareUiUpsert(self, change : {[string]: any}, revision : number
 		instance = existing,
 		payload = payload,
 		stableId = stableId,
-		notice = generatedStableId and ("Generated stable id for " .. existing:GetFullName()) or "",
+		notice = "",
 	}
 end
 
@@ -5480,27 +6505,87 @@ local function applyScriptUpsert(self, change : {[string]: any}, revision : numb
 		return false, "Unsupported script class: " .. tostring(className)
 	end
 
-	local parent, targetName, parentError = ensureParentPath(rbxPath)
+	local parent, targetName, _, parentError, targetLocalStableId = resolveLocalChangeParent(
+		change,
+		INSTANCE_KINDS.Script,
+		className,
+		false
+	)
+	if not parent and parentError == nil then
+		parent, targetName, parentError = ensureParentPath(rbxPath)
+	end
 	if not parent then
 		return false, parentError
 	end
 
-	local scriptInstance, conflictError = replaceManagedConflict(parent, targetName, className)
-	if conflictError then
-		return false, conflictError
+	local incomingStableId = getScriptStableId(change)
+	if targetLocalStableId ~= nil and targetLocalStableId ~= "" then
+		if incomingStableId ~= "" and incomingStableId ~= targetLocalStableId then
+			return false, "Script local path stable ID mismatch at " .. rbxPath
+		end
+		incomingStableId = targetLocalStableId
+	end
+
+	local indexes = buildManagedIndexes(self.managedRoots, self.ignoredRbxPaths)
+	local scriptInstance = if incomingStableId ~= "" then indexes.byStableId[incomingStableId] else nil
+	if not scriptInstance then
+		local existingError
+		scriptInstance, existingError = findExistingManagedTarget(change, indexes)
+		if existingError then
+			return false, existingError
+		end
+	end
+	if scriptInstance and not scriptInstance:IsA(className) then
+		if not isManagedInstance(scriptInstance) then
+			return false, "Refused replacing unmanaged instance: " .. scriptInstance:GetFullName()
+		end
+		removeFromIndexesRecursive(indexes, scriptInstance)
+		if activeMutationJournal then
+			activeMutationJournal:remove(scriptInstance)
+		else
+			scriptInstance:Destroy()
+		end
+		scriptInstance = nil
+	end
+
+	if not scriptInstance and (targetLocalStableId == nil or targetLocalStableId == "") then
+		local conflictError
+		scriptInstance, conflictError = replaceManagedConflict(parent, targetName, className)
+		if conflictError then
+			return false, conflictError
+		end
+	elseif not scriptInstance then
+		indexes.claimedAdopted = indexes.claimedAdopted or {}
+		local adoptable, adoptError = findAdoptableUnmanagedChild(
+			parent,
+			targetName,
+			className,
+			incomingStableId,
+			indexes.claimedAdopted
+		)
+		if adoptError then
+			return false, adoptError
+		end
+		scriptInstance = adoptable
 	end
 	if not scriptInstance then
 		scriptInstance = Instance.new(className)
-		scriptInstance.Name = targetName
-		scriptInstance.Parent = parent
+		if activeMutationJournal then
+			activeMutationJournal:recordCreated(scriptInstance)
+		end
 	end
+	if activeMutationJournal then
+		activeMutationJournal:touch(scriptInstance)
+	end
+	scriptInstance.Name = targetName
+	scriptInstance.Parent = parent
 
 	local didUpdate = setScriptSource(scriptInstance, source)
 	if not didUpdate then
 		return false, "Failed to update source for " .. scriptInstance:GetFullName()
 	end
 
-	markManagedInstance(scriptInstance, localPath, revision, getScriptStableId(change), INSTANCE_KINDS.Script)
+	markManagedInstance(scriptInstance, localPath, revision, incomingStableId, INSTANCE_KINDS.Script)
 	return applyScriptPayload(self, scriptInstance, className, targetName, change.payload)
 end
 
@@ -5514,7 +6599,16 @@ local function applyScriptRename(self, change : {[string]: any}, revision : numb
 		return true
 	end
 
-	local existing = resolvePath(oldPath)
+	local indexes = buildManagedIndexes(self.managedRoots, self.ignoredRbxPaths)
+	local incomingStableId = getScriptStableId(change)
+	local existing = if incomingStableId ~= "" then indexes.byStableId[incomingStableId] else nil
+	if not existing then
+		local resolveError
+		existing, resolveError = resolvePath(oldPath)
+		if resolveError then
+			return false, resolveError
+		end
+	end
 	if not existing then
 		if typeof(change.source) == "string" then
 			return applyScriptUpsert(self, change, revision)
@@ -5525,20 +6619,46 @@ local function applyScriptRename(self, change : {[string]: any}, revision : numb
 		return false, "Refused to rename unmanaged script at " .. oldPath
 	end
 
-	local newParent, newName, parentError = ensureParentPath(newPath)
+	local newParent, newName, _, parentError, targetLocalStableId = resolveLocalChangeParent(
+		change,
+		INSTANCE_KINDS.Script,
+		existing.ClassName,
+		false
+	)
+	if not newParent and parentError == nil then
+		newParent, newName, parentError = ensureParentPath(newPath)
+	end
 	if not newParent then
 		return false, parentError
 	end
+	if targetLocalStableId ~= nil and targetLocalStableId ~= "" then
+		if incomingStableId ~= "" and incomingStableId ~= targetLocalStableId then
+			return false, "Script rename stable ID mismatch at " .. newPath
+		end
+		incomingStableId = targetLocalStableId
+	end
 
-	local occupied = newParent:FindFirstChild(newName)
-	if occupied and occupied ~= existing then
-		if isManagedInstance(occupied) then
-			occupied:Destroy()
-		else
-			return false, "Rename target occupied by unmanaged instance: " .. newPath
+	if targetLocalStableId == nil or targetLocalStableId == "" then
+		local occupied, occupiedError = findUniqueChild(newParent, newName)
+		if occupiedError then
+			return false, occupiedError
+		end
+		if occupied and occupied ~= existing then
+			if isManagedInstance(occupied) then
+				if activeMutationJournal then
+					activeMutationJournal:remove(occupied)
+				else
+					occupied:Destroy()
+				end
+			else
+				return false, "Rename target occupied by unmanaged instance: " .. newPath
+			end
 		end
 	end
 
+	if activeMutationJournal then
+		activeMutationJournal:touch(existing)
+	end
 	existing.Name = newName
 	existing.Parent = newParent
 	if typeof(change.source) == "string" then
@@ -5547,7 +6667,7 @@ local function applyScriptRename(self, change : {[string]: any}, revision : numb
 			return false, "Failed to update source for " .. existing:GetFullName()
 		end
 	end
-	markManagedInstance(existing, change.local_path, revision, getScriptStableId(change), INSTANCE_KINDS.Script)
+	markManagedInstance(existing, change.local_path, revision, incomingStableId, INSTANCE_KINDS.Script)
 	return applyScriptPayload(self, existing, existing.ClassName, newName, change.payload)
 end
 
@@ -5567,16 +6687,20 @@ function SyncAPI:applyDelete(change : {[string]: any})
 		return true, "Skip delete root service at " .. targetPath
 	end
 
-	local indexes = buildManagedIndexes(self.managedRoots)
+	local indexes = buildManagedIndexes(self.managedRoots, self.ignoredRbxPaths)
 	local expectedClass = typeof(change.class_name) == "string" and change.class_name or ""
 	local localPathTarget = resolveLocalChangeTarget(change, entity, expectedClass)
 	local target = localPathTarget
 	if not target then
-		target = findExistingManagedTarget(change, indexes)
+		local targetError
+		target, targetError = findExistingManagedTarget(change, indexes)
+		if targetError then
+			return false, targetError
+		end
 	end
 	local incomingStableId = typeof(change.stable_id) == "string" and change.stable_id or ""
 	if not target and incomingStableId ~= "" then
-		local referenceIndex = buildReferenceIndex(self.managedRoots)
+		local referenceIndex = buildReferenceIndex(self.managedRoots, self.ignoredRbxPaths)
 		target = referenceIndex.byStableId[incomingStableId]
 	end
 	if not target then
@@ -5633,7 +6757,11 @@ function SyncAPI:applyDelete(change : {[string]: any})
 	end
 
 	removeFromIndexesRecursive(indexes, target)
-	target:Destroy()
+	if activeMutationJournal then
+		activeMutationJournal:remove(target)
+	else
+		target:Destroy()
+	end
 	if repairedLegacyOwnership then
 		return true, "Repaired legacy delete at " .. targetPath
 	end
@@ -5643,13 +6771,13 @@ end
 function SyncAPI:applyUpsert(change : {[string]: any}, revision : number)
 	local entity = getEntityKind(change)
 	if entity == INSTANCE_KINDS.UIInstance then
-		local indexes = buildManagedIndexes(self.managedRoots)
+		local indexes = buildManagedIndexes(self.managedRoots, self.ignoredRbxPaths)
 		local ok, resultOrError = prepareUiUpsert(self, change, revision, indexes)
 		if not ok then
 			return false, resultOrError
 		end
 		if typeof(resultOrError) == "table" and resultOrError.instance then
-			local referenceIndex = buildReferenceIndex(self.managedRoots)
+			local referenceIndex = buildReferenceIndex(self.managedRoots, self.ignoredRbxPaths)
 			local propertyErrors, propertyNotices = applyUiProperties(
 				self,
 				resultOrError.instance,
@@ -5708,6 +6836,271 @@ local function getIncomingUiStableId(change : {[string]: any})
 	return ""
 end
 
+local function makeApplyConflict(kind : string, operation : string, change : {[string]: any}, message : string, hint : string?)
+	return {
+		kind = kind,
+		operation = operation,
+		entity = getEntityKind(change),
+		local_path = tostring(change.local_path or change.old_local_path or ""),
+		rbx_path = tostring(change.new_rbx_path or change.rbx_path or change.old_rbx_path or ""),
+		stable_id = getIncomingChangeStableId(change),
+		message = message,
+		hint = hint or "Perbaiki conflict lalu jalankan sync lagi.",
+	}
+end
+
+local function preflightChanges(self, changes : {any})
+	local conflicts = {}
+	local indexes = buildManagedIndexes(self.managedRoots, self.ignoredRbxPaths)
+	local seenIncomingIds = {}
+	local seenLocalPaths = {}
+	local duplicateStudioIds = {}
+
+	local function add(conflict)
+		local key = tostring(conflict.kind) .. "\0" .. tostring(conflict.local_path) .. "\0" .. tostring(conflict.rbx_path) .. "\0" .. tostring(conflict.stable_id)
+		for _, existing in ipairs(conflicts) do
+			local existingKey = tostring(existing.kind) .. "\0" .. tostring(existing.local_path) .. "\0" .. tostring(existing.rbx_path) .. "\0" .. tostring(existing.stable_id)
+			if existingKey == key then
+				return
+			end
+		end
+		table.insert(conflicts, conflict)
+	end
+
+	for stableId, candidates in pairs(indexes.byStableIdAll or {}) do
+		if Identity.isExplicitStableId(stableId) and #candidates > 1 then
+			duplicateStudioIds[stableId] = true
+			local paths = {}
+			for _, candidate in ipairs(candidates) do
+				table.insert(paths, candidate:GetFullName())
+			end
+			table.sort(paths)
+			add(makeApplyConflict(
+				"duplicate_stable_id",
+				"upsert",
+				{ stable_id = stableId, rbx_path = paths[1] },
+				"StableId " .. stableId .. " dipakai oleh lebih dari satu instance di Studio: " .. table.concat(paths, ", ") .. ".",
+				"Beri setiap instance StableId yang unik; RiftSync tidak mengganti ID valid secara otomatis."
+			))
+		end
+	end
+
+	local identityPlan = Identity.buildApplyPlan(changes, indexes.candidates)
+	for _, conflict in ipairs(identityPlan.conflicts or {}) do
+		if conflict.kind ~= "duplicate_stable_id" or duplicateStudioIds[conflict.stable_id] ~= true then
+			add(conflict)
+		end
+	end
+
+	for localPath, candidates in pairs(indexes.byLocalPathAll or {}) do
+		if #candidates > 1 then
+			for _, candidate in ipairs(candidates) do
+				add(makeApplyConflict(
+					"duplicate_local_path",
+					"upsert",
+					{
+						stable_id = candidate:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId),
+						local_path = localPath,
+						rbx_path = candidate:GetFullName(),
+					},
+					"Local path " .. localPath .. " dipakai oleh beberapa instance managed di Studio.",
+					"Perbaiki metadata LocalPath agar setiap identity memiliki path lokal yang unik."
+				))
+			end
+		end
+	end
+
+	for _, change in ipairs(changes) do
+		local operation = tostring(change.op or "")
+		local stableId = getIncomingChangeStableId(change)
+		if operation ~= "delete" and Identity.isExplicitStableId(stableId) then
+			local previous = seenIncomingIds[stableId]
+			if previous then
+				add(makeApplyConflict("duplicate_stable_id", operation, change,
+					"StableId " .. stableId .. " muncul lebih dari sekali dalam batch.",
+					"Pastikan satu StableId hanya dimiliki satu object metadata."))
+				add(makeApplyConflict("duplicate_stable_id", tostring(previous.op or "upsert"), previous,
+					"StableId " .. stableId .. " muncul lebih dari sekali dalam batch.",
+					"Pastikan satu StableId hanya dimiliki satu object metadata."))
+			else
+				seenIncomingIds[stableId] = change
+			end
+		end
+
+		local localPath = tostring(change.local_path or "")
+		if localPath ~= "" and operation ~= "delete" then
+			local previous = seenLocalPaths[localPath]
+			if previous and getIncomingChangeStableId(previous) ~= stableId then
+				add(makeApplyConflict("duplicate_local_path", operation, change,
+					"Local path " .. localPath .. " dipakai oleh lebih dari satu identity.",
+					"Gunakan satu metadata per path atau suffix ~rid_<StableId>."))
+			else
+				seenLocalPaths[localPath] = change
+			end
+		end
+
+		local targetPath = change.new_rbx_path or change.rbx_path
+		if operation == "rename" then
+			targetPath = change.new_rbx_path
+		end
+		if operation ~= "delete" and typeof(targetPath) == "string" and targetPath ~= "" then
+			local hasLocalIdentity = Identity.localSegmentHasStableId(localPath)
+			local entity = getEntityKind(change)
+			local expectedClass = typeof(change.class_name) == "string" and change.class_name or ""
+			if entity == INSTANCE_KINDS.UIInstance and typeof(change.payload) == "table" then
+				expectedClass = tostring(change.payload.className or change.payload["$className"] or expectedClass)
+			end
+
+			local resolvedTarget, targetError = findExistingManagedTarget(change, indexes)
+			if targetError then
+				add(makeApplyConflict("ambiguous_target", operation, change, tostring(targetError),
+					"Perbaiki identity yang ambigu sebelum sync."))
+			end
+			local targetIsExact = resolvedTarget ~= nil and buildGamePath(resolvedTarget) == targetPath
+			if resolvedTarget and not isManagedInstance(resolvedTarget) then
+				local resolvedStableId = resolvedTarget:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+				if not Identity.canAdoptExactTarget(change, {
+					className = resolvedTarget.ClassName,
+					stableId = typeof(resolvedStableId) == "string" and resolvedStableId or "",
+					rbxPath = buildGamePath(resolvedTarget),
+					managed = false,
+				}) then
+					add(makeApplyConflict("ambiguous_target", operation, change,
+						"Destination " .. targetPath .. " sudah ditempati instance unmanaged yang tidak aman diadopsi.",
+						"Hanya upsert dengan path persis, class sama, dan StableId kompatibel yang dapat diadopsi."))
+				end
+			end
+
+			if not targetIsExact then
+				local parent, name, isRootService, pathError = parseRobloxPath(targetPath)
+				if (not parent or pathError) and hasLocalIdentity and expectedClass ~= "" then
+					local localParent, localName, localIsRoot, localError = resolveLocalChangeParent(
+						change,
+						entity,
+						expectedClass,
+						false
+					)
+					if localParent or localIsRoot then
+						parent = localParent
+						name = localName
+						isRootService = localIsRoot
+						pathError = nil
+					elseif pathError == nil then
+						pathError = localError
+					end
+				end
+
+				if pathError and string.find(tostring(pathError), "AMBIGUOUS", 1, true) then
+					add(makeApplyConflict("ambiguous_target", operation, change,
+						"Destination " .. targetPath .. " memiliki beberapa kandidat sibling.",
+						"Gunakan StableId yang sudah terikat, atau pastikan hanya satu object unmanaged yang cocok."))
+				elseif parent and name and not isRootService then
+					if hasLocalIdentity and expectedClass ~= "" then
+						indexes.claimedAdopted = indexes.claimedAdopted or {}
+						local adoptable, adoptError = findAdoptableUnmanagedChild(
+							parent,
+							name,
+							expectedClass,
+							stableId,
+							indexes.claimedAdopted
+						)
+						if adoptError then
+							add(makeApplyConflict("ambiguous_target", operation, change, tostring(adoptError),
+								"Sisakan satu object unmanaged yang cocok atau beri identity RiftSync yang unik."))
+						elseif adoptable then
+							if resolvedTarget and resolvedTarget ~= adoptable then
+								add(makeApplyConflict("ambiguous_target", operation, change,
+									"Destination " .. targetPath .. " ditempati object unmanaged lain.",
+									"Upsert tidak boleh memindahkan identity lain lalu mengadopsi destination."))
+							elseif not Identity.canAdoptExactTarget(change, {
+								className = adoptable.ClassName,
+								stableId = tostring(adoptable:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId) or ""),
+								rbxPath = buildGamePath(adoptable),
+								managed = false,
+							}) then
+								add(makeApplyConflict("ambiguous_target", operation, change,
+									"Destination " .. targetPath .. " tidak aman untuk diadopsi.",
+									"Hanya exact same-class upsert dengan StableId kompatibel yang dapat diadopsi."))
+							end
+						end
+					else
+						local occupied, occupiedError = findUniqueChild(parent, name)
+						if occupiedError then
+							add(makeApplyConflict("ambiguous_target", operation, change, tostring(occupiedError),
+								"Gunakan StableId untuk memilih instance yang tepat."))
+						elseif occupied and occupied ~= resolvedTarget then
+							local occupantId = occupied:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+							local occupantManaged = isManagedInstance(occupied)
+							local canAdoptUnmanaged = resolvedTarget == nil
+								and not occupantManaged
+								and Identity.canAdoptExactTarget(change, {
+									className = occupied.ClassName,
+									stableId = typeof(occupantId) == "string" and occupantId or "",
+									rbxPath = buildGamePath(occupied),
+									managed = false,
+								})
+							local identitiesConflict = Identity.isExplicitStableId(stableId)
+								and Identity.isExplicitStableId(occupantId)
+								and occupantId ~= stableId
+							if identitiesConflict or not canAdoptUnmanaged then
+								add(makeApplyConflict("ambiguous_target", operation, change,
+									"Destination " .. targetPath .. " sudah ditempati instance lain atau unmanaged.",
+									"Exact same-class upsert dapat diadopsi; class berbeda, operasi destruktif, atau StableId berbeda harus diperbaiki manual."))
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return conflicts
+end
+
+local function buildApplyPlan(self, changes : {any})
+	local conflicts = preflightChanges(self, changes)
+	local indexes = buildManagedIndexes(self.managedRoots, self.ignoredRbxPaths)
+	local steps = {}
+	if #conflicts > 0 then
+		for _, change in ipairs(changes) do
+			table.insert(steps, {
+				operation = tostring(change.op or ""),
+				action = "reject",
+				target = nil,
+				change = change,
+			})
+		end
+		return { steps = steps, conflicts = conflicts, indexes = indexes }
+	end
+	for _, change in ipairs(changes) do
+		local operation = tostring(change.op or "")
+		local target, targetError = findExistingManagedTarget(change, indexes)
+		local action = "create"
+		if operation == "delete" then
+			action = target and "delete" or "delete_missing"
+		elseif target then
+			local destination = tostring(change.new_rbx_path or change.rbx_path or "")
+			action = target:GetFullName() == destination and "reuse" or "rename_move"
+		end
+		if targetError then
+			conflicts[#conflicts + 1] = makeApplyConflict(
+				"ambiguous_target",
+				operation,
+				change,
+				tostring(targetError),
+				"Perbaiki identity yang ambigu sebelum sync."
+			)
+			action = "reject"
+		end
+		steps[#steps + 1] = {
+			operation = operation,
+			action = action,
+			target = target,
+			change = change,
+		}
+	end
+	return { steps = steps, conflicts = conflicts, indexes = indexes }
+end
+
 local function cloneUiChangeWithoutStableId(change : {[string]: any})
 	local clone = {}
 	for key, value in pairs(change) do
@@ -5739,28 +7132,42 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 			skipped = 0,
 			warnings = 0,
 			errors = 0,
+			phase = "apply",
+			conflicts = {},
+			rollback_status = "not_needed",
+			rolled_back_count = 0,
+			rollback_errors = {},
 		}
-	end
-
-	local incomingStableIdCounts = {}
-	for _, change in ipairs(changes) do
-		if getEntityKind(change) == INSTANCE_KINDS.UIInstance and tostring(change.op) ~= "delete" then
-			local stableId = getIncomingUiStableId(change)
-			if stableId ~= "" then
-				incomingStableIdCounts[stableId] = (incomingStableIdCounts[stableId] or 0) + 1
-			end
-		end
 	end
 
 	local orderedChanges = {}
 	for _, change in ipairs(changes) do
-		local stableId = getIncomingUiStableId(change)
-		if stableId ~= "" and (incomingStableIdCounts[stableId] or 0) > 1 then
-			table.insert(orderedChanges, cloneUiChangeWithoutStableId(change))
-		else
-			table.insert(orderedChanges, change)
-		end
+		table.insert(orderedChanges, change)
 	end
+
+	local applyPlan = buildApplyPlan(self, orderedChanges)
+	local preflightConflicts = applyPlan.conflicts
+	if #preflightConflicts > 0 then
+		local conflictErrors = {}
+		for _, conflict in ipairs(preflightConflicts) do
+			table.insert(conflictErrors, tostring(conflict.message))
+		end
+		return false, conflictErrors, {}, {
+			total = #changes,
+			applied = 0,
+			skipped = 0,
+			warnings = 0,
+			errors = #conflictErrors,
+			phase = "preflight",
+			conflicts = preflightConflicts,
+			rollback_status = "not_needed",
+			rolled_back_count = 0,
+			rollback_errors = {},
+		}
+	end
+
+	local mutationJournal = newMutationJournal()
+	activeMutationJournal = mutationJournal
 
 	table.sort(orderedChanges, function(a, b)
 		local aOp = tostring(a.op)
@@ -5793,7 +7200,7 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 		return aKey < bKey
 	end)
 
-	local indexes = buildManagedIndexes(self.managedRoots)
+	local indexes = buildManagedIndexes(self.managedRoots, self.ignoredRbxPaths)
 	local errors = {}
 	local notices = {}
 	local errorSeen = {}
@@ -5884,7 +7291,12 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 				continue
 			end
 
-			local ok, resultOrError = prepareUiUpsert(self, change, targetRevision, indexes)
+			local callOk, ok, resultOrError = pcall(prepareUiUpsert, self, change, targetRevision, indexes)
+			if not callOk then
+				local unexpectedError = ok
+				ok = false
+				resultOrError = "Unexpected apply error: " .. tostring(unexpectedError)
+			end
 			if not ok then
 				if isOrphanMessage(resultOrError) then
 					skippedCount += 1
@@ -5907,14 +7319,20 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 				end
 			end
 		else
-			local ok, resultOrError
+			local callOk, ok, resultOrError
 			if op == "upsert" then
-				ok, resultOrError = applyScriptUpsert(self, change, targetRevision)
+				callOk, ok, resultOrError = pcall(applyScriptUpsert, self, change, targetRevision)
 			elseif op == "rename" then
-				ok, resultOrError = applyScriptRename(self, change, targetRevision)
+				callOk, ok, resultOrError = pcall(applyScriptRename, self, change, targetRevision)
 			else
+				callOk = true
 				ok = false
 				resultOrError = "Unsupported op: " .. op
+			end
+			if not callOk then
+				local unexpectedError = ok
+				ok = false
+				resultOrError = "Unexpected apply error: " .. tostring(unexpectedError)
 			end
 
 			if ok then
@@ -5945,14 +7363,20 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 			total = #uiPrepared,
 		})
 	end
-	local referenceIndex = buildReferenceIndex(self.managedRoots)
+	local referenceIndex = buildReferenceIndex(self.managedRoots, self.ignoredRbxPaths)
 	for preparedIndex, prepared in ipairs(uiPrepared) do
-		local propertyErrors, propertyNotices = applyUiProperties(
+		local propertyCallOk, propertyErrors, propertyNotices = pcall(
+			applyUiProperties,
 			self,
 			prepared.instance,
 			prepared.payload,
 			referenceIndex
 		)
+		if not propertyCallOk then
+			local unexpectedError = propertyErrors
+			propertyErrors = { "Unexpected property apply error: " .. tostring(unexpectedError) }
+			propertyNotices = {}
+		end
 		for _, errorMessage in ipairs(propertyErrors) do
 			pushError(errorMessage)
 		end
@@ -5985,7 +7409,12 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 		})
 	end
 	for preparedIndex, prepared in ipairs(uiPrepared) do
-		local metadataErrors, metadataNotices = applyUiAttributesAndTags(prepared.instance, prepared.payload)
+		local metadataCallOk, metadataErrors, metadataNotices = pcall(applyUiAttributesAndTags, prepared.instance, prepared.payload)
+		if not metadataCallOk then
+			local unexpectedError = metadataErrors
+			metadataErrors = { "Unexpected metadata apply error: " .. tostring(unexpectedError) }
+			metadataNotices = {}
+		end
 		for _, errorMessage in ipairs(metadataErrors) do
 			pushError(errorMessage)
 		end
@@ -6018,7 +7447,12 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 		})
 	end
 	for deleteIndex, change in ipairs(deleteQueue) do
-		local ok, resultOrError = self:applyDelete(change)
+		local callOk, ok, resultOrError = pcall(self.applyDelete, self, change)
+		if not callOk then
+			local unexpectedError = ok
+			ok = false
+			resultOrError = "Unexpected delete error: " .. tostring(unexpectedError)
+		end
 		if ok then
 			appliedCount += 1
 			if change.repair_tombstone == true then
@@ -6063,8 +7497,30 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 
 	local wasSuccessful = #errors == 0
 	if wasSuccessful then
+		mutationJournal:commit()
+		activeMutationJournal = nil
 		self.lastAppliedRevision = targetRevision
 		self.plugin:SetSetting(SETTING_KEYS.LastRevision, self.lastAppliedRevision)
+	else
+		local rollbackOk, rolledBackCount, rollbackErrors = mutationJournal:rollback()
+		activeMutationJournal = nil
+		for _, rollbackError in ipairs(rollbackErrors) do
+			table.insert(errors, rollbackError)
+		end
+		return false, errors, notices, {
+			total = #orderedChanges,
+			applied = appliedCount,
+			skipped = skippedCount,
+			warnings = #notices,
+			errors = #errors,
+			phase = "rollback",
+			conflicts = {},
+			rollback_status = rollbackOk and "success" or "failed",
+			rolled_back_count = rolledBackCount,
+			rollback_errors = rollbackErrors,
+			history = summariseSyncHistoryEvents(syncHistoryEvents),
+			repair = repairStats,
+		}
 	end
 
 	return wasSuccessful, errors, notices, {
@@ -6073,6 +7529,11 @@ function SyncAPI:applyChanges(changes : {any}, targetRevision : number)
 		skipped = skippedCount,
 		warnings = #notices,
 		errors = #errors,
+		phase = "apply",
+		conflicts = {},
+		rollback_status = "not_needed",
+		rolled_back_count = 0,
+		rollback_errors = {},
 		history = summariseSyncHistoryEvents(syncHistoryEvents),
 		repair = repairStats,
 	}
@@ -6127,6 +7588,7 @@ function SyncAPI:performHandshake()
 		or tonumber(response.indexed_script_count)
 		or 0
 	self.serverSyncRootEmpty = response.sync_root_empty == true
+	self.syncRootEmpty = response.sync_root_empty == true
 	self.serverSyncRootInitialized = response.sync_root_initialized == true
 	self.debugState.handshake = true
 	self.debugState.lastServerRev = tonumber(response.server_rev) or self.debugState.lastServerRev

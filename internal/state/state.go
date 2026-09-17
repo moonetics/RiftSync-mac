@@ -92,17 +92,18 @@ const (
 )
 
 type Activity struct {
-	Text          string  `json:"text"`
-	Operation     string  `json:"operation"`
-	Phase         string  `json:"phase,omitempty"`
-	Error         bool    `json:"error"`
-	Progress      int     `json:"progress"`
-	Current       int     `json:"current,omitempty"`
-	Total         int     `json:"total,omitempty"`
-	Indeterminate bool    `json:"indeterminate,omitempty"`
-	ClientID      string  `json:"client_id"`
-	Revision      int     `json:"revision"`
-	At            float64 `json:"at"`
+	Text          string         `json:"text"`
+	Operation     string         `json:"operation"`
+	Phase         string         `json:"phase,omitempty"`
+	Error         bool           `json:"error"`
+	Progress      int            `json:"progress"`
+	Current       int            `json:"current,omitempty"`
+	Total         int            `json:"total,omitempty"`
+	Indeterminate bool           `json:"indeterminate,omitempty"`
+	ClientID      string         `json:"client_id"`
+	Revision      int            `json:"revision"`
+	At            float64        `json:"at"`
+	Details       map[string]any `json:"details,omitempty"`
 }
 
 type RemoteExecState string

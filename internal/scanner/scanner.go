@@ -18,6 +18,7 @@ type Snapshot struct {
 	Records      map[string]records.SyncRecord
 	Warnings     []string
 	InvalidPaths []string
+	Conflicts    []records.Conflict
 	ScriptCount  int
 	UICount      int
 	CacheHits    int
@@ -197,6 +198,8 @@ func NormalizeRecords(input map[string]records.SyncRecord, warnings []string, in
 	for _, key := range keys {
 		addRecord(&snapshot, identityToLocalPath, input[key])
 	}
+	snapshot.Conflicts = append(snapshot.Conflicts, records.ValidateRecords(snapshot.Records)...)
+	snapshot.Conflicts = dedupeConflicts(snapshot.Conflicts)
 	countRecords(&snapshot)
 	return snapshot
 }
@@ -229,7 +232,7 @@ func (c *Cache) scanTree(cfg config.Config, walkRoot string, progress ProgressFu
 			return nil
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" || entry.Name() == config.MetadataDir || entry.Name() == config.GuidebookDir {
+			if entry.Name() == ".git" || entry.Name() == config.MetadataDir || entry.Name() == config.GuidebookDir || entry.Name() == config.VSCodeDir {
 				return filepath.SkipDir
 			}
 			return nil
@@ -342,6 +345,14 @@ func (c *Cache) scanTree(cfg config.Config, walkRoot string, progress ProgressFu
 		}
 		if result.InvalidPath != "" {
 			snapshot.InvalidPaths = append(snapshot.InvalidPaths, result.InvalidPath)
+			snapshot.Conflicts = append(snapshot.Conflicts, records.Conflict{
+				Kind:      records.ConflictInvalidMetadata,
+				Severity:  "error",
+				Entity:    records.EntityUIInstance,
+				LocalPath: result.InvalidPath,
+				Message:   "invalid metadata JSON: " + result.InvalidPath,
+				Hint:      "Fix the JSON metadata, then retry sync.",
+			})
 			continue
 		}
 		if result.Record == nil {
@@ -357,21 +368,31 @@ func (c *Cache) scanTree(cfg config.Config, walkRoot string, progress ProgressFu
 		snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("skipped unreadable files: %d (sample: %s)", skippedUnreadable, strings.Join(unreadableSamples, " | ")))
 	}
 
-	seenStableIDs := map[string]string{}
-	for _, record := range snapshot.Records {
-		if record.Entity != records.EntityUIInstance || record.StableID == "" {
-			continue
-		}
-		if previous, ok := seenStableIDs[record.StableID]; ok {
-			snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Duplicate stable id %s at %s and %s", record.StableID, record.LocalPath, previous))
-		} else {
-			seenStableIDs[record.StableID] = record.LocalPath
+	snapshot.Conflicts = append(snapshot.Conflicts, records.ValidateRecords(snapshot.Records)...)
+	snapshot.Conflicts = dedupeConflicts(snapshot.Conflicts)
+	for _, conflict := range snapshot.Conflicts {
+		if conflict.Error() {
+			snapshot.Warnings = append(snapshot.Warnings, conflict.Message)
 		}
 	}
 
 	countRecords(&snapshot)
 
 	return snapshot, nil
+}
+
+func dedupeConflicts(input []records.Conflict) []records.Conflict {
+	seen := map[string]bool{}
+	result := make([]records.Conflict, 0, len(input))
+	for _, conflict := range input {
+		key := string(conflict.Kind) + "\x00" + conflict.LocalPath + "\x00" + conflict.ConflictingPath + "\x00" + conflict.RbxPath
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, conflict)
+	}
+	return result
 }
 
 func parseRecord(cfg config.Config, relPosix, source string, managedServices map[string]bool, ignored []string) (*records.SyncRecord, error) {
@@ -400,6 +421,20 @@ func parseRecord(cfg config.Config, relPosix, source string, managedServices map
 
 func addRecord(snapshot *Snapshot, identityToLocalPath map[string]string, record records.SyncRecord) {
 	if existing, exists := snapshot.Records[record.LocalPath]; exists {
+		if records.IdentityKey(existing) != records.IdentityKey(record) {
+			snapshot.Conflicts = append(snapshot.Conflicts, records.Conflict{
+				Kind:            records.ConflictDuplicateLocalPath,
+				Severity:        "error",
+				Entity:          record.Entity,
+				LocalPath:       record.LocalPath,
+				RbxPath:         record.RbxPath,
+				StableID:        record.StableID,
+				ConflictingPath: existing.LocalPath,
+				ConflictingID:   existing.StableID,
+				Message:         fmt.Sprintf("local path %s represents more than one identity", record.LocalPath),
+				Hint:            "Use one metadata representation per local path or add a ~rid_<StableId> suffix.",
+			})
+		}
 		shouldReplace, reason := records.ChoosePreferredRecord(existing, record)
 		if shouldReplace {
 			snapshot.Records[record.LocalPath] = record
@@ -408,6 +443,26 @@ func addRecord(snapshot *Snapshot, identityToLocalPath map[string]string, record
 			snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Duplicate local_path ignored: %s (%s)", record.LocalPath, reason))
 		}
 		return
+	}
+	// A properties file and a Rojo init.meta file can describe the same
+	// logical target while carrying different metadata IDs. Prefer the richer
+	// representation when neither path uses the duplicate-sibling marker.
+	if record.StableID != "" && !strings.Contains(record.LocalPath, "~rid_") {
+		for existingPath, existingRecord := range snapshot.Records {
+			if existingRecord.Entity == record.Entity && existingRecord.RbxPath == record.RbxPath &&
+				!strings.Contains(existingPath, "~rid_") && !strings.Contains(existingRecord.LocalPath, "~rid_") {
+				shouldReplace, reason := records.ChoosePreferredRecord(existingRecord, record)
+				if shouldReplace {
+					delete(snapshot.Records, existingPath)
+					snapshot.Records[record.LocalPath] = record
+					identityToLocalPath[records.IdentityKey(record)] = record.LocalPath
+					snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Merged duplicate target %s: replaced %s -> %s (%s)", record.RbxPath, existingPath, record.LocalPath, reason))
+				} else {
+					snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Merged duplicate target %s: kept %s (%s)", record.RbxPath, existingPath, reason))
+				}
+				return
+			}
+		}
 	}
 
 	identityKey := records.IdentityKey(record)
@@ -422,6 +477,25 @@ func addRecord(snapshot *Snapshot, identityToLocalPath map[string]string, record
 	if !ok {
 		snapshot.Records[record.LocalPath] = record
 		identityToLocalPath[identityKey] = record.LocalPath
+		return
+	}
+	if record.StableID != "" && !strings.HasPrefix(record.StableID, "path:") &&
+		existingRecord.StableID == record.StableID && existingRecord.LocalPath != record.LocalPath {
+		// Keep both records so ValidateRecords can report the collision instead
+		// of silently choosing whichever file happened to be scanned first.
+		snapshot.Records[record.LocalPath] = record
+		snapshot.Conflicts = append(snapshot.Conflicts, records.Conflict{
+			Kind:            records.ConflictDuplicateStableID,
+			Severity:        "error",
+			Entity:          record.Entity,
+			LocalPath:       record.LocalPath,
+			RbxPath:         record.RbxPath,
+			StableID:        record.StableID,
+			ConflictingPath: existingRecord.LocalPath,
+			ConflictingID:   existingRecord.StableID,
+			Message:         fmt.Sprintf("stable ID %s is used by %s and %s", record.StableID, existingRecord.LocalPath, record.LocalPath),
+			Hint:            "Give each instance a unique StableId; valid IDs are never rewritten automatically.",
+		})
 		return
 	}
 
@@ -591,7 +665,9 @@ func isIgnoredMetadataPath(relPosix string) bool {
 		relPosix == config.MetadataDir ||
 		strings.HasPrefix(relPosix, config.MetadataDir+"/") ||
 		relPosix == config.GuidebookDir ||
-		strings.HasPrefix(relPosix, config.GuidebookDir+"/")
+		strings.HasPrefix(relPosix, config.GuidebookDir+"/") ||
+		relPosix == config.VSCodeDir ||
+		strings.HasPrefix(relPosix, config.VSCodeDir+"/")
 }
 
 func cloneFileResult(source FileResult) FileResult {

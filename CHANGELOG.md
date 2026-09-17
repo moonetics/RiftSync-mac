@@ -2,6 +2,49 @@
 
 Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
+## 4.1.11 - 2026-09-17
+
+- Optimized idle CPU and I/O performance by separating event-driven `fsnotify` watcher from the legacy periodic scan loop.
+- Introduced `safety_scan_interval_sec` (default 30 seconds) for background reconciliation, replacing the relentless 400ms project-wide file traversal loop.
+- Properly respected `--legacy-scan` flag so periodic scanning only runs when explicitly requested, eliminating duplicate scanning during watcher mode.
+- Synchronous file changes remain instantaneous (< 0.2s) via OS kernel `FSEvents` while idle CPU drops to near 0%.
+
+## 4.1.10 - 2026-09-11
+
+- Completed generic unmanaged exact-target adoption for StableId-suffixed local paths. UI and script apply now reuse one uniquely matching same-class unmanaged object, while ambiguous candidates, conflicting IDs, destructive operations, and unsafe class replacement remain blocked.
+
+## 4.1.9 - 2026-09-11
+
+- Fixed snapshot preflight rejecting an existing unmanaged Studio object even though the apply path could safely reuse it. Exact-path, same-class upserts with compatible StableIds are now adopted generically; destructive operations, class mismatches, ambiguous siblings, and conflicting IDs remain blocked.
+
+## 4.1.8 - 2026-09-11
+
+- Added a one-shot `Force ID repair` option to the Start source chooser. It clears only active RiftSync identities before the selected Studio or Local bootstrap, excludes ignored and rollback subtrees, records Studio mutations for Undo, and restores the previous IDs if bootstrap fails.
+
+## 4.1.7 - 2026-09-11
+
+- Replaced vendor-specific rollback exclusions with a general, case-insensitive `ServerStorage.__*Rollback*` subtree rule, covering rollback snapshots from any Studio tool while avoiding ordinary project folders.
+
+## 4.1.6 - 2026-09-11
+
+- Fixed Studio bootstrap rejecting duplicate StableIds copied into `ServerStorage.__WeAreDevsRollback_*`; both the current WeAreDevs name and the legacy WrexDev rollback name are excluded from traversal and identity indexes without deleting their backup contents.
+
+## 4.1.5 - 2026-09-10
+
+- Added the current application version beside the RiftSync title in the desktop header.
+- Added an explicit no-compare source chooser on every Start: Studio replaces local with backup, or local applies to Studio with an Undo recording; live sync remains Local -> Studio.
+- Fixed overlapping managed roots being able to index the same Studio instance more than once, and condensed duplicate StableId reports to include the conflicting Studio paths once.
+- Excluded `ServerStorage.__WrexDevRollback_*` recovery snapshots from Studio traversal, identity indexes, references, and sync exports so copied StableIds inside third-party rollback data do not block syncing.
+- Added StableId-first identity validation, duplicate sibling suffix support, and structured validation conflicts.
+- Added read-only Studio preflight, rollback journaling for unexpected apply failures, and full conflict details in activity/debug payloads.
+- Added portable config template, macOS plugin build guard, pure Luau identity tests, and consistent product versioning.
+
+## 4.1.4 - 2026-09-04
+
+- Added lossless sync for same-name, same-class Roblox siblings through stable-ID local path suffixes while preserving their Studio names.
+- Added stable-ID-first duplicate apply behavior and Decal/Texture `Face` synchronization.
+- Added automatic Local profile discovery on widget open plus a compatible Studio refresh icon.
+
 ## 4.1.3 - 2026-08-04
 
 - Fixed transient Git indexing failures during automatic revision commits by retrying `git add -A` when project state files are still settling.

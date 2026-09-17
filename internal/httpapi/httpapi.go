@@ -215,6 +215,7 @@ func (a *API) activity(w http.ResponseWriter, r *http.Request) {
 		Indeterminate: boolValue(payload["indeterminate"]),
 		ClientID:      stringValue(payload["client_id"]),
 		Revision:      intValue(payload["revision"], 0),
+		Details:       objectValue(payload["details"]),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "activity": activity})
 }
@@ -766,12 +767,6 @@ func (a *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	a.state.ApplySnapshot(snapshot.Records, snapshot.Warnings, snapshot.InvalidPaths)
 	a.state.RecordPerformance(len(files), 0, time.Since(scanStarted), 0, snapshot.CacheHits, snapshot.CacheMisses)
-	if err := config.WriteGuidebookStatus(cfg, config.ScaffoldOptions{
-		Version:           a.version,
-		LastKnownRevision: a.state.Revision(),
-	}); err != nil {
-		writeErrors = append(writeErrors, fmt.Sprintf("Failed writing guidebook status: %v", err))
-	}
 	if len(writeErrors) == 0 {
 		if err := a.state.SetSyncRootInitialized(true); err != nil {
 			writeErrors = append(writeErrors, "Failed persisting initialized project state: "+err.Error())
@@ -1125,7 +1120,7 @@ func listSyncRootFiles(syncRoot string) ([]string, error) {
 }
 
 func isPreservedRootEntry(name string) bool {
-	return name == ".git" || name == config.MetadataDir || name == config.GuidebookDir
+	return name == ".git" || name == config.MetadataDir || name == config.GuidebookDir || name == config.VSCodeDir
 }
 
 func normalizePullText(value string) string {
@@ -1182,6 +1177,13 @@ func boolValue(value any) bool {
 	default:
 		return false
 	}
+}
+
+func objectValue(value any) map[string]any {
+	if result, ok := value.(map[string]any); ok {
+		return result
+	}
+	return nil
 }
 
 func intValue(value any, fallback int) int {

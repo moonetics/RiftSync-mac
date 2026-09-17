@@ -20,16 +20,6 @@ func DetectChanges(oldRecords, newRecords map[string]SyncRecord, invalidPaths ma
 		}
 	}
 
-	newIdentityKeys := map[string]bool{}
-	for _, record := range newRecords {
-		newIdentityKeys[IdentityKey(record)] = true
-	}
-	for path := range deleted {
-		if newIdentityKeys[IdentityKey(oldRecords[path])] {
-			delete(deleted, path)
-		}
-	}
-
 	modified := []string{}
 	for path := range shared {
 		oldRecord := oldRecords[path]

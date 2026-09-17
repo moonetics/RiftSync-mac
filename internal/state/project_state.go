@@ -202,7 +202,7 @@ func (s *AppState) inferInitializedLocked() bool {
 			return nil
 		}
 		first := strings.Split(filepath.ToSlash(relative), "/")[0]
-		if first == ".git" || first == config.MetadataDir || first == config.GuidebookDir {
+		if first == ".git" || first == config.MetadataDir || first == config.GuidebookDir || first == config.VSCodeDir {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}

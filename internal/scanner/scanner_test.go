@@ -243,6 +243,53 @@ func TestScanDeduplicatesByIdentity(t *testing.T) {
 	}
 }
 
+func TestScanPreservesDuplicateSiblingPathsWithStableSuffix(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "StarterGui/Same~rid_left.ScreenGui/properties.init.json", `{"id":"left","className":"ScreenGui","name":"Same"}`)
+	writeFile(t, root, "StarterGui/Same~rid_right.ScreenGui/properties.init.json", `{"id":"right","className":"ScreenGui","name":"Same"}`)
+
+	snapshot, err := Scan(testConfig(t, root))
+	if err != nil {
+		t.Fatalf("Scan returned error: %v", err)
+	}
+	if len(snapshot.Records) != 2 {
+		t.Fatalf("record count = %d, want 2: %#v", len(snapshot.Records), snapshot.Records)
+	}
+	for _, record := range snapshot.Records {
+		if record.RbxPath != "game.StarterGui.Same" {
+			t.Fatalf("RbxPath = %q, want duplicate Roblox path", record.RbxPath)
+		}
+	}
+}
+
+func TestScanPreservesDuplicateSiblingScriptsWithStableSuffix(t *testing.T) {
+	root := t.TempDir()
+	leftDir := "Workspace/Model.Model/LightConfig~rid_left.Script"
+	rightDir := "Workspace/Model.Model/LightConfig~rid_right.Script"
+	writeFile(t, root, leftDir+"/LightConfig~rid_left.server.luau", "print('left')")
+	writeFile(t, root, leftDir+"/properties.init.json", `{"id":"left","className":"Script","name":"LightConfig","properties":{}}`)
+	writeFile(t, root, rightDir+"/LightConfig~rid_right.server.luau", "print('right')")
+	writeFile(t, root, rightDir+"/properties.init.json", `{"id":"right","className":"Script","name":"LightConfig","properties":{}}`)
+
+	snapshot, err := Scan(testConfig(t, root))
+	if err != nil {
+		t.Fatalf("Scan returned error: %v", err)
+	}
+	if len(snapshot.Records) != 2 || snapshot.ScriptCount != 2 {
+		t.Fatalf("records/scripts = %d/%d, want 2/2: %#v", len(snapshot.Records), snapshot.ScriptCount, snapshot.Records)
+	}
+	seenIDs := map[string]bool{}
+	for _, record := range snapshot.Records {
+		if record.RbxPath != "game.Workspace.Model.LightConfig" {
+			t.Fatalf("RbxPath = %q, want duplicate script path", record.RbxPath)
+		}
+		seenIDs[record.StableID] = true
+	}
+	if !seenIDs["left"] || !seenIDs["right"] {
+		t.Fatalf("stable IDs = %#v, want left and right", seenIDs)
+	}
+}
+
 func TestParseRelativeFile(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "ServerScriptService/Foo.server.luau", "print('hi')")

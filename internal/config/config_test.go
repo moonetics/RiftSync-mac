@@ -1,12 +1,11 @@
 package config
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestLoadExistingConfig(t *testing.T) {
@@ -224,7 +223,7 @@ func TestInvalidRemoteExecConfigFails(t *testing.T) {
 	}
 }
 
-func TestEnsureSyncRootScaffoldCreatesFoldersAndGuidebook(t *testing.T) {
+func TestEnsureSyncRootScaffoldCreatesFolders(t *testing.T) {
 	root := t.TempDir()
 	cfg := Default()
 	cfg.SyncRoot = root
@@ -250,210 +249,14 @@ func TestEnsureSyncRootScaffoldCreatesFoldersAndGuidebook(t *testing.T) {
 	if _, err := os.Stat(existing); err != nil {
 		t.Fatalf("existing file was removed: %v", err)
 	}
-	if body, err := os.ReadFile(filepath.Join(root, GuidebookDir, "README.md")); err != nil {
-		t.Fatalf("guidebook missing: %v", err)
-	} else if !strings.Contains(string(body), "RiftSync Guidebook") {
-		t.Fatalf("guidebook content = %q, want RiftSync Guidebook", string(body))
+	if _, err := os.Stat(filepath.Join(root, GuidebookDir)); !os.IsNotExist(err) {
+		t.Fatalf("expected .guidebook to not exist after EnsureSyncRootScaffold, err=%v", err)
 	}
-}
-
-func TestEnsureSyncRootScaffoldDoesNotOverwriteGuidebook(t *testing.T) {
-	root := t.TempDir()
-	cfg := Default()
-	cfg.SyncRoot = root
-	if err := cfg.NormalizeAndValidate(); err != nil {
-		t.Fatalf("NormalizeAndValidate returned error: %v", err)
-	}
-	guidebook := filepath.Join(root, GuidebookDir, "README.md")
-	if err := os.MkdirAll(filepath.Dir(guidebook), 0o755); err != nil {
-		t.Fatalf("mkdir guidebook: %v", err)
-	}
-	if err := os.WriteFile(guidebook, []byte("custom guide"), 0o644); err != nil {
-		t.Fatalf("write guidebook: %v", err)
-	}
-	if err := EnsureSyncRootScaffold(cfg); err != nil {
-		t.Fatalf("EnsureSyncRootScaffold returned error: %v", err)
-	}
-	body, err := os.ReadFile(guidebook)
-	if err != nil {
-		t.Fatalf("read guidebook: %v", err)
-	}
-	if string(body) != "custom guide" {
-		t.Fatalf("guidebook overwritten = %q", string(body))
-	}
-}
-
-func TestEnsureSyncRootScaffoldWritesExecLauncherAndOverwritesIt(t *testing.T) {
-	root := t.TempDir()
-	cfg := Default()
-	cfg.SyncRoot = root
-	if err := cfg.NormalizeAndValidate(); err != nil {
-		t.Fatalf("NormalizeAndValidate returned error: %v", err)
-	}
-	serverPath := filepath.Join(root, "tools", "riftsync-server.exe")
-	if err := os.MkdirAll(filepath.Dir(serverPath), 0o755); err != nil {
-		t.Fatalf("mkdir server dir: %v", err)
-	}
-	if err := os.WriteFile(serverPath, []byte("exe"), 0o644); err != nil {
-		t.Fatalf("write server: %v", err)
-	}
-	configPath := filepath.Join(root, "sync_config.json")
-
-	if err := EnsureSyncRootScaffold(cfg, ScaffoldOptions{ConfigPath: configPath, ExecutablePath: serverPath}); err != nil {
-		t.Fatalf("EnsureSyncRootScaffold returned error: %v", err)
-	}
-	launcher := filepath.Join(root, GuidebookDir, GuidebookExecLauncher)
-	body, err := os.ReadFile(launcher)
-	if err != nil {
-		t.Fatalf("read launcher: %v", err)
-	}
-	text := string(body)
-	if !strings.Contains(text, "$RiftSyncServer = '"+serverPath+"'") {
-		t.Fatalf("launcher missing server path: %s", text)
-	}
-	if !strings.Contains(text, "$input | & $RiftSyncServer --config $RiftSyncConfig exec @execArgs") {
-		t.Fatalf("launcher missing stdin forwarding: %s", text)
-	}
-	if !strings.Contains(text, "$execArgs = @('--file', $firstArg) + $remainingArgs") {
-		t.Fatalf("launcher missing lua file shortcut rewrite: %s", text)
-	}
-	if err := os.WriteFile(launcher, []byte("old launcher"), 0o644); err != nil {
-		t.Fatalf("overwrite launcher setup: %v", err)
-	}
-	nextServerPath := filepath.Join(root, "next", "riftsync-server.exe")
-	if err := os.MkdirAll(filepath.Dir(nextServerPath), 0o755); err != nil {
-		t.Fatalf("mkdir next server dir: %v", err)
-	}
-	if err := os.WriteFile(nextServerPath, []byte("exe"), 0o644); err != nil {
-		t.Fatalf("write next server: %v", err)
-	}
-	if err := EnsureSyncRootScaffold(cfg, ScaffoldOptions{ConfigPath: configPath, ExecutablePath: nextServerPath}); err != nil {
-		t.Fatalf("EnsureSyncRootScaffold second call returned error: %v", err)
-	}
-	body, err = os.ReadFile(launcher)
-	if err != nil {
-		t.Fatalf("read launcher after overwrite: %v", err)
-	}
-	if !strings.Contains(string(body), nextServerPath) || strings.Contains(string(body), "old launcher") {
-		t.Fatalf("launcher was not regenerated: %s", string(body))
-	}
-}
-
-func TestWriteGuidebookStatusIncludesRuntimeContext(t *testing.T) {
-	root := t.TempDir()
-	cfg := Default()
-	cfg.SyncRoot = root
-	cfg.RemoteExecEnabled = true
-	cfg.RemoteExecToken = "secret"
-	if err := cfg.NormalizeAndValidate(); err != nil {
-		t.Fatalf("NormalizeAndValidate returned error: %v", err)
-	}
-	configPath := filepath.Join(root, "sync_config.json")
-	generatedAt := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
-	if err := EnsureSyncRootScaffold(cfg, ScaffoldOptions{
-		ConfigPath:        configPath,
-		Version:           "3.5.0",
-		LastKnownRevision: 7,
-		GeneratedAt:       generatedAt,
-		WriteStatusJSON:   true,
-	}); err != nil {
-		t.Fatalf("EnsureSyncRootScaffold returned error: %v", err)
-	}
-
-	var payload GuidebookStatusPayload
-	body, err := os.ReadFile(filepath.Join(root, GuidebookDir, GuidebookStatus))
-	if err != nil {
-		t.Fatalf("read guidebook status: %v", err)
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		t.Fatalf("decode guidebook status: %v", err)
-	}
-	if payload.SyncRoot != root || payload.ConfigPath != configPath || payload.Version != "3.5.0" || payload.LastKnownRevision != 7 {
-		t.Fatalf("status payload = %#v", payload)
-	}
-	if !payload.RemoteExecEnabled || !payload.RemoteExecConfigured || !payload.RemoteExecAvailable {
-		t.Fatalf("remote exec booleans = enabled %t configured %t available %t", payload.RemoteExecEnabled, payload.RemoteExecConfigured, payload.RemoteExecAvailable)
-	}
-	if len(payload.SupportedFileFormats) == 0 {
-		t.Fatal("supported formats empty")
-	}
-	if !payload.GeneratedAt.Equal(generatedAt) {
-		t.Fatalf("GeneratedAt = %s, want %s", payload.GeneratedAt, generatedAt)
-	}
-}
-
-func TestGuidebookStatusOverwritesButReadmeDoesNot(t *testing.T) {
-	root := t.TempDir()
-	cfg := Default()
-	cfg.SyncRoot = root
-	if err := cfg.NormalizeAndValidate(); err != nil {
-		t.Fatalf("NormalizeAndValidate returned error: %v", err)
-	}
-	guidebook := filepath.Join(root, GuidebookDir, "README.md")
-	if err := os.MkdirAll(filepath.Dir(guidebook), 0o755); err != nil {
-		t.Fatalf("mkdir guidebook: %v", err)
-	}
-	if err := os.WriteFile(guidebook, []byte("custom guide"), 0o644); err != nil {
-		t.Fatalf("write guidebook: %v", err)
-	}
-	statusPath := filepath.Join(root, GuidebookDir, GuidebookStatus)
-	if err := os.WriteFile(statusPath, []byte(`{"old":true}`), 0o644); err != nil {
-		t.Fatalf("write old status: %v", err)
-	}
-
-	if err := EnsureSyncRootScaffold(cfg, ScaffoldOptions{Version: "3.5.0", LastKnownRevision: 3, WriteStatusJSON: true}); err != nil {
-		t.Fatalf("EnsureSyncRootScaffold returned error: %v", err)
-	}
-	readmeBody, err := os.ReadFile(guidebook)
-	if err != nil {
-		t.Fatalf("read guidebook: %v", err)
-	}
-	if string(readmeBody) != "custom guide" {
-		t.Fatalf("guidebook overwritten = %q", string(readmeBody))
-	}
-	statusBody, err := os.ReadFile(statusPath)
-	if err != nil {
-		t.Fatalf("read status: %v", err)
-	}
-	if strings.Contains(string(statusBody), `"old":true`) || !strings.Contains(string(statusBody), `"last_known_revision": 3`) {
-		t.Fatalf("status was not regenerated: %s", string(statusBody))
-	}
-}
-
-func TestGuidebookExecLauncherEscapesPowerShellPaths(t *testing.T) {
-	launcher := buildGuidebookExecLauncher(`C:\Users\O'Brien\Rift Sync\riftsync-server.exe`, `D:\Game Config\sync_config.json`, true)
-	if !strings.Contains(launcher, "$RiftSyncServer = 'C:\\Users\\O''Brien\\Rift Sync\\riftsync-server.exe'") {
-		t.Fatalf("server path not single-quote escaped: %s", launcher)
-	}
-	if !strings.Contains(launcher, "$RiftSyncConfig = 'D:\\Game Config\\sync_config.json'") {
-		t.Fatalf("config path not single-quote escaped: %s", launcher)
-	}
-}
-
-func TestResolveRiftSyncServerPath(t *testing.T) {
-	root := t.TempDir()
-	serverPath := filepath.Join(root, "riftsync-server.exe")
-	if err := os.WriteFile(serverPath, []byte("exe"), 0o644); err != nil {
-		t.Fatalf("write server: %v", err)
-	}
-	resolved, exists := resolveRiftSyncServerPath(serverPath)
-	if resolved != filepath.Clean(serverPath) || !exists {
-		t.Fatalf("server resolve = %q %t, want %q true", resolved, exists, filepath.Clean(serverPath))
-	}
-
-	appPath := filepath.Join(root, "riftsync.exe")
-	if err := os.WriteFile(appPath, []byte("exe"), 0o644); err != nil {
-		t.Fatalf("write app: %v", err)
-	}
-	resolved, exists = resolveRiftSyncServerPath(appPath)
-	if resolved != serverPath || !exists {
-		t.Fatalf("app resolve = %q %t, want sibling %q true", resolved, exists, serverPath)
-	}
-
-	missingAppPath := filepath.Join(t.TempDir(), "riftsync.exe")
-	resolved, exists = resolveRiftSyncServerPath(missingAppPath)
-	if resolved != filepath.Join(filepath.Dir(missingAppPath), "riftsync-server.exe") || exists {
-		t.Fatalf("missing app resolve = %q %t, want sibling candidate false", resolved, exists)
+	vscodeSettings := filepath.Join(root, VSCodeDir, "settings.json")
+	if body, err := os.ReadFile(vscodeSettings); err != nil {
+		t.Fatalf("expected .vscode/settings.json to exist after scaffold: %v", err)
+	} else if !strings.Contains(string(body), "luau-lsp.platform.type") || !strings.Contains(string(body), "roblox") {
+		t.Fatalf(".vscode/settings.json content = %q", string(body))
 	}
 }
 
@@ -485,5 +288,19 @@ func TestResolveInsideSyncRootRejectsTraversal(t *testing.T) {
 
 	if _, err := cfg.ResolveInsideSyncRoot("../outside"); err == nil {
 		t.Fatal("ResolveInsideSyncRoot returned nil error, want traversal rejection")
+	}
+}
+
+func TestPortabilityWarningDetectsWindowsPathOnUnix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows paths are native on Windows")
+	}
+	cfg := Default()
+	cfg.SyncRoot = `C:\Users\Example\game`
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		t.Fatalf("NormalizeAndValidate returned error: %v", err)
+	}
+	if warning := cfg.PortabilityWarning(); warning == "" {
+		t.Fatal("PortabilityWarning is empty for a Windows path on Unix")
 	}
 }

@@ -134,6 +134,32 @@ func TestScriptPropertiesPathHelpers(t *testing.T) {
 	}
 }
 
+func TestDisambiguatedScriptPathKeepsRobloxNameAndStableID(t *testing.T) {
+	localPath := "Workspace/Model~rid_parent-id.Model/LightConfig~rid_script-id.Script/LightConfig~rid_script-id.server.luau"
+	record, err := NewScriptRecord(localPath, "print('duplicate-safe')", managedServices, nil)
+	if err != nil {
+		t.Fatalf("NewScriptRecord returned error: %v", err)
+	}
+	if record == nil {
+		t.Fatal("record is nil")
+	}
+	if record.RbxPath != "game.Workspace.Model.LightConfig" || record.StableID != "script-id" {
+		t.Fatalf("record path/id = %q/%q", record.RbxPath, record.StableID)
+	}
+	propertiesPath, ok, err := ScriptPropertiesPathForSourcePath(localPath)
+	if err != nil || !ok {
+		t.Fatalf("ScriptPropertiesPathForSourcePath = %q/%t/%v", propertiesPath, ok, err)
+	}
+	wantProperties := "Workspace/Model~rid_parent-id.Model/LightConfig~rid_script-id.Script/properties.init.json"
+	if propertiesPath != wantProperties {
+		t.Fatalf("propertiesPath = %q, want %q", propertiesPath, wantProperties)
+	}
+	sourcePath, ok, err := ScriptSourcePathForPropertiesPath(propertiesPath)
+	if err != nil || !ok || sourcePath != localPath {
+		t.Fatalf("source path roundtrip = %q/%t/%v, want %q", sourcePath, ok, err, localPath)
+	}
+}
+
 func TestStableID(t *testing.T) {
 	tests := []map[string]any{
 		{"id": " main "},
@@ -166,6 +192,57 @@ func TestUIPropertiesRecordDefaultsNameAndClass(t *testing.T) {
 	}
 	if record.Payload["name"] != "Main" {
 		t.Fatalf("payload name = %v, want Main", record.Payload["name"])
+	}
+}
+
+func TestDisambiguatedUIPathKeepsRobloxName(t *testing.T) {
+	record, err := NewUIRecord(
+		"Workspace/RaceWallDecal~rid_part-id.Part/Decal~rid_decal-id.Decal/properties.init.json",
+		`{"id":"decal-id","className":"Decal","name":"Decal","properties":{"Face":{"$type":"Enum","enumType":"NormalId","name":"Back"}}}`,
+		managedServices,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewUIRecord returned error: %v", err)
+	}
+	if record == nil {
+		t.Fatal("record is nil")
+	}
+	if record.RbxPath != "game.Workspace.RaceWallDecal.Decal" || record.StableID != "decal-id" {
+		t.Fatalf("record path/id = %q/%q", record.RbxPath, record.StableID)
+	}
+}
+
+func TestIdentityKeyUsesStableIDForDuplicateRobloxPaths(t *testing.T) {
+	left := SyncRecord{Entity: EntityUIInstance, LocalPath: "Workspace/Same~rid_left.Frame/properties.init.json", RbxPath: "game.Workspace.Same", StableID: "left"}
+	right := SyncRecord{Entity: EntityUIInstance, LocalPath: "Workspace/Same~rid_right.Frame/properties.init.json", RbxPath: "game.Workspace.Same", StableID: "right"}
+	if IdentityKey(left) == IdentityKey(right) {
+		t.Fatal("duplicate Roblox paths with distinct stable IDs must have distinct identities")
+	}
+}
+
+func TestValidateRecordsRejectsDuplicateStableIDAndAmbiguousFallback(t *testing.T) {
+	snapshot := map[string]SyncRecord{
+		"Workspace/A~rid_same.Part/properties.init.json": {
+			Entity: EntityUIInstance, LocalPath: "Workspace/A~rid_same.Part/properties.init.json", RbxPath: "game.Workspace.A", StableID: "same",
+		},
+		"Workspace/B~rid_same.Part/properties.init.json": {
+			Entity: EntityUIInstance, LocalPath: "Workspace/B~rid_same.Part/properties.init.json", RbxPath: "game.Workspace.B", StableID: "same",
+		},
+		"Workspace/UnnamedA.Part/properties.init.json": {
+			Entity: EntityUIInstance, LocalPath: "Workspace/UnnamedA.Part/properties.init.json", RbxPath: "game.Workspace.Duplicate", StableID: "path:one",
+		},
+		"Workspace/UnnamedB.Part/properties.init.json": {
+			Entity: EntityUIInstance, LocalPath: "Workspace/UnnamedB.Part/properties.init.json", RbxPath: "game.Workspace.Duplicate", StableID: "path:two",
+		},
+	}
+	conflicts := ValidateRecords(snapshot)
+	seen := map[ConflictKind]bool{}
+	for _, conflict := range conflicts {
+		seen[conflict.Kind] = true
+	}
+	if !seen[ConflictDuplicateStableID] || !seen[ConflictAmbiguousTarget] {
+		t.Fatalf("conflicts = %#v, want duplicate stable ID and ambiguous target", conflicts)
 	}
 }
 
