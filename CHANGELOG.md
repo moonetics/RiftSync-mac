@@ -2,6 +2,28 @@
 
 Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
+## 4.2.2 - 2026-09-18
+
+- Excluded `SoundService` by default alongside `Workspace` in the Explorer service filter dropdown for a cleaner, focused default tree view.
+- Removed redundant batch enablement buttons and stray separator characters from the VM Protection panel.
+- Bumped app and plugin version to `4.2.2`.
+
+## 4.2.1 - 2026-09-18
+
+- Added Service Filter multi-select dropdown beside search bar with bulk toggle (`All`/`None`), excluding massive `Workspace` by default for instant tree rendering.
+- Fixed dark fallback icons for Roblox root services and post-processing effects with authentic, vibrant vector SVG icons (`SoundService`, `ServerScriptService`, `ReplicatedStorage`, `ServerStorage`, `StarterGui`, `StarterPack`, `Bloom`, `ColorCorrection`, etc.).
+- Fixed `SoundService` tree row alignment and removed confusing `Off` badge on non-script UI instances.
+- Streamlined Security & Batch action panel layout with compact button heights and spacing to eliminate vertical clipping.
+- Added visible custom WebKit scrollbars on Explorer tree and Inspector sub-panels.
+
+## 4.2.0 - 2026-09-18
+
+- Added Sorevium VM Obfuscator integration inside RiftSync GUI Webview with dedicated **Protection** tab.
+- Integrated full Roblox Studio Explorer replica tree with official Roblox service and script icons, collapse/expand carets, and real-time search filter.
+- In-place script protection using Local Vault (`.rblxsync/vault/`): active game files are substituted with zero-lag Sorevium VM bytecode without breaking `require()` paths or game hierarchies.
+- 1-click single-script and batch-folder protection and restoration.
+- Single standalone binary compilation with embedded Luau AST CGO bridge and VM generator.
+
 ## 4.1.11 - 2026-09-17
 
 - Optimized idle CPU and I/O performance by separating event-driven `fsnotify` watcher from the legacy periodic scan loop.

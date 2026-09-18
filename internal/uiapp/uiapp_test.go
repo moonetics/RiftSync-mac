@@ -1158,7 +1158,7 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 	typeListDocument := string(typeListBody)
 	for _, needle := range []string{
 		`BootstrapPreview = "/bootstrap/preview"`,
-		`TypeList.VERSION = "4.1.11"`,
+		`TypeList.VERSION = "4.2.2"`,
 	} {
 		if !strings.Contains(typeListDocument, needle) {
 			t.Fatalf("TypeList missing %q", needle)

@@ -20,6 +20,7 @@ import (
 	"riftsync/internal/config"
 	"riftsync/internal/exechistory"
 	"riftsync/internal/instances"
+	"riftsync/internal/obfuscator"
 	"riftsync/internal/profilediscovery"
 	"riftsync/internal/serverapp"
 	"riftsync/internal/state"
@@ -391,6 +392,17 @@ func (m *multiAppController) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/app/exec/run", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExecRun(w, r) }))
 	mux.HandleFunc("/app/exec/rerun", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExecRerun(w, r) }))
 	mux.HandleFunc("/app/logs", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleLogs(w, r) }))
+	mux.HandleFunc("/app/protection/tree", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleProtectionTree(w, r) }))
+	mux.HandleFunc("/app/protection/protect", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleProtectionProtect(w, r) }))
+	mux.HandleFunc("/app/protection/restore", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleProtectionRestore(w, r) }))
+	mux.HandleFunc("/app/explorer/tree", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleProtectionTree(w, r) }))
+	mux.HandleFunc("/app/explorer/protect", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleProtectionProtect(w, r) }))
+	mux.HandleFunc("/app/explorer/restore", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleProtectionRestore(w, r) }))
+	mux.HandleFunc("/app/explorer/set-enabled", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExplorerSetEnabled(w, r) }))
+	mux.HandleFunc("/app/explorer/set-properties", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExplorerSetProperties(w, r) }))
+	mux.HandleFunc("/app/explorer/reveal", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExplorerReveal(w, r) }))
+	mux.HandleFunc("/app/explorer/rename", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExplorerRename(w, r) }))
+	mux.HandleFunc("/app/explorer/delete", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExplorerDelete(w, r) }))
 	mux.HandleFunc("/app/window/minimize", m.handleWindowMinimize)
 	mux.HandleFunc("/app/window/close", m.handleWindowClose)
 	mux.HandleFunc("/app/quit", m.handleWindowClose)
@@ -1061,6 +1073,17 @@ func (a *appController) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/app/exec/run", a.handleExecRun)
 	mux.HandleFunc("/app/exec/rerun", a.handleExecRerun)
 	mux.HandleFunc("/app/logs", a.handleLogs)
+	mux.HandleFunc("/app/protection/tree", a.handleProtectionTree)
+	mux.HandleFunc("/app/protection/protect", a.handleProtectionProtect)
+	mux.HandleFunc("/app/protection/restore", a.handleProtectionRestore)
+	mux.HandleFunc("/app/explorer/tree", a.handleProtectionTree)
+	mux.HandleFunc("/app/explorer/protect", a.handleProtectionProtect)
+	mux.HandleFunc("/app/explorer/restore", a.handleProtectionRestore)
+	mux.HandleFunc("/app/explorer/set-enabled", a.handleExplorerSetEnabled)
+	mux.HandleFunc("/app/explorer/set-properties", a.handleExplorerSetProperties)
+	mux.HandleFunc("/app/explorer/reveal", a.handleExplorerReveal)
+	mux.HandleFunc("/app/explorer/rename", a.handleExplorerRename)
+	mux.HandleFunc("/app/explorer/delete", a.handleExplorerDelete)
 	mux.HandleFunc("/app/window/minimize", a.handleWindowMinimize)
 	mux.HandleFunc("/app/window/close", a.handleWindowClose)
 	mux.HandleFunc("/app/quit", a.handleQuit)
@@ -1606,6 +1629,263 @@ func (a *appController) handleLogs(w http.ResponseWriter, r *http.Request) {
 		"git":           status.Git,
 		"activity":      status.Activity,
 		"scan_warnings": status.Warnings,
+	})
+}
+
+type protectionProtectRequest struct {
+	Paths     []string `json:"paths"`
+	Watermark string   `json:"watermark"`
+}
+
+type protectionRestoreRequest struct {
+	Paths []string `json:"paths"`
+}
+
+func (a *appController) handleProtectionTree(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	if syncRoot == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no sync root configured"})
+		return
+	}
+	summary, err := obfuscator.BuildExplorer(syncRoot)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "ok",
+		"summary":   summary,
+		"sync_root": syncRoot,
+	})
+}
+
+func (a *appController) handleProtectionProtect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var req protectionProtectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	if len(req.Paths) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no paths specified"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	if syncRoot == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no sync root configured"})
+		return
+	}
+	processed, err := obfuscator.ProtectScripts(syncRoot, req.Paths, req.Watermark)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "ok",
+		"processed": processed,
+	})
+}
+
+func (a *appController) handleProtectionRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var req protectionRestoreRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	if len(req.Paths) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no paths specified"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	if syncRoot == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no sync root configured"})
+		return
+	}
+	restored, err := obfuscator.RestoreScripts(syncRoot, req.Paths)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "ok",
+		"restored": restored,
+	})
+}
+
+type explorerSetEnabledRequest struct {
+	Paths   []string `json:"paths"`
+	Enabled bool     `json:"enabled"`
+}
+
+type explorerRevealRequest struct {
+	Path string `json:"path"`
+}
+
+func (a *appController) handleExplorerSetEnabled(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var req explorerSetEnabledRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	if len(req.Paths) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no paths specified"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	if syncRoot == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no sync root configured"})
+		return
+	}
+	updated, err := obfuscator.SetScriptsEnabled(syncRoot, req.Paths, req.Enabled)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"updated": updated,
+		"enabled": req.Enabled,
+	})
+}
+
+type explorerSetPropertiesRequest struct {
+	Path       string         `json:"path"`
+	Properties map[string]any `json:"properties"`
+}
+
+func (a *appController) handleExplorerSetProperties(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var req explorerSetPropertiesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	if req.Path == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no path specified"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	if syncRoot == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no sync root configured"})
+		return
+	}
+	if err := obfuscator.SetInstanceProperties(syncRoot, req.Path, req.Properties); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "ok",
+		"path":       req.Path,
+		"properties": req.Properties,
+	})
+}
+
+func (a *appController) handleExplorerReveal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var req explorerRevealRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	if syncRoot == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no sync root configured"})
+		return
+	}
+	if err := obfuscator.RevealPath(syncRoot, req.Path); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+type explorerRenameRequest struct {
+	Path    string `json:"path"`
+	NewName string `json:"new_name"`
+}
+
+func (a *appController) handleExplorerRename(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var req explorerRenameRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	if req.Path == "" || strings.TrimSpace(req.NewName) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "path and new_name are required"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	if syncRoot == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no sync root configured"})
+		return
+	}
+	newRel, err := obfuscator.RenameInstance(syncRoot, req.Path, req.NewName)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "ok",
+		"old_path": req.Path,
+		"new_path": newRel,
+	})
+}
+
+type explorerDeleteRequest struct {
+	Path string `json:"path"`
+}
+
+func (a *appController) handleExplorerDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var req explorerDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "invalid JSON"})
+		return
+	}
+	if req.Path == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "path is required"})
+		return
+	}
+	syncRoot := a.status().SyncRoot
+	if syncRoot == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": "no sync root configured"})
+		return
+	}
+	if err := obfuscator.DeleteInstance(syncRoot, req.Path); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"path":   req.Path,
 	})
 }
 
