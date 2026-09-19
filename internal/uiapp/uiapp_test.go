@@ -1158,7 +1158,7 @@ func TestPluginPullStudioPreviewAndHealthChecklist(t *testing.T) {
 	typeListDocument := string(typeListBody)
 	for _, needle := range []string{
 		`BootstrapPreview = "/bootstrap/preview"`,
-		`TypeList.VERSION = "4.2.2"`,
+		`TypeList.VERSION = "4.2.3"`,
 	} {
 		if !strings.Contains(typeListDocument, needle) {
 			t.Fatalf("TypeList missing %q", needle)
@@ -1390,4 +1390,33 @@ func freePort(t *testing.T) int {
 	}
 	defer listener.Close()
 	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func TestAppOpenIDERoute(t *testing.T) {
+	tempDir := t.TempDir()
+	opts := serverapp.Options{
+		HostOverride:     "127.0.0.1",
+		PortOverride:     freePort(t),
+		SyncRootOverride: tempDir,
+	}
+	controller := &appController{
+		runner:  serverapp.New(opts),
+		options: opts,
+		quit:    make(chan struct{}),
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/app/open-ide", nil)
+	getRec := httptest.NewRecorder()
+	controller.handleOpenIDE(getRec, getReq)
+	if getRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d", getRec.Code)
+	}
+
+	body, _ := json.Marshal(openIDERequest{IDE: "invalid_ide_test"})
+	postReq := httptest.NewRequest(http.MethodPost, "/app/open-ide", bytes.NewReader(body))
+	postRec := httptest.NewRecorder()
+	controller.handleOpenIDE(postRec, postReq)
+	if postRec.Code != http.StatusOK && postRec.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status %d", postRec.Code)
+	}
 }

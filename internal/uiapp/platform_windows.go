@@ -78,6 +78,36 @@ func openFolder(target string) error {
 	return cmd.Start()
 }
 
+func openInIDE(target, ide string) error {
+	ide = strings.ToLower(strings.TrimSpace(ide))
+	switch ide {
+	case "vscode":
+		cmd := exec.Command("cmd", "/c", "code", target)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err := cmd.Start(); err == nil {
+			return nil
+		}
+	case "cursor":
+		cmd := exec.Command("cmd", "/c", "cursor", target)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err := cmd.Start(); err == nil {
+			return nil
+		}
+	case "auto", "":
+		cmd := exec.Command("cmd", "/c", "code", target)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err := cmd.Start(); err == nil {
+			return nil
+		}
+		cmd2 := exec.Command("cmd", "/c", "cursor", target)
+		cmd2.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err := cmd2.Start(); err == nil {
+			return nil
+		}
+	}
+	return openFolder(target)
+}
+
 func (w *windowController) makeFrameless() error {
 	if w == nil || w.native == 0 {
 		return errors.New("window handle is unavailable")

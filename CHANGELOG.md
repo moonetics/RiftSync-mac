@@ -2,6 +2,12 @@
 
 Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
+## 4.2.3 - 2026-09-19
+
+- Added interactive "Clean Duplicate IDs" feature in plugin to detect and clear duplicate/conflicting StableIds with one click without affecting other instances.
+- Optimized `clearStudioStableIds` with frame yielding (time-slicing every 20ms) and memory reduction to prevent Roblox Studio freezes on large places (50,000+ instances).
+- Bumped app and plugin version to `4.2.3`.
+
 ## 4.2.2 - 2026-09-18
 
 - Excluded `SoundService` by default alongside `Workspace` in the Explorer service filter dropdown for a cleaner, focused default tree view.

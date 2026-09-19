@@ -1557,6 +1557,117 @@ function SyncAPI:isForceIdentityRepairEnabled()
 	return self.forceIdentityRepair == true
 end
 
+function SyncAPI:getLastDuplicateInstances()
+	return self.lastDuplicateInstances or {}
+end
+
+function SyncAPI:detectStudioDuplicateIds()
+	local duplicates = {
+		count = 0,
+		idCount = 0,
+		instances = {},
+		byStableId = {},
+		paths = {},
+	}
+	local byStableId = {}
+	local visited = {}
+	local lastYieldAt = os.clock()
+
+	for _, rootPath in ipairs(self.managedRoots or {}) do
+		local rootInstance = resolvePath(rootPath)
+		if rootInstance then
+			local pending = { rootInstance }
+			while #pending > 0 do
+				local instance = table.remove(pending)
+				if not visited[instance] then
+					visited[instance] = true
+					local gamePath = buildGamePath(instance)
+					if not isIgnoredPath(gamePath, self.ignoredRbxPaths or {}) then
+						for _, child in ipairs(instance:GetChildren()) do
+							table.insert(pending, child)
+						end
+
+						local stableId = instance:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)
+						if typeof(stableId) == "string" and Identity.isExplicitStableId(stableId) then
+							byStableId[stableId] = byStableId[stableId] or {}
+							table.insert(byStableId[stableId], instance)
+						end
+
+						if os.clock() - lastYieldAt >= 0.02 then
+							task.wait()
+							lastYieldAt = os.clock()
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for stableId, list in pairs(byStableId) do
+		if #list > 1 then
+			duplicates.idCount += 1
+			duplicates.byStableId[stableId] = list
+			for _, inst in ipairs(list) do
+				duplicates.count += 1
+				table.insert(duplicates.instances, inst)
+				local pathOk, fullName = pcall(function() return inst:GetFullName() end)
+				if pathOk and fullName then
+					table.insert(duplicates.paths, fullName)
+				end
+			end
+		end
+	end
+
+	self.lastDuplicateInstances = duplicates.instances
+	return duplicates
+end
+
+function SyncAPI:cleanDuplicateStudioIds(customCandidates : {Instance}?)
+	local targets = customCandidates
+	if not targets or #targets == 0 then
+		targets = self.lastDuplicateInstances
+	end
+	if not targets or #targets == 0 then
+		local detected = self:detectStudioDuplicateIds()
+		targets = detected.instances
+	end
+
+	if not targets or #targets == 0 then
+		return 0, nil
+	end
+
+	local recordingKind, recordingIdentifier = beginForceIdentityRepairRecording()
+	local cleanedCount = 0
+	local visited = {}
+	local lastYieldAt = os.clock()
+
+	for _, instance in ipairs(targets) do
+		if instance and instance.Parent and not visited[instance] then
+			visited[instance] = true
+			local ok = pcall(function()
+				instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, nil)
+				instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.LocalPath, nil)
+				instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged, nil)
+				instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.LastSyncedHash, nil)
+				instance:SetAttribute("SyncId", nil)
+				instance:SetAttribute("ManagedByLocalSync", nil)
+			end)
+			if ok then
+				cleanedCount += 1
+			end
+		end
+		if os.clock() - lastYieldAt >= 0.02 then
+			task.wait()
+			lastYieldAt = os.clock()
+		end
+	end
+
+	finishForceIdentityRepairRecording(recordingKind, recordingIdentifier, true)
+	self.lastDuplicateInstances = {}
+	self:appendDebugEvent("Cleaned " .. tostring(cleanedCount) .. " duplicate identity instances in Studio", false)
+	return cleanedCount, nil
+end
+
 function SyncAPI:isRunning()
 	return self.running
 end
@@ -3857,6 +3968,7 @@ clearStudioStableIds = function(self)
 	local clearedEntries = {}
 	local clearedCount = 0
 	local visited = {}
+	local lastYieldAt = os.clock()
 
 	for _, rootPath in ipairs(self.managedRoots or {}) do
 		local rootInstance = resolvePath(rootPath)
@@ -3885,17 +3997,17 @@ clearStudioStableIds = function(self)
 							or syncId ~= nil
 							or legacyManaged ~= nil
 
-						local entry = {
-							instance = instance,
-							stableId = stableId,
-							localPath = localPath,
-							isManaged = isManaged,
-							lastHash = lastHash,
-							syncId = syncId,
-							legacyManaged = legacyManaged,
-						}
-						table.insert(clearedEntries, entry)
 						if hasAnyAttribute then
+							local entry = {
+								instance = instance,
+								stableId = stableId,
+								localPath = localPath,
+								isManaged = isManaged,
+								lastHash = lastHash,
+								syncId = syncId,
+								legacyManaged = legacyManaged,
+							}
+							table.insert(clearedEntries, entry)
 							local ok, clearError = pcall(function()
 								instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId, nil)
 								instance:SetAttribute(TypeList.MANAGED_ATTRIBUTES.LocalPath, nil)
@@ -3910,6 +4022,11 @@ clearStudioStableIds = function(self)
 								return nil, tostring(clearError) .. suffix, clearedCount
 							end
 							clearedCount += 1
+						end
+
+						if os.clock() - lastYieldAt >= 0.02 then
+							task.wait()
+							lastYieldAt = os.clock()
 						end
 					end
 				end
@@ -6867,12 +6984,14 @@ local function preflightChanges(self, changes : {any})
 		table.insert(conflicts, conflict)
 	end
 
+	local detectedDuplicates = {}
 	for stableId, candidates in pairs(indexes.byStableIdAll or {}) do
 		if Identity.isExplicitStableId(stableId) and #candidates > 1 then
 			duplicateStudioIds[stableId] = true
 			local paths = {}
 			for _, candidate in ipairs(candidates) do
 				table.insert(paths, candidate:GetFullName())
+				table.insert(detectedDuplicates, candidate)
 			end
 			table.sort(paths)
 			add(makeApplyConflict(
@@ -6884,6 +7003,7 @@ local function preflightChanges(self, changes : {any})
 			))
 		end
 	end
+	self.lastDuplicateInstances = detectedDuplicates
 
 	local identityPlan = Identity.buildApplyPlan(changes, indexes.candidates)
 	for _, conflict in ipairs(identityPlan.conflicts or {}) do

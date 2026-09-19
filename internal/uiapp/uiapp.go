@@ -386,6 +386,7 @@ func (m *multiAppController) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/app/restart", m.handleScopedConfigMutation(true))
 	mux.HandleFunc("/app/config/apply", m.handleScopedConfigMutation(false))
 	mux.HandleFunc("/app/open-folder", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleOpenFolder(w, r) }))
+	mux.HandleFunc("/app/open-ide", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleOpenIDE(w, r) }))
 	mux.HandleFunc("/app/pick-folder", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handlePickFolder(w, r) }))
 	mux.HandleFunc("/app/history", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleHistory(w, r) }))
 	mux.HandleFunc("/app/exec/history", m.delegate(func(a *appController, w http.ResponseWriter, r *http.Request) { a.handleExecHistory(w, r) }))
@@ -1067,6 +1068,7 @@ func (a *appController) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/app/restart", a.handleRestart)
 	mux.HandleFunc("/app/config/apply", a.handleConfigApply)
 	mux.HandleFunc("/app/open-folder", a.handleOpenFolder)
+	mux.HandleFunc("/app/open-ide", a.handleOpenIDE)
 	mux.HandleFunc("/app/pick-folder", a.handlePickFolder)
 	mux.HandleFunc("/app/history", a.handleHistory)
 	mux.HandleFunc("/app/exec/history", a.handleExecHistory)
@@ -1240,6 +1242,35 @@ func (a *appController) handleOpenFolder(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "app": payload})
+}
+
+type openIDERequest struct {
+	IDE string `json:"ide"`
+}
+
+func (a *appController) handleOpenIDE(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "error": "method not allowed"})
+		return
+	}
+	var req openIDERequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	payload := a.status()
+	target := strings.TrimSpace(payload.SyncRoot)
+	if target == "" {
+		target = "src/game"
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": payload})
+		return
+	}
+	if err := openInIDE(target, req.IDE); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "error": err.Error(), "app": payload})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "app": payload, "ide": req.IDE})
 }
 
 func (a *appController) handlePickFolder(w http.ResponseWriter, r *http.Request) {

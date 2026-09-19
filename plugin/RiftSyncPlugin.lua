@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------------------
--- RiftSyncPlugin v4.2.2
+-- RiftSyncPlugin v4.2.3
 -- Multi-profile Roblox Studio client for RiftSync.
 --------------------------------------------------------------------------------------------
 
@@ -365,10 +365,14 @@ local forceIdentityRepairHint = wrappedLabel(
 	false
 )
 forceIdentityRepairHint.LayoutOrder = 3
+local cleanDuplicatesStartButton = button(startSourcePanel, "Clean Duplicate IDs", COLORS.Amber, 4)
+cleanDuplicatesStartButton.Size = UDim2.new(1, 0, 0, 36)
+cleanDuplicatesStartButton.TextColor3 = COLORS.BorderDark
+cleanDuplicatesStartButton.Visible = false
 local startSourceActions = Instance.new("Frame")
 startSourceActions.Size = UDim2.new(1, 0, 0, 40)
 startSourceActions.BackgroundTransparency = 1
-startSourceActions.LayoutOrder = 4
+startSourceActions.LayoutOrder = 5
 startSourceActions.Parent = startSourcePanel
 horizontalList(startSourceActions, 8)
 local startFromStudioButton = button(startSourceActions, "Use Studio", COLORS.Cyan, 1)
@@ -377,7 +381,7 @@ startFromStudioButton.Size = UDim2.new(0.5, -4, 0, 40)
 local startFromLocalButton = button(startSourceActions, "Use Local", COLORS.Green, 2)
 startFromLocalButton.TextColor3 = COLORS.BorderDark
 startFromLocalButton.Size = UDim2.new(0.5, -4, 0, 40)
-local cancelStartButton = button(startSourcePanel, "Cancel", COLORS.SurfaceHigh, 5)
+local cancelStartButton = button(startSourcePanel, "Cancel", COLORS.SurfaceHigh, 6)
 cancelStartButton.Size = UDim2.new(1, 0, 0, 40)
 
 local pullPreviewPanel = panel(scroll, 6)
@@ -419,6 +423,10 @@ progressFill.Parent = progressTrack
 corner(progressFill, 4)
 local progressCaption = label(statusPanel, "", 12, COLORS.Muted, false)
 progressCaption.Visible = false
+local cleanDuplicatesStatusButton = button(statusPanel, "Clean Duplicate IDs", COLORS.Amber, 5)
+cleanDuplicatesStatusButton.Size = UDim2.new(1, 0, 0, 36)
+cleanDuplicatesStatusButton.TextColor3 = COLORS.BorderDark
+cleanDuplicatesStatusButton.Visible = false
 
 local historyPanel = panel(scroll, 7)
 label(historyPanel, "RECENT SYNC ACTIVITY", 10, COLORS.Muted, true)
@@ -725,7 +733,78 @@ updateStatus = function(text, isError, meta)
 		setProfileControlsLocked(client:isRunning())
 		updateExecUI()
 	end
+	if isError and (string.find(raw, "duplicate_stable_id", 1, true) or string.find(raw, "dipakai oleh lebih dari satu instance", 1, true)) then
+		local lastDups = client and client.getLastDuplicateInstances and client:getLastDuplicateInstances() or {}
+		if #lastDups > 0 then
+			local labelText = string.format("Clean Duplicate IDs (%d objects)", #lastDups)
+			cleanDuplicatesStatusButton.Text = labelText
+			cleanDuplicatesStatusButton.Visible = true
+			cleanDuplicatesStartButton.Text = labelText
+			cleanDuplicatesStartButton.Visible = true
+		elseif client and client.detectStudioDuplicateIds then
+			task.spawn(function()
+				local detected = client:detectStudioDuplicateIds()
+				if detected.count > 0 then
+					local labelText = string.format("Clean Duplicate IDs (%d objects)", detected.count)
+					cleanDuplicatesStatusButton.Text = labelText
+					cleanDuplicatesStatusButton.Visible = true
+					cleanDuplicatesStartButton.Text = labelText
+					cleanDuplicatesStartButton.Visible = true
+				end
+			end)
+		end
+	end
 end
+
+local function refreshDuplicateButtons()
+	if not client then
+		cleanDuplicatesStatusButton.Visible = false
+		cleanDuplicatesStartButton.Visible = false
+		return
+	end
+	local lastDups = client.getLastDuplicateInstances and client:getLastDuplicateInstances() or {}
+	local count = #lastDups
+	if count > 0 then
+		local btnText = string.format("Clean Duplicate IDs (%d objects)", count)
+		cleanDuplicatesStatusButton.Text = btnText
+		cleanDuplicatesStatusButton.Visible = true
+		cleanDuplicatesStartButton.Text = btnText
+		cleanDuplicatesStartButton.Visible = true
+	else
+		cleanDuplicatesStatusButton.Visible = false
+		cleanDuplicatesStartButton.Visible = false
+	end
+end
+
+local function onCleanDuplicatesClicked()
+	if not client or not client.cleanDuplicateStudioIds then
+		return
+	end
+	cleanDuplicatesStatusButton.Active = false
+	cleanDuplicatesStartButton.Active = false
+	cleanDuplicatesStatusButton.Text = "Cleaning duplicate IDs..."
+	cleanDuplicatesStartButton.Text = "Cleaning duplicate IDs..."
+	task.spawn(function()
+		local cleaned, cleanErr = client:cleanDuplicateStudioIds()
+		cleanDuplicatesStatusButton.Active = true
+		cleanDuplicatesStartButton.Active = true
+		if cleanErr then
+			updateStatus("Failed to clean duplicates: " .. tostring(cleanErr), true)
+		elseif cleaned and cleaned > 0 then
+			refreshDuplicateButtons()
+			updateStatus(
+				string.format("Selesai membersihkan %d objek duplikat! Silakan klik Start lagi.", cleaned),
+				false
+			)
+		else
+			refreshDuplicateButtons()
+			updateStatus("Tidak ditemukan objek duplikat. Silakan klik Start.", false)
+		end
+	end)
+end
+
+cleanDuplicatesStatusButton.MouseButton1Click:Connect(onCleanDuplicatesClicked)
+cleanDuplicatesStartButton.MouseButton1Click:Connect(onCleanDuplicatesClicked)
 
 local function mark(value)
 	return value and "[x]" or "[ ]"
@@ -904,6 +983,7 @@ startButton.MouseButton1Click:Connect(function()
 	client:setForceIdentityRepair(false)
 	refreshForceIdentityRepairUI()
 	refreshStartSourceGuidance()
+	refreshDuplicateButtons()
 	startSourcePanel.Visible = true
 	setProfileControlsLocked(true)
 	updateStatus("Choose Studio or Local as the source for this start. Nothing has changed yet.", false)

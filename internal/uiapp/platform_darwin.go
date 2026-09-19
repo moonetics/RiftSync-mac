@@ -12,6 +12,78 @@ func openFolder(target string) error {
 	return exec.Command("open", target).Start()
 }
 
+func openInIDE(target, ide string) error {
+	ide = strings.ToLower(strings.TrimSpace(ide))
+	switch ide {
+	case "antigravity":
+		if err := exec.Command("open", "-b", "com.google.antigravity-ide", target).Run(); err == nil {
+			return nil
+		}
+		if err := exec.Command("open", "-b", "com.google.antigravity", target).Run(); err == nil {
+			return nil
+		}
+		if err := exec.Command("open", "-a", "Antigravity IDE", target).Run(); err == nil {
+			return nil
+		}
+		return exec.Command("open", "-a", "Antigravity", target).Run()
+
+	case "vscode":
+		if err := exec.Command("open", "-b", "com.microsoft.VSCode", target).Run(); err == nil {
+			return nil
+		}
+		if err := exec.Command("open", "-a", "Visual Studio Code", target).Run(); err == nil {
+			return nil
+		}
+		return exec.Command("code", target).Run()
+
+	case "cursor":
+		if err := exec.Command("open", "-b", "com.todesktop.230313mzl4w4u92", target).Run(); err == nil {
+			return nil
+		}
+		if err := exec.Command("open", "-a", "Cursor", target).Run(); err == nil {
+			return nil
+		}
+		return exec.Command("cursor", target).Run()
+
+	case "default":
+		return exec.Command("open", target).Start()
+
+	case "auto", "":
+		// Priority 1: Antigravity IDE
+		if err := exec.Command("open", "-b", "com.google.antigravity-ide", target).Run(); err == nil {
+			return nil
+		}
+		if err := exec.Command("open", "-b", "com.google.antigravity", target).Run(); err == nil {
+			return nil
+		}
+		if err := exec.Command("open", "-a", "Antigravity IDE", target).Run(); err == nil {
+			return nil
+		}
+		// Priority 2: Visual Studio Code
+		if err := exec.Command("open", "-b", "com.microsoft.VSCode", target).Run(); err == nil {
+			return nil
+		}
+		if err := exec.Command("open", "-a", "Visual Studio Code", target).Run(); err == nil {
+			return nil
+		}
+		if err := exec.Command("code", target).Run(); err == nil {
+			return nil
+		}
+		// Priority 3: Cursor
+		if err := exec.Command("open", "-b", "com.todesktop.230313mzl4w4u92", target).Run(); err == nil {
+			return nil
+		}
+		// Fallback: System default
+		return exec.Command("open", target).Start()
+
+	default:
+		if err := exec.Command("open", "-a", ide, target).Run(); err == nil {
+			return nil
+		}
+		return exec.Command("open", target).Start()
+	}
+}
+
 // macOS keeps its native title bar. The embedded page remains fully usable,
 // while close is finalized through webview.Terminate in requestQuit.
 func (w *windowController) makeFrameless() error { return nil }

@@ -5,6 +5,9 @@ package uiapp
 import "errors"
 
 func openFolder(string) error { return errors.New("open folder is unsupported on this platform") }
+func openInIDE(string, string) error {
+	return errors.New("open in IDE is unsupported on this platform")
+}
 func pickFolder(uintptr) (string, bool, error) {
 	return "", false, errors.New("folder picker is unsupported on this platform")
 }
