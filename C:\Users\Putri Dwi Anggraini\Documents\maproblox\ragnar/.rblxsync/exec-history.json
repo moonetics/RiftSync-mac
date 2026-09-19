@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "exec_1789782012887303000",
+      "timestamp": "2026-09-19T01:40:12.887303Z",
+      "submitted_by": "cli",
+      "source_kind": "inline",
+      "source": "return { name = workspace.Name, count = #workspace:GetChildren() } --json",
+      "source_summary": {
+        "line_count": 1,
+        "char_count": 73,
+        "byte_count": 73,
+        "first_line": "return { name = workspace.Name, count = #workspace:GetChildren() } --json"
+      },
+      "timeout_sec": 10,
+      "result_state": "submit_failed",
+      "ok": false,
+      "error": "Post \"http://127.0.0.1:8765/exec/commands\": dial tcp 127.0.0.1:8765: connect: connection refused"
+    }
+  ]
+}

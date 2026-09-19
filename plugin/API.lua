@@ -330,23 +330,44 @@ local function getServiceByName(serviceName : string)
 end
 
 local function findUniqueChild(parent : Instance, childName : string, className : string?)
-	local found = nil
+	local matches = {}
 	for _, child in ipairs(parent:GetChildren()) do
 		if child.Name == childName and (className == nil or className == "" or child.ClassName == className) then
-			if found then
-				local classHint = if className and className ~= "" then "." .. className else ""
-				return nil,
-					"AMBIGUOUS_SIBLING: multiple children named "
-						.. childName
-						.. classHint
-						.. " under "
-						.. parent:GetFullName()
-						.. "; rename one of them before syncing"
-			end
-			found = child
+			table.insert(matches, child)
 		end
 	end
-	return found, nil
+
+	if #matches == 0 then
+		return nil, nil
+	end
+
+	if #matches == 1 then
+		return matches[1], nil
+	end
+
+	-- Multiple children with identical name: prioritize managed instance if only one is managed
+	local managedMatches = {}
+	for _, child in ipairs(matches) do
+		if child:GetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged) == true
+			or child:GetAttribute("ManagedByLocalSync") == true
+			or (typeof(child:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)) == "string" and child:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId) ~= "")
+		then
+			table.insert(managedMatches, child)
+		end
+	end
+
+	if #managedMatches == 1 then
+		return managedMatches[1], nil
+	end
+
+	local classHint = if className and className ~= "" then "." .. className else ""
+	return nil,
+		"AMBIGUOUS_SIBLING: multiple children named "
+			.. childName
+			.. classHint
+			.. " under "
+			.. parent:GetFullName()
+			.. "; rename one of them before syncing"
 end
 
 local function findChildByStableId(parent : Instance, stableId : string)
@@ -3857,25 +3878,43 @@ local function newMutationJournal()
 			local instance = entry.instance
 			if not self.created[instance] then
 				local ok, err = pcall(function()
-					instance.Name = entry.name
-					instance.Parent = entry.parent
+					if instance.Name ~= entry.name and instance.Parent ~= game then
+						pcall(function()
+							instance.Name = entry.name
+						end)
+					end
+					if instance.Parent ~= entry.parent and entry.parent ~= nil and instance.Parent ~= game then
+						pcall(function()
+							instance.Parent = entry.parent
+						end)
+					end
 					for key, value in pairs(entry.attributes) do
-						instance:SetAttribute(key, value)
+						pcall(function()
+							instance:SetAttribute(key, value)
+						end)
 					end
 					for key, _ in pairs(instance:GetAttributes()) do
 						if entry.attributes[key] == nil then
-							instance:SetAttribute(key, nil)
+							pcall(function()
+								instance:SetAttribute(key, nil)
+							end)
 						end
 					end
 					for _, tag in ipairs(collectionService:GetTags(instance)) do
-						collectionService:RemoveTag(instance, tag)
+						pcall(function()
+							collectionService:RemoveTag(instance, tag)
+						end)
 					end
 					for _, tag in ipairs(entry.tags) do
-						collectionService:AddTag(instance, tag)
+						pcall(function()
+							collectionService:AddTag(instance, tag)
+						end)
 					end
 					for propertyName, property in pairs(entry.properties) do
 						if property.present then
-							(instance :: any)[propertyName] = property.value
+							pcall(function()
+								(instance :: any)[propertyName] = property.value
+							end)
 						end
 					end
 				end)
