@@ -2,7 +2,7 @@
 
 Fork macOS dari RiftSync dengan aplikasi native `RiftSync.app`, server Apple Silicon, dan profile Local plugin yang mengikuti project di aplikasi. Dukungan build Windows tetap dipertahankan di source yang sama.
 
-Versi: `4.2.3`
+Versi: `4.2.04`
 Protocol sync: `rbxsync/2.0.0`
 
 One-way sync untuk Roblox Studio:

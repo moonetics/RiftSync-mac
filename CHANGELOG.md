@@ -2,6 +2,12 @@
 
 Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
+## 4.2.04 - 2026-09-19
+
+- Standardized minor/patch release numbering schema to 2-digit format (`x.x.xx`).
+- Fixed `ambiguous_target` error when applying local snapshot where unmanaged Studio instances had identical names in different branches.
+- Rebuilt native macOS app (`RiftSync.app`), CLI server, and Roblox Studio plugin.
+
 ## 4.2.3 - 2026-09-19
 
 - Added interactive "Clean Duplicate IDs" feature in plugin to detect and clear duplicate/conflicting StableIds with one click without affecting other instances.
