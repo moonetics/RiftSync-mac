@@ -1,6 +1,6 @@
 local TypeList = {}
 
-TypeList.VERSION = "4.2.04"
+TypeList.VERSION = "4.2.05"
 TypeList.PROTOCOL = "rbxsync/2.0.0"
 TypeList.PLUGIN_ICON = "rbxassetid://72034413544662"
 TypeList.CHANGE_ENCODINGS = {

@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------------------
--- RiftSyncPlugin v4.2.04
+-- RiftSyncPlugin v4.2.05
 -- Multi-profile Roblox Studio client for RiftSync.
 --------------------------------------------------------------------------------------------
 
@@ -369,10 +369,14 @@ local cleanDuplicatesStartButton = button(startSourcePanel, "Clean Duplicate IDs
 cleanDuplicatesStartButton.Size = UDim2.new(1, 0, 0, 36)
 cleanDuplicatesStartButton.TextColor3 = COLORS.BorderDark
 cleanDuplicatesStartButton.Visible = false
+local renameSiblingsStartButton = button(startSourcePanel, "Auto-Rename Sibling Duplicates", COLORS.Amber, 5)
+renameSiblingsStartButton.Size = UDim2.new(1, 0, 0, 36)
+renameSiblingsStartButton.TextColor3 = COLORS.BorderDark
+renameSiblingsStartButton.Visible = false
 local startSourceActions = Instance.new("Frame")
 startSourceActions.Size = UDim2.new(1, 0, 0, 40)
 startSourceActions.BackgroundTransparency = 1
-startSourceActions.LayoutOrder = 5
+startSourceActions.LayoutOrder = 6
 startSourceActions.Parent = startSourcePanel
 horizontalList(startSourceActions, 8)
 local startFromStudioButton = button(startSourceActions, "Use Studio", COLORS.Cyan, 1)
@@ -381,7 +385,7 @@ startFromStudioButton.Size = UDim2.new(0.5, -4, 0, 40)
 local startFromLocalButton = button(startSourceActions, "Use Local", COLORS.Green, 2)
 startFromLocalButton.TextColor3 = COLORS.BorderDark
 startFromLocalButton.Size = UDim2.new(0.5, -4, 0, 40)
-local cancelStartButton = button(startSourcePanel, "Cancel", COLORS.SurfaceHigh, 6)
+local cancelStartButton = button(startSourcePanel, "Cancel", COLORS.SurfaceHigh, 7)
 cancelStartButton.Size = UDim2.new(1, 0, 0, 40)
 
 local pullPreviewPanel = panel(scroll, 6)
@@ -427,6 +431,10 @@ local cleanDuplicatesStatusButton = button(statusPanel, "Clean Duplicate IDs", C
 cleanDuplicatesStatusButton.Size = UDim2.new(1, 0, 0, 36)
 cleanDuplicatesStatusButton.TextColor3 = COLORS.BorderDark
 cleanDuplicatesStatusButton.Visible = false
+local renameSiblingsStatusButton = button(statusPanel, "Auto-Rename Sibling Duplicates", COLORS.Amber, 6)
+renameSiblingsStatusButton.Size = UDim2.new(1, 0, 0, 36)
+renameSiblingsStatusButton.TextColor3 = COLORS.BorderDark
+renameSiblingsStatusButton.Visible = false
 
 local historyPanel = panel(scroll, 7)
 label(historyPanel, "RECENT SYNC ACTIVITY", 10, COLORS.Muted, true)
@@ -754,12 +762,35 @@ updateStatus = function(text, isError, meta)
 			end)
 		end
 	end
+	if isError and (string.find(raw, "AMBIGUOUS_SIBLING", 1, true) or string.find(raw, "multiple children named", 1, true)) then
+		local lastSiblings = client and client.getLastDuplicateSiblingInstances and client:getLastDuplicateSiblingInstances() or {}
+		if #lastSiblings > 0 then
+			local labelText = string.format("Auto-Rename Sibling Duplicates (%d objects)", #lastSiblings)
+			renameSiblingsStatusButton.Text = labelText
+			renameSiblingsStatusButton.Visible = true
+			renameSiblingsStartButton.Text = labelText
+			renameSiblingsStartButton.Visible = true
+		elseif client and client.detectDuplicateSiblingNames then
+			task.spawn(function()
+				local detected = client:detectDuplicateSiblingNames()
+				if detected.count > 0 then
+					local labelText = string.format("Auto-Rename Sibling Duplicates (%d objects)", detected.count)
+					renameSiblingsStatusButton.Text = labelText
+					renameSiblingsStatusButton.Visible = true
+					renameSiblingsStartButton.Text = labelText
+					renameSiblingsStartButton.Visible = true
+				end
+			end)
+		end
+	end
 end
 
 local function refreshDuplicateButtons()
 	if not client then
 		cleanDuplicatesStatusButton.Visible = false
 		cleanDuplicatesStartButton.Visible = false
+		renameSiblingsStatusButton.Visible = false
+		renameSiblingsStartButton.Visible = false
 		return
 	end
 	local lastDups = client.getLastDuplicateInstances and client:getLastDuplicateInstances() or {}
@@ -773,6 +804,19 @@ local function refreshDuplicateButtons()
 	else
 		cleanDuplicatesStatusButton.Visible = false
 		cleanDuplicatesStartButton.Visible = false
+	end
+
+	local lastSiblings = client.getLastDuplicateSiblingInstances and client:getLastDuplicateSiblingInstances() or {}
+	local sibCount = #lastSiblings
+	if sibCount > 0 then
+		local sibBtnText = string.format("Auto-Rename Sibling Duplicates (%d objects)", sibCount)
+		renameSiblingsStatusButton.Text = sibBtnText
+		renameSiblingsStatusButton.Visible = true
+		renameSiblingsStartButton.Text = sibBtnText
+		renameSiblingsStartButton.Visible = true
+	else
+		renameSiblingsStatusButton.Visible = false
+		renameSiblingsStartButton.Visible = false
 	end
 end
 
@@ -803,8 +847,37 @@ local function onCleanDuplicatesClicked()
 	end)
 end
 
+local function onRenameSiblingsClicked()
+	if not client or not client.renameDuplicateSiblings then
+		return
+	end
+	renameSiblingsStatusButton.Active = false
+	renameSiblingsStartButton.Active = false
+	renameSiblingsStatusButton.Text = "Renaming sibling duplicates..."
+	renameSiblingsStartButton.Text = "Renaming sibling duplicates..."
+	task.spawn(function()
+		local renamed, renameErr = client:renameDuplicateSiblings()
+		renameSiblingsStatusButton.Active = true
+		renameSiblingsStartButton.Active = true
+		if renameErr then
+			updateStatus("Failed to rename duplicates: " .. tostring(renameErr), true)
+		elseif renamed and renamed > 0 then
+			refreshDuplicateButtons()
+			updateStatus(
+				string.format("Selesai me-rename %d objek kembar (standard copy)! Silakan klik Start lagi.", renamed),
+				false
+			)
+		else
+			refreshDuplicateButtons()
+			updateStatus("Tidak ditemukan objek kembar. Silakan klik Start.", false)
+		end
+	end)
+end
+
 cleanDuplicatesStatusButton.MouseButton1Click:Connect(onCleanDuplicatesClicked)
 cleanDuplicatesStartButton.MouseButton1Click:Connect(onCleanDuplicatesClicked)
+renameSiblingsStatusButton.MouseButton1Click:Connect(onRenameSiblingsClicked)
+renameSiblingsStartButton.MouseButton1Click:Connect(onRenameSiblingsClicked)
 
 local function mark(value)
 	return value and "[x]" or "[ ]"

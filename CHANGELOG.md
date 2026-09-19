@@ -2,6 +2,13 @@
 
 Catatan perubahan penting RiftSync, diurutkan dari rilis terbaru ke rilis lama.
 
+## 4.2.05 - 2026-09-19
+
+- Added interactive "Auto-Rename Sibling Duplicates" button in Studio plugin widget to resolve conflicting sibling names with one click.
+- Uses standard copy naming convention (`Name (Copy)`, `Name (Copy 2)`, etc.) with full Studio Undo (`Ctrl+Z`) support via `ChangeHistoryService`.
+- Time-sliced renaming with 20ms frame yields to prevent Studio freezing on large DataModels.
+- Bumped app and plugin version to `4.2.05`.
+
 ## 4.2.04 - 2026-09-19
 
 - Standardized minor/patch release numbering schema to 2-digit format (`x.x.xx`).

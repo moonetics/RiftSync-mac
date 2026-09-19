@@ -189,6 +189,41 @@ local function finishForceIdentityRepairRecording(recordingKind : string, identi
 	end
 end
 
+local function beginAutoRenameRecording()
+	local ok, identifier = pcall(function()
+		return changeHistoryService:TryBeginRecording(
+			"RiftSyncAutoRenameSiblings",
+			"RiftSync: Auto-rename duplicate siblings"
+		)
+	end)
+	if ok and typeof(identifier) == "string" and identifier ~= "" then
+		return "recording", identifier
+	end
+
+	local waypointOk = pcall(function()
+		changeHistoryService:SetWaypoint("RiftSync: Before auto-rename duplicate siblings")
+	end)
+	if waypointOk then
+		return "waypoint", nil
+	end
+	return "none", nil
+end
+
+local function finishAutoRenameRecording(recordingKind : string, identifier : string?, preserveUndo : boolean)
+	if recordingKind == "recording" and identifier then
+		pcall(function()
+			changeHistoryService:FinishRecording(
+				identifier,
+				preserveUndo and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel
+			)
+		end)
+	elseif recordingKind == "waypoint" and preserveUndo then
+		pcall(function()
+			changeHistoryService:SetWaypoint("RiftSync: Auto-rename duplicate siblings complete")
+		end)
+	end
+end
+
 local function isManagedAttributeName(attributeName : any)
 	if typeof(attributeName) ~= "string" then
 		return false
@@ -1687,6 +1722,144 @@ function SyncAPI:cleanDuplicateStudioIds(customCandidates : {Instance}?)
 	self.lastDuplicateInstances = {}
 	self:appendDebugEvent("Cleaned " .. tostring(cleanedCount) .. " duplicate identity instances in Studio", false)
 	return cleanedCount, nil
+end
+
+local function getStandardCopyName(parent : Instance, baseName : string) : string
+	local candidate = baseName .. " (Copy)"
+	if not parent:FindFirstChild(candidate) then
+		return candidate
+	end
+	local index = 2
+	while parent:FindFirstChild(baseName .. " (Copy " .. tostring(index) .. ")") do
+		index += 1
+	end
+	return baseName .. " (Copy " .. tostring(index) .. ")"
+end
+
+function SyncAPI:getLastDuplicateSiblingInstances()
+	return self.lastDuplicateSiblingInstances or {}
+end
+
+function SyncAPI:detectDuplicateSiblingNames()
+	local conflicts = {
+		count = 0,
+		instances = {},
+		details = {},
+	}
+	local visitedParents = {}
+
+	local roots = self.managedRoots
+	if not roots or #roots == 0 then
+		roots = { "game.Workspace", "game.ReplicatedFirst", "game.ReplicatedStorage", "game.ServerScriptService", "game.ServerStorage", "game.StarterGui", "game.StarterPack", "game.StarterPlayer", "game.Lighting", "game.SoundService", "game.TextChatService" }
+	end
+
+	local function checkContainer(parent : Instance)
+		if not parent or visitedParents[parent] then return end
+		visitedParents[parent] = true
+
+		local nameGroups = {}
+		local ok, children = pcall(function() return parent:GetChildren() end)
+		if not ok or not children then return end
+
+		for _, child in ipairs(children) do
+			local name = child.Name
+			if not nameGroups[name] then
+				nameGroups[name] = {}
+			end
+			table.insert(nameGroups[name], child)
+		end
+
+		for name, list in pairs(nameGroups) do
+			if #list > 1 then
+				local primary = nil
+				for _, inst in ipairs(list) do
+					if inst:GetAttribute(TypeList.MANAGED_ATTRIBUTES.IsManaged) == true
+						or (typeof(inst:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId)) == "string" and inst:GetAttribute(TypeList.MANAGED_ATTRIBUTES.StableId) ~= "")
+					then
+						primary = inst
+						break
+					end
+				end
+				if not primary then
+					primary = list[1]
+				end
+
+				for _, inst in ipairs(list) do
+					if inst ~= primary then
+						conflicts.count += 1
+						table.insert(conflicts.instances, inst)
+						table.insert(conflicts.details, {
+							instance = inst,
+							originalName = name,
+							parent = parent,
+							primary = primary,
+						})
+					end
+				end
+			end
+		end
+	end
+
+	for _, rootPath in ipairs(roots) do
+		local rootInstance = resolvePath(rootPath)
+		if rootInstance then
+			checkContainer(rootInstance)
+			if rootInstance == workspace or rootInstance:IsA("Workspace") then
+				for _, child in ipairs(rootInstance:GetChildren()) do
+					if child:IsA("Folder") or child:IsA("Model") then
+						checkContainer(child)
+					end
+				end
+			end
+		end
+	end
+
+	self.lastDuplicateSiblingInstances = conflicts.instances
+	return conflicts
+end
+
+function SyncAPI:renameDuplicateSiblings(customCandidates : {Instance}?)
+	local targets = customCandidates
+	if not targets or #targets == 0 then
+		targets = self.lastDuplicateSiblingInstances
+	end
+	if not targets or #targets == 0 then
+		local detected = self:detectDuplicateSiblingNames()
+		targets = detected.instances
+	end
+
+	if not targets or #targets == 0 then
+		return 0, nil
+	end
+
+	local recordingKind, recordingIdentifier = beginAutoRenameRecording()
+	local renamedCount = 0
+	local visited = {}
+	local lastYieldAt = os.clock()
+
+	for _, instance in ipairs(targets) do
+		if instance and instance.Parent and not visited[instance] then
+			visited[instance] = true
+			local parent = instance.Parent
+			local oldName = instance.Name
+			local newName = getStandardCopyName(parent, oldName)
+			local ok = pcall(function()
+				instance.Name = newName
+			end)
+			if ok then
+				renamedCount += 1
+			end
+		end
+		if os.clock() - lastYieldAt >= 0.02 then
+			task.wait()
+			lastYieldAt = os.clock()
+		end
+	end
+
+	finishAutoRenameRecording(recordingKind, recordingIdentifier, true)
+	self.lastDuplicateSiblingInstances = {}
+	self:appendDebugEvent("Renamed " .. tostring(renamedCount) .. " duplicate sibling instances in Studio (standard copy)", false)
+	return renamedCount, nil
 end
 
 function SyncAPI:isRunning()
