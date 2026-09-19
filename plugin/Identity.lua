@@ -227,12 +227,16 @@ function Identity.buildApplyPlan(changes, candidates)
 			end
 			local resolved, resolveError = Identity.resolveName(nameMatches, desiredName, "")
 			if resolveError then
-				add(conflict("ambiguous_target", operation, change,
-					"Name-only resolution found multiple candidates for " .. desiredName .. ".",
-					"Use StableId to select the intended instance."))
+				if operation ~= "upsert" or desiredPath == "" then
+					add(conflict("ambiguous_target", operation, change,
+						"Name-only resolution found multiple candidates for " .. desiredName .. ".",
+						"Use StableId to select the intended instance."))
+				end
 			elseif resolved then
-				target = resolved
-				claimedCandidates[target] = true
+				if operation ~= "upsert" or desiredPath == "" or resolved.rbxPath == desiredPath then
+					target = resolved
+					claimedCandidates[target] = true
+				end
 			end
 		end
 
